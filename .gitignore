@@ -1,0 +1,8 @@
+# personal data: todos and copies of work emails
+data/
+# build output
+mac/build/
+# app icon image (copyrighted artwork, kept local only)
+mac/icon-source.png
+.DS_Store
+__pycache__/
