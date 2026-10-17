@@ -150,7 +150,19 @@ func drawPet(_ b: NSRect) {
 class PetView: NSView {
     var onClick: () -> Void = {}
     var grab = NSPoint.zero, moved = false
-    override func draw(_ r: NSRect) { drawPet(bounds) }
+    var overdue = 0 { didSet { if overdue != oldValue { needsDisplay = true } } }
+    override func draw(_ r: NSRect) {
+        // Fully transparent pixels let clicks fall through; a near-invisible fill makes the whole square clickable.
+        NSColor.black.withAlphaComponent(0.01).setFill(); bounds.fill()
+        NSGraphicsContext.saveGraphicsState(); drawPet(bounds); NSGraphicsContext.restoreGraphicsState()
+        guard overdue > 0 else { return }
+        let text = NSAttributedString(string: overdue > 99 ? "99+" : "\(overdue)", attributes: [
+            .font: NSFont.boldSystemFont(ofSize: 15), .foregroundColor: NSColor.white])
+        let w = max(26, text.size().width + 12), r = NSRect(x: bounds.maxX - w - 2, y: bounds.maxY - 28, width: w, height: 26)
+        let pill = NSBezierPath(roundedRect: r, xRadius: 13, yRadius: 13)
+        NSColor.systemRed.setFill(); pill.fill(); NSColor.white.setStroke(); pill.lineWidth = 2; pill.stroke()
+        text.draw(at: NSPoint(x: r.midX - text.size().width / 2, y: r.midY - text.size().height / 2))
+    }
     override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
     override func mouseDown(with e: NSEvent) { grab = e.locationInWindow; moved = false }
     override func mouseDragged(with e: NSEvent) {
@@ -207,6 +219,19 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
         }
         pet.setContentSize(NSSize(width: petSize, height: petSize))  // saved frame may hold an old size
         pet.orderFrontRegardless()
+
+        // red badge on the pet: open, not-done tasks whose due time has passed
+        let refresh = { [weak view] in
+            URLSession.shared.dataTask(with: base.appendingPathComponent("api/todos")) { data, _, _ in
+                guard let data, let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return }
+                let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd'T'HH:mm"
+                let now = f.string(from: Date())
+                let n = list.filter { ($0["done"] as? Bool) != true && !((($0["due"] as? String) ?? "").isEmpty) && ($0["due"] as! String) <= now }.count
+                DispatchQueue.main.async { view?.overdue = n }
+            }.resume()
+        }
+        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in refresh() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { refresh() }
     }
 
     func toggle() {

@@ -175,9 +175,9 @@ h2 span{font-weight:400;margin-left:4px}h2.late{color:var(--red)}
 .meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;margin-top:3px;font-size:12px}
 .info{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .chips{display:contents}.chip{border-radius:10px;padding:1px 8px;cursor:pointer;background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 65% var(--chipL));font-weight:500}
-.chip b{margin-left:3px;font-weight:400;opacity:0}.chip:hover b{opacity:.7}.chip b:hover{opacity:1}
-.addl{border:0;background:none;width:58px;padding:1px 2px;color:var(--muted);outline:none;opacity:0}
-.t:hover .addl,.addl:focus{opacity:1}.addl:focus{width:180px;color:var(--text)}
+.chip b{display:inline-block;vertical-align:bottom;max-width:0;overflow:hidden;font-weight:400;opacity:0}.chip:hover b{max-width:1em;margin-left:3px;opacity:.7}.chip b:hover{opacity:1}
+.addl{border:0;background:none;width:0;padding:1px 0;color:var(--muted);outline:none;opacity:0}
+.t:hover .addl,.addl:focus{opacity:1;width:58px;padding:1px 2px}.addl:focus{width:180px;color:var(--text)}
 details summary{display:inline-block;font-size:12px;color:var(--muted);cursor:pointer;margin-top:4px;list-style:none;user-select:none}
 details summary::-webkit-details-marker{display:none}
 details summary::before{content:"›";display:inline-block;margin-right:5px;transition:transform .15s}
