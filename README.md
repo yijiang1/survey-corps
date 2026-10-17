@@ -11,6 +11,7 @@ A small local task manager for macOS that turns Outlook emails into to-dos.
 - Drag an email from Outlook and drop it anywhere in the window to create a task. The subject, sender, date and body are saved, along with a copy of the original email.
 - **Open in Outlook** button re-opens the saved email in Outlook.
 - Links in email bodies are clickable. Outlook Safe Links / URL Defense wrappers are unwrapped for display (the click still goes through the scanner) and open in your default browser.
+- Optional: auto-fill labels and a due date for each dropped email using an LLM (Argonne's Argo gateway; needs the lab network/VPN). Enable it with `data/config.json`: `{"argo_user": "<ANL username>"}` (optional `"argo_model"`). It never overwrites labels or a due date you set, and does nothing if the gateway is unreachable. The email text is sent to that gateway.
 - Add plain tasks by typing in the box at the top and pressing Enter.
 
 **Organising**

@@ -196,6 +196,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Survey Corps"
+        window.minSize = NSSize(width: 820, height: 480)
         window.contentView = web
         window.center()
         window.setFrameAutosaveName("main")

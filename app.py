@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Survey Corps: local todo list fed by emails dragged from Outlook. Run: python3 app.py"""
-import html, json, re, subprocess, sys, threading, time, uuid
+import html, json, re, subprocess, sys, threading, time, urllib.request, uuid
 from datetime import datetime
 from email import message_from_bytes, policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +13,8 @@ DATA = Path(__file__).resolve().parent / "data"
 MAILS = DATA / "mails"   # original .eml copies, opened in Outlook via "Open mail"
 INBOX = DATA / "inbox"   # fallback: drag emails from Outlook into this Finder folder
 DB = DATA / "todos.json"
+CONFIG = DATA / "config.json"  # optional: {"argo_user": "<ANL username>", "argo_model": "claudesonnet5"}
+ARGO = "https://apps.inside.anl.gov/argoapi/v1/chat/completions"
 lock = threading.Lock()
 
 
@@ -41,6 +43,77 @@ def email_text(msg):
     return re.sub(r"\s*\n\s*\n\s*", "\n\n", text).strip()
 
 
+def clean_suggestion(text, now):
+    """Pull {"labels", "due"} out of the model's reply, dropping anything malformed or already past."""
+    m = re.search(r"\{.*\}", text, re.S)
+    try:
+        d = json.loads(m.group(0)) if m else {}
+    except ValueError:
+        return {}
+    labels = [str(x).strip() for x in d.get("labels") or [] if str(x).strip()][:3]
+    due = str(d.get("due") or "")
+    try:
+        ok = datetime.strptime(due, "%Y-%m-%dT%H:%M") > now
+    except ValueError:
+        ok = False
+    return {"labels": [l for l in labels if len(l) <= 24], "due": due if ok else ""}
+
+
+def config():
+    return json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+
+
+def argo(prompt, max_tokens):
+    """Ask the lab's Argo LLM. Returns the reply text, or None if unconfigured or unreachable (e.g. no VPN)."""
+    cfg = config()
+    if not cfg.get("argo_user"):
+        return None
+    req = urllib.request.Request(ARGO, json.dumps({
+        "model": cfg.get("argo_model", "claudesonnet5"), "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}]}).encode(),
+        {"Content-Type": "application/json", "Authorization": "Bearer " + cfg["argo_user"]})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.load(r)["choices"][0]["message"]["content"]
+    except Exception:
+        return None
+
+
+def suggest(t, known):
+    """Labels and a due date for a dropped email, or {} if Argo isn't available."""
+    now = datetime.now()
+    prompt = (f"Today is {now:%A %Y-%m-%d %H:%M} (local time). Existing labels: {json.dumps(known)}.\n"
+              "Below is an email I saved as a to-do. Reply with ONLY a JSON object "
+              '{"labels": [...], "due": "..."}.\n'
+              "- labels: up to 3 short labels (1-2 words, Title Case). Reuse an existing label whenever one fits; "
+              "invent a new one only if none does.\n"
+              '- due: when I must act by, as local YYYY-MM-DDTHH:MM. Resolve relative dates ("by Friday") against the '
+              'email\'s own Date header; if only a date is given use 17:00. Use "" if the email states no deadline '
+              "(do not invent one).\n\n"
+              f"Subject: {t['title']}\nFrom: {t['sender']}\nDate: {t['date']}\n\n{t['body'][:3000]}")
+    reply = argo(prompt, 200)
+    return clean_suggestion(reply, now) if reply else {}
+
+
+def enrich(t):
+    """Background: fill in labels/due on a freshly dropped email, unless the user already set them."""
+    with lock:
+        known = sorted({l for x in load() for l in x.get("labels", [])})
+    s = suggest(t, known)
+    if not s:
+        return
+    with lock:
+        todos = load()
+        cur = next((x for x in todos if x["id"] == t["id"]), None)
+        if not cur:
+            return
+        if s["labels"] and not cur.get("labels"):
+            cur["labels"] = sorted(set(s["labels"]))
+        if s["due"] and not cur["due"]:
+            cur["due"], cur["notified"] = s["due"], False
+        save(todos)
+
+
 def make_todo(raw, name):
     tid = uuid.uuid4().hex[:12]
     t = {"id": tid, "done": False, "due": "", "notified": False, "note": "",
@@ -51,6 +124,7 @@ def make_todo(raw, name):
         text = email_text(msg)
         t.update(title=str(msg["Subject"] or "(no subject)"), sender=str(msg["From"] or ""),
                  date=str(msg["Date"] or ""), body=text.strip()[:3000], eml=True)
+        threading.Thread(target=enrich, args=(t,), daemon=True).start()
     else:  # plain text (manual todo, or Outlook only handed over text)
         text = raw.decode("utf-8", "replace").strip()
         t.update(title=(text.splitlines() or ["(empty)"])[0][:200], sender="", date="",
@@ -198,6 +272,20 @@ textarea:focus{border-color:var(--accent)}
 .icon svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 #donebox{margin-top:18px}#donebox>summary{font-size:12px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin:0 4px 6px}
 .done{opacity:.65}
+.seg{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{border:0;background:var(--card);padding:6px 12px;cursor:pointer}.seg .on{background:var(--accent);color:#fff}
+.calhd{display:flex;align-items:center;gap:8px;margin:14px 0 8px}.calhd h3{margin:0;font-size:16px;flex:1}
+.calhd button{border:1px solid var(--line);background:var(--card);border-radius:6px;padding:4px 10px;cursor:pointer}
+.calhd small{color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.dow{background:var(--bg);padding:4px 8px;font-size:11px;color:var(--muted);text-transform:uppercase}
+.day{background:var(--card);min-height:96px;padding:4px;cursor:pointer;overflow:hidden}
+.day.out{background:var(--bg)}.day.out .dn{opacity:.5}.day.sel{box-shadow:inset 0 0 0 2px var(--accent)}.day.over{background:var(--hover)}
+.dn{font-size:12px;color:var(--muted);margin:0 2px 2px}.day.today .dn{background:var(--accent);color:#fff;border-radius:9px;padding:0 6px;display:inline-block}
+.ev{font-size:11.5px;border-radius:4px;padding:1px 5px;margin:2px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:grab;
+  background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 65% var(--chipL))}
+.ev.late{background:var(--redbg);color:var(--red);font-weight:600}.ev.done{text-decoration:line-through;opacity:.55}
+.more{font-size:11px;color:var(--muted);padding:0 5px}
 #drop{display:none;position:fixed;inset:8px;z-index:9;pointer-events:none;align-items:center;justify-content:center;
   border:3px dashed var(--accent);border-radius:14px;background:#0a84ff1a;color:var(--accent);font-size:20px;font-weight:600}
 #drop.over{display:flex}
@@ -209,10 +297,11 @@ textarea:focus{border-color:var(--accent)}
     <input id=new placeholder="Add a task and press Enter, or drag an email from Outlook anywhere">
     <input id=q type=search placeholder="Search  ( / )">
     <select id=lf><option value="">All labels</option></select>
+    <span class=seg><button id=vl>List</button><button id=vc>Calendar</button></span>
   </div>
 </header>
 <datalist id=labels></datalist>
-<main><div id=list></div><details id=donebox><summary id=donehdr></summary><div id=donelist></div></details></main>
+<main><div id=cal hidden></div><div id=list></div><details id=donebox><summary id=donehdr></summary><div id=donelist></div></details></main>
 <script>
 const api=(p,b)=>fetch(p,{method:'POST',body:typeof b==='string'||b instanceof Blob?b:JSON.stringify(b)}).then(load);
 const nowStr=()=>new Date(Date.now()-new Date().getTimezoneOffset()*6e4).toISOString().slice(0,16);
@@ -288,7 +377,44 @@ function linkify(el,text){
   el.append(text.slice(i));
 }
 const hue=s=>[...s].reduce((h,c)=>(h*31+c.charCodeAt(0))%360,7);
-let all=[];
+let all=[], view=localStorage.view||'list', cm=new Date(), sel='', dragId=null;
+cm.setDate(1);
+const ymd=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+function renderCal(shown){
+  const el=(tag,cls,txt)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e};
+  const by={};for(const t of shown.filter(t=>t.due).sort((a,b)=>a.due.localeCompare(b.due)))(by[t.due.slice(0,10)]||=[]).push(t);
+  const y=cm.getFullYear(),m=cm.getMonth(),lead=new Date(y,m,1).getDay(),days=new Date(y,m+1,0).getDate();
+  const go=n=>{cm=n?new Date(y,m+n,1):new Date(new Date().getFullYear(),new Date().getMonth(),1);render()};
+  const hd=el('div','calhd'),title=el('h3',0,new Date(y,m,1).toLocaleDateString([],{month:'long',year:'numeric'}));
+  const undated=shown.filter(t=>!t.due&&!t.done).length;
+  hd.append(title,...(undated?[el('small',0,`${undated} without a due date`)]:[]));
+  for(const [l,n] of [['‹',-1],['Today',0],['›',1]]){const b=el('button',0,l);b.onclick=()=>go(n);hd.append(b)}
+  const grid=el('div','grid');
+  for(const d of ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'])grid.append(el('div','dow',d));
+  const today=ymd(new Date());
+  for(let i=0;i<Math.ceil((lead+days)/7)*7;i++){
+    const d=new Date(y,m,1-lead+i),k=ymd(d),c=el('div','day'+(d.getMonth()!==m?' out':'')+(k===today?' today':'')+(k===sel?' sel':''));
+    c.append(el('div','dn',d.getDate()));
+    const ts=by[k]||[];
+    for(const t of ts.slice(0,3)){
+      const e=el('div','ev'+(t.done?' done':'')+(!t.done&&t.due<=nowStr()?' late':''),t.title);
+      e.style.setProperty('--h',(t.labels||[])[0]?hue(t.labels[0]):210);e.title=t.title+'\n'+fmtDue(t.due);
+      e.draggable=true;e.ondragstart=ev=>{dragId=t.id;ev.dataTransfer.setData('application/x-todo',t.id)};e.ondragend=()=>dragId=null;
+      c.append(e);
+    }
+    if(ts.length>3)c.append(el('div','more',`+${ts.length-3} more`));
+    c.onclick=()=>{sel=sel===k?'':k;render()};
+    c.ondragover=e=>{if(dragId){e.preventDefault();c.classList.add('over')}};
+    c.ondragleave=()=>c.classList.remove('over');
+    c.ondrop=e=>{if(!dragId)return;e.preventDefault();e.stopPropagation();c.classList.remove('over');
+      const t=all.find(x=>x.id===dragId);dragId=null;if(t&&t.due.slice(0,10)!==k)api(`/api/todo/${t.id}/update`,{due:k+t.due.slice(10)})};
+    grid.append(c);
+  }
+  const out=[hd,grid];
+  if(sel){const ts=by[sel]||[];out.push(el('h2',0,new Date(sel+'T00:00').toLocaleDateString([],{weekday:'long',month:'long',day:'numeric'})),
+    ...(ts.length?ts.map(item):[el('div','empty','Nothing due this day.')]))}
+  cal.replaceChildren(...out);
+}
 function render(){
   const names=[...new Set(all.flatMap(t=>t.labels||[]))].sort();
   labels.replaceChildren(...names.map(n=>new Option(n)));
@@ -313,13 +439,16 @@ function render(){
     out.push(e);
   }
   list.replaceChildren(...out); donelist.replaceChildren(...done.map(item));
-  donebox.hidden=!done.length; donehdr.textContent=`Done · ${done.length}`;
+  const isCal=view==='cal'; cal.hidden=!isCal; list.hidden=isCal; vl.className=isCal?'':'on'; vc.className=isCal?'on':'';
+  if(isCal)renderCal(shown);
+  donebox.hidden=isCal||!done.length; donehdr.textContent=`Done · ${done.length}`;
   const openAll=all.filter(t=>!t.done), late=openAll.filter(t=>t.due&&t.due<=nowStr()).length;
   stats.textContent=`${openAll.length} open`+(late?` · ${late} overdue`:'');
   document.title=`Survey Corps (${openAll.length})`;
 }
 async function load(){all=await (await fetch('/api/todos')).json();render()}
 q.oninput=lf.onchange=render;
+vl.onclick=()=>{view='list';localStorage.view=view;render()};vc.onclick=()=>{view='cal';localStorage.view=view;render()};
 document.getElementById('new').onkeydown=e=>{
   const v=e.target.value.trim();
   if(e.key==='Enter'&&v){e.target.value='';api('/api/drop?name=todo.txt',v)}
@@ -327,15 +456,15 @@ document.getElementById('new').onkeydown=e=>{
 };
 addEventListener('keydown',e=>{if(e.key==='/'&&!/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)){e.preventDefault();q.focus()}});
 q.onkeydown=e=>{if(e.key==='Escape'){q.value='';render();q.blur()}};
-addEventListener('dragover',e=>{e.preventDefault();drop.classList.add('over')});
+addEventListener('dragover',e=>{e.preventDefault();if(!dragId)drop.classList.add('over')});
 addEventListener('dragleave',e=>{if(!e.relatedTarget)drop.classList.remove('over')});  // only when leaving the window
 addEventListener('drop',async e=>{
-  e.preventDefault(); drop.classList.remove('over');
+  e.preventDefault(); if(dragId)return; drop.classList.remove('over');
   const files=[...e.dataTransfer.files];
   for(const f of files) await fetch('/api/drop?name='+encodeURIComponent(f.name),{method:'POST',body:f});
   const txt=!files.length&&(e.dataTransfer.getData('text/plain')||e.dataTransfer.getData('text/uri-list'));
   if(txt) await fetch('/api/drop?name=drop.txt',{method:'POST',body:txt});
-  load();
+  load(); setTimeout(load,8000); setTimeout(load,20000);  // labels/due arrive from the LLM a few seconds later
 });
 setInterval(()=>{if(!document.querySelector('.t details[open]')&&document.activeElement===document.body)load()},30000);
 load();
