@@ -1,6 +1,6 @@
 from datetime import datetime
 from pathlib import Path
-from app import clean_scores, clean_suggestion, parse_arxiv
+from app import SCOUT, channel, clean_scores, clean_settings, clean_suggestion, parse_arxiv, parse_youtube_page
 now = datetime(2026, 10, 17, 9, 0)
 assert clean_suggestion('x {"labels": ["A", " B ", "", "C", "D"], "due": "2026-10-20T17:00"} y', now) == {"labels": ["A", "B", "C"], "due": "2026-10-20T17:00", "title": "", "actions": []}
 assert clean_suggestion('{"title": " Review draft ", "actions": ["only one"]}', now) == {"labels": [], "due": "", "title": "Review draft", "actions": []}  # 1 action = no split
@@ -34,4 +34,18 @@ app.argo = back
 app.retry_argo()
 x = app.load()[0]
 assert "retry" not in x and x["title"] == "Review draft" and x["labels"] == ["Review"] and x["body"] == "", x
+c = clean_settings({"scout_profile": "  ", "scout_keywords": [" a  b ", "", 3], "scout_hours": "99"})
+assert c == {"scout_keywords": ["a b", "3"], "scout_arxiv_keywords": [], "scout_youtube": [], "scout_profile": SCOUT["scout_profile"],
+             "scout_hours": 48}, c
+assert clean_settings({"scout_hours": "x"})["scout_hours"] == 3
+assert channel("UCMLtBahI5DMrt0NPvDSoIRQ   MLST  ") == "UCMLtBahI5DMrt0NPvDSoIRQ MLST"  # ids are kept without a lookup
+import json
+from datetime import timedelta
+lock = {"lockupViewModel": {"contentType": "LOCKUP_CONTENT_TYPE_VIDEO", "contentId": "abc", "metadata": {"lockupMetadataViewModel": {
+    "title": {"content": "Agents  rule"}, "metadata": {"contentMetadataViewModel": {"metadataRows": [{"metadataParts": [
+        {"text": {"content": "1K"}, "accessibilityLabel": "1 thousand views"}, {"text": {"content": "2w ago"}, "accessibilityLabel": "2 weeks ago"}]}]}}}}}}
+page = '<meta property="og:title" content="Chan &amp; Co"><script>var ytInitialData = ' + json.dumps({"a": [lock, {"x": 1}]}) + ';</script>'
+v = parse_youtube_page(page)
+assert [(x["id"], x["title"], x["by"]) for x in v] == [("yt:abc", "Agents rule", "Chan & Co")], v
+assert v[0]["date"] == (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
 print("ok")

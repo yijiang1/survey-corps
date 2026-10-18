@@ -29,7 +29,8 @@ A small local task manager for macOS that turns Outlook emails into to-dos.
 - Every few hours, it pulls new arXiv papers and GitHub repos matching your keywords, plus new videos from YouTube channels you list. Argo scores each item 0-10 against your interests, with a one-line reason why. Off VPN, items still show up, just unscored, and get scored on a later check.
 - 📌 on a card adds a "Read: …" task (label Reading) with a two-line Argo summary in its notes.
 - 👍 / 👎 / ☆ on each card feed the next round of ranking. You get a notification when something scores 8 or higher.
-- Configure in `data/config.json` (all optional): `scout_profile` (your interests, in plain text), `scout_keywords` (list; arXiv + GitHub), `scout_arxiv_keywords` (list; arXiv only), `scout_youtube` (list of channel ids, `UC...`), `scout_hours` (default 3), `github_token`. Results live in `data/feed.json`. Only titles and abstracts go to Argo.
+- **+ Add** in the Scout window: paste links (arXiv paper, YouTube video, GitHub repo, or any web page) to save them straight to Saved. Scout fills in the title, authors and abstract, and Argo scores them like everything else.
+- **Interests** button in the Scout window: edit what you're interested in (plain words Argo ranks against), search terms (arXiv + GitHub, plus arXiv-only ones), YouTube channels (paste an `@handle`, a channel link or an ID) and how often to check. Saving starts a new check; **Reset to defaults** goes back to the built-in AI agents / RSI / ptychography setup. Settings are saved to `data/config.json` (optional `github_token` there too); results live in `data/feed.json`. Only titles and abstracts go to Argo.
 
 **macOS integration**
 - macOS notification when a task comes due.

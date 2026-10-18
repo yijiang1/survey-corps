@@ -313,17 +313,69 @@ def watcher():
 # ---- Scout: new arXiv papers, YouTube videos and GitHub repos, ranked by Argo against your interests ----
 FEED = DATA / "feed.json"  # {"last": "...", "errors": [...], "seen": [ids], "items": [...]}
 feed_lock, scout_busy = threading.Lock(), threading.Lock()
-SCOUT = {  # defaults; override any of these keys in data/config.json
-    "scout_profile": "Two equally important areas. (1) Ptychography, 4D-STEM and electron/X-ray microscopy; phase retrieval and computational imaging; "
-                     "tomography and CT reconstruction; inverse problems with deep learning or diffusion models; "
-                     "(2) AI/LLM agents (agent architectures, tool use, autonomous research agents, agent benchmarks); "
-                     "recursive self-improvement (RSI): self-improving and self-evolving agents and models.",
-    "scout_keywords": ["ptychography", "phase retrieval", "4D-STEM", "computational imaging", "tomographic reconstruction"],
-    "scout_arxiv_keywords": ["recursive self-improvement", "self-improving agent", "self-evolving agent",
-                             "LLM agent", "AI agent", "agentic"],  # arXiv only (too noisy as GitHub searches)
-    "scout_youtube": [],  # channel ids ("UC..."): the channel page → Share → Copy channel ID
-    "scout_hours": 3,     # how often to check
+SCOUT = {  # defaults; edited in the Scout window ("Interests"), which saves overrides to data/config.json
+    "scout_profile": "Two equally important areas. (1) AI/LLM agents (agent architectures, tool use, autonomous research agents, "
+                     "agent benchmarks) and recursive self-improvement (RSI): self-improving and self-evolving agents and models. "
+                     "(2) Ptychography (X-ray and electron), including reconstruction algorithms and software.",
+    "scout_keywords": ["recursive self-improvement", "self-improving agent", "self-evolving agent", "autonomous research agent",
+                       "ptychography"],                       # arXiv + GitHub
+    "scout_arxiv_keywords": ["LLM agent", "AI agent", "agentic"],  # arXiv only (too noisy as GitHub searches)
+    "scout_youtube": ["UCMLtBahI5DMrt0NPvDSoIRQ Machine Learning Street Talk", "UCNJ1Ymd5yFuUPtn21xtRbbw AI Explained",
+                      "UCXl4i9dYBrFOabk0xGmbkRA Dwarkesh Patel", "UCxBcwypKK-W3GHd_RZ9FZrQ Latent Space",
+                      "UC55ODQSvARtgSyc8ThfiepQ Sam Witteveen", "UCbfYPyITQ-7l4upoX8nvctg Two Minute Papers",
+                      "UC_x36zCEGilGpB1m-V4gmjg IndyDevDan"],  # "<channel id> <name>"
+    "scout_hours": 3,  # how often to check
 }
+config_lock = threading.Lock()
+
+
+def channel(line):
+    """A YouTube channel line: "UC... name" is kept; an @handle or channel URL is looked up to "UC... name"."""
+    tok = line.split()[0]
+    if re.fullmatch(r"UC[\w-]{22}", tok):
+        return " ".join(line.split())
+    url = tok if tok.startswith("http") else "https://" + tok if "youtube.com" in tok else "https://www.youtube.com/@" + tok.lstrip("@")
+    page = fetch(url, BROWSER).decode("utf-8", "replace")
+    m = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[\w-]{22})"', page)
+    if not m:
+        raise ValueError(f"no YouTube channel found for {tok}")
+    name = re.search(r'<meta property="og:title" content="([^"]*)"', page)
+    return m.group(1) + (" " + html.unescape(name.group(1)) if name else "")
+
+
+def clean_settings(d):
+    """Validated scout_* overrides from the Interests form (YouTube lines are resolved separately)."""
+    lines = lambda k: [" ".join(str(x).split()) for x in d.get(k) or [] if str(x).strip()][:30]
+    out = {k: lines(k) for k in ("scout_keywords", "scout_arxiv_keywords", "scout_youtube")}
+    out["scout_profile"] = " ".join(str(d.get("scout_profile") or "").split())[:3000] or SCOUT["scout_profile"]
+    try:
+        out["scout_hours"] = max(1, min(48, int(d.get("scout_hours") or 3)))
+    except (TypeError, ValueError):
+        out["scout_hours"] = 3
+    return out
+
+
+def save_settings(d):
+    """Save the form (or {"reset": true} to go back to the defaults). Returns an error message, or None."""
+    if d.get("reset"):
+        new = {}
+    else:
+        new = clean_settings(d)
+        bad = []
+        for i, line in enumerate(new["scout_youtube"]):
+            try:
+                new["scout_youtube"][i] = channel(line)
+            except Exception as e:
+                bad.append(f"{line} ({e})")
+        if bad:
+            return "Couldn't find YouTube channel: " + "; ".join(bad)
+    with config_lock:
+        cfg = {k: v for k, v in config().items() if not k.startswith("scout_")}
+        cfg.update(new)
+        tmp = CONFIG.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cfg, indent=1, ensure_ascii=False))
+        tmp.replace(CONFIG)
+    return None
 ATOM, YT, MEDIA = "{http://www.w3.org/2005/Atom}", "{http://www.youtube.com/xml/schemas/2015}", "{http://search.yahoo.com/mrss/}"
 
 
@@ -335,6 +387,9 @@ def save_feed(f):
     tmp = FEED.with_suffix(".tmp")
     tmp.write_text(json.dumps(f, indent=1, ensure_ascii=False))
     tmp.replace(FEED)
+
+
+BROWSER = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en", "Cookie": "CONSENT=YES+1"}  # pages that serve bots a stub or a consent wall
 
 
 def fetch(url, headers=None):
@@ -367,11 +422,117 @@ def parse_youtube(xml):
             for e in ET.fromstring(xml).iter(ATOM + "entry")]
 
 
+def parse_youtube_page(page):
+    """Videos from a channel's /videos page (its embedded ytInitialData), used when the RSS feed fails."""
+    m = re.search(r"var ytInitialData = (\{.*?\});</script>", page, re.S)
+    if not m:
+        raise ValueError("no video list on the channel page")
+    name = re.search(r'<meta property="og:title" content="([^"]*)"', page)
+    by, found = html.unescape(name.group(1)) if name else "", []
+
+    def walk(o):
+        if isinstance(o, dict):
+            v = o.get("lockupViewModel")
+            if v and v.get("contentType") == "LOCKUP_CONTENT_TYPE_VIDEO":
+                found.append(v)
+            for x in o.values():
+                walk(x)
+        elif isinstance(o, list):
+            for x in o:
+                walk(x)
+    walk(json.loads(m.group(1)))
+    out = []
+    for v in found[:15]:
+        md = v["metadata"]["lockupMetadataViewModel"]
+        parts = [p.get("accessibilityLabel") or p["text"]["content"]
+                 for r in md.get("metadata", {}).get("contentMetadataViewModel", {}).get("metadataRows", [])
+                 for p in r.get("metadataParts", []) if "text" in p]
+        # ponytail: the page only says "4 days ago", so the date is approximate
+        age = next((re.match(r"(\d+) (minute|hour|day|week|month|year)s? ago", x) for x in parts if x.endswith(" ago")), None)
+        days = int(age.group(1)) * {"minute": 0, "hour": 0, "day": 1, "week": 7, "month": 30, "year": 365}[age.group(2)] if age else 0
+        out.append({"id": "yt:" + v["contentId"], "src": "YouTube", "title": flat(md["title"]["content"]),
+                    "url": "https://www.youtube.com/watch?v=" + v["contentId"], "by": by,
+                    "date": (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d"), "text": ""})
+    return out
+
+
+def youtube(c):
+    """A channel's latest videos: the RSS feed, or the channel page when YouTube's feed is failing (it often 404s)."""
+    try:
+        return parse_youtube(fetch("https://www.youtube.com/feeds/videos.xml?channel_id=" + c))
+    except Exception:
+        page = fetch(f"https://www.youtube.com/channel/{c}/videos",
+                     BROWSER)
+        return parse_youtube_page(page.decode("utf-8", "replace"))
+
+
 def parse_github(data):
     return [{"id": "gh:" + r["full_name"], "src": "GitHub", "title": r["full_name"], "url": r["html_url"],
              "by": f"★ {r['stargazers_count']}" + (f" · {r['language']}" if r.get("language") else ""),
              "date": r["pushed_at"][:10], "text": flat(r.get("description"))}
             for r in json.loads(data)["items"]]
+
+
+def page_meta(page):
+    """{name or property: [contents]} from a page's <meta> tags, in either attribute order."""
+    out = {}
+    for tag in re.findall(r"<meta\b[^>]*>", page, re.I):
+        a = {k.lower(): html.unescape(v) for k, v in re.findall(r'([\w:-]+)\s*=\s*"([^"]*)"', tag)}
+        k = a.get("name") or a.get("property")
+        if k and "content" in a:
+            out.setdefault(k.lower(), []).append(a["content"])
+    return out
+
+
+def link_item(url):
+    """A feed item for a pasted link: an arXiv paper, YouTube video, GitHub repo, or any other web page."""
+    url = url.strip()
+    url = url if re.match(r"https?://", url) else "https://" + url
+    today = datetime.now().strftime("%Y-%m-%d")
+    m = re.search(r"arxiv\.org/(?:abs|pdf|html)/(.+?)(?:v\d+)?(?:\.pdf)?/?(?:[?#].*)?$", url)
+    if m:  # the abstract page (not the rate-limited export API) has everything in citation_* tags
+        aid, url = m.group(1), "https://arxiv.org/abs/" + m.group(1)
+        meta = page_meta(fetch(url, BROWSER).decode("utf-8", "replace"))
+        one = lambda *ks: next((meta[k][0] for k in ks if meta.get(k)), "")
+        authors = [" ".join(reversed(a.split(", ", 1))) for a in meta.get("citation_author", [])]  # "Last, First"
+        return {"id": "arxiv:" + aid, "src": "arXiv", "title": flat(one("citation_title", "og:title")), "url": url,
+                "by": ", ".join(authors[:3]) + (" et al." if len(authors) > 3 else ""),
+                "date": one("citation_date", "citation_online_date").replace("/", "-")[:10] or today,
+                "text": flat(one("citation_abstract", "og:description"))}
+    m = re.search(r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|live/|embed/)|youtu\.be/)([\w-]{11})", url)
+    if m:
+        url = "https://www.youtube.com/watch?v=" + m.group(1)
+        o = json.loads(fetch("https://www.youtube.com/oembed?format=json&url=" + urllib.parse.quote(url)))
+        return {"id": "yt:" + m.group(1), "src": "YouTube", "title": flat(o["title"]), "url": url,
+                "by": o.get("author_name", ""), "date": today, "text": ""}
+    m = re.match(r"https?://(?:www\.)?github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?(?:[/?#].*)?$", url)
+    if m:
+        return parse_github(json.dumps({"items": [json.loads(fetch(f"https://api.github.com/repos/{m.group(1)}/{m.group(2)}"))]}))[0]
+    page = fetch(url, BROWSER).decode("utf-8", "replace")
+    meta = page_meta(page)
+    tag = re.search(r"<title[^>]*>(.*?)</title>", page, re.S | re.I)
+    title = (meta.get("og:title") or meta.get("twitter:title") or [html.unescape(tag.group(1)) if tag else url])[0]
+    return {"id": "link:" + url, "src": "Link", "title": flat(title, 300), "url": url,
+            "by": urlparse(url).netloc.removeprefix("www."), "date": today,
+            "text": flat((meta.get("og:description") or meta.get("description") or [""])[0])}
+
+
+def score_one(item_id):
+    """Background: Argo's score and one-line reason for a single (manually added) item."""
+    cfg = {**SCOUT, **config()}
+    with feed_lock:
+        f = load_feed()
+        x = next((x for x in f["items"] if x["id"] == item_id), None)
+        liked = [y["title"] for y in f["items"] if (y["vote"] > 0 or y["saved"]) and y["id"] != item_id][:15]
+        disliked = [y["title"] for y in f["items"] if y["vote"] < 0][:15]
+    scores = rank([x], cfg, liked, disliked) if x else {}
+    if 0 in scores:
+        with feed_lock:
+            f = load_feed()
+            for y in f["items"]:
+                if y["id"] == item_id:
+                    y["score"], y["why"] = scores[0]
+            save_feed(f)
 
 
 def clean_scores(text):
@@ -410,8 +571,8 @@ def run_scout():
                                                               + urllib.parse.quote(f'all:"{k}"')
                                                               + "&sortBy=submittedDate&sortOrder=descending&max_results=15")))
                 for k in cfg["scout_keywords"] + cfg["scout_arxiv_keywords"]]
-        jobs += [(f"YouTube {c}", lambda c=c: parse_youtube(fetch("https://www.youtube.com/feeds/videos.xml?channel_id=" + c)))
-                 for c in cfg["scout_youtube"]]
+        jobs += [("YouTube " + (" ".join(line.split()[1:]) or line.split()[0]), lambda c=line.split()[0]: youtube(c))
+                 for line in cfg["scout_youtube"]]
         jobs += [(f"GitHub '{k}'", lambda k=k: parse_github(fetch("https://api.github.com/search/repositories?sort=stars&per_page=10&q="
                                                                   + urllib.parse.quote(f'"{k}" pushed:>{since}'), gh)))
                  for k in cfg["scout_keywords"]]
@@ -428,6 +589,10 @@ def run_scout():
                               else f"{name}: {e}")
             if is_arxiv:
                 time.sleep(3)  # arXiv API asks for 3 s between calls
+        yt = [e.split(": ", 1)[0][len("YouTube "):] for e in errors if e.startswith("YouTube ")]
+        if yt:  # one line, not one per channel
+            errors = [e for e in errors if not e.startswith("YouTube ")]
+            errors.append(f"YouTube: couldn't load {', '.join(yt)}; will retry next check")
         with feed_lock:
             f = load_feed()
             seen = set(f["seen"])
@@ -493,6 +658,8 @@ class H(BaseHTTPRequestHandler):
                                         "rev": DB.stat().st_mtime if DB.exists() else 0}).encode())
         elif self.path == "/feed":
             self.reply(200, FEED_PAGE.encode(), "text/html; charset=utf-8")
+        elif self.path == "/api/scout/settings":
+            self.reply(200, json.dumps({k: {**SCOUT, **config()}[k] for k in SCOUT}).encode())
         elif self.path == "/api/feed":
             with feed_lock:
                 f = load_feed()
@@ -507,6 +674,18 @@ class H(BaseHTTPRequestHandler):
             return self.reply(403)
         u = urlparse(self.path)
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if u.path == "/api/scout/channel":  # {"q": "@handle" | link | id} -> {"line": "UC... name"}
+            try:
+                return self.reply(200, json.dumps({"line": channel(json.loads(raw or b"{}").get("q") or "")}).encode())
+            except Exception as e:
+                msg = "Channel not found" if "404" in str(e) or isinstance(e, (ValueError, IndexError)) else str(e)
+                return self.reply(400, json.dumps({"error": msg}).encode())
+        if u.path == "/api/scout/settings":
+            err = save_settings(json.loads(raw or b"{}"))
+            if err:
+                return self.reply(400, json.dumps({"error": err}).encode())
+            threading.Thread(target=run_scout, daemon=True).start()  # check right away with the new searches
+            return self.reply(200)
         if u.path == "/api/feed/refresh":
             threading.Thread(target=run_scout, daemon=True).start()
             return self.reply(200)
@@ -542,6 +721,30 @@ class H(BaseHTTPRequestHandler):
                 return self.reply(404)
             text = draft_reply(t)
             return self.reply(200, json.dumps({"draft": text}).encode()) if text else self.reply(503)
+        if u.path == "/api/feed/add":  # {"url": ...} -> fetched, saved to the Saved list, then scored in the background
+            try:
+                item = link_item(json.loads(raw or b"{}").get("url") or "")
+            except urllib.error.HTTPError as e:
+                return self.reply(400, json.dumps({"error": f"Couldn't read that link (the site answered {e.code})"}).encode())
+            except urllib.error.URLError:
+                return self.reply(400, json.dumps({"error": "Couldn't reach that site. Check the link?"}).encode())
+            except Exception as e:
+                return self.reply(400, json.dumps({"error": f"Couldn't read that link ({e})"}).encode())
+            with feed_lock:
+                f = load_feed()
+                x = next((x for x in f["items"] if x["id"] == item["id"]), None)
+                existed = x is not None
+                if x:
+                    x["saved"] = True
+                else:
+                    x = {**item, "added": datetime.now().isoformat(timespec="minutes"), "score": None, "why": "",
+                         "vote": 0, "saved": True, "read": False, "manual": True}
+                    f["items"].insert(0, x)
+                    f["seen"] = sorted(set(f["seen"]) | {x["id"]})
+                save_feed(f)
+            if x["score"] is None:
+                threading.Thread(target=score_one, args=(x["id"],), daemon=True).start()
+            return self.reply(200, json.dumps({"title": x["title"], "existing": existed}).encode())
         if u.path == "/api/feed/update":  # {"id": ..., "vote"/"saved"/"read": ...}, or {"all_read": true}
             patch = json.loads(raw or b"{}")
             with feed_lock:
@@ -954,10 +1157,39 @@ details summary::-webkit-details-marker{display:none}details p{margin:6px 0 0;fo
 .acts{flex:none;display:flex;gap:2px;align-items:flex-start}
 .acts button{border:0;background:none;border-radius:6px;width:30px;height:28px;cursor:pointer;opacity:.35;font-size:14px}
 .c:hover .acts button{opacity:.8}.acts button:hover{background:var(--line);opacity:1}.acts .on{opacity:1!important}
+dialog.sheet{width:min(760px,calc(100vw - 32px));max-height:calc(100vh - 48px);border:1px solid var(--line);border-radius:14px;
+  padding:0;background:var(--card);color:var(--text);box-shadow:0 24px 70px #0005}
+dialog.sheet::backdrop{background:#0006;backdrop-filter:blur(2px)}
+dialog.sheet form{display:flex;flex-direction:column;max-height:calc(100vh - 50px)}
+dialog#adddlg{width:min(580px,calc(100vw - 32px))}
+.alog{font-size:12.5px;margin-top:8px;overflow-wrap:anywhere}.alog.bad{color:var(--gold)}
+.ph{padding:18px 22px 4px}.ph h3{margin:0;font-size:17px}.ph p{margin:3px 0 0;color:var(--muted);font-size:12.5px}
+.pb{padding:4px 22px 18px;overflow:auto}
+.sec{margin-top:18px}.sec b{display:block;font-size:13px}.sec small{display:block;color:var(--muted);font-size:12px;margin:2px 0 7px}
+.sec small.err{color:var(--gold);margin:5px 0 0;min-height:0}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:18px}@media (max-width:600px){.two{grid-template-columns:1fr}}
+.sheet textarea{width:100%;font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 11px;
+  outline:none;resize:vertical;line-height:1.45}
+.sheet textarea:focus,.tags:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px #0a84ff26}
+.tags{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:40px;background:var(--bg);border:1px solid var(--line);
+  border-radius:8px;padding:6px;cursor:text}
+.tag{display:inline-flex;align-items:center;gap:2px;background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:2px 3px 2px 10px;font-size:12.5px;max-width:100%}
+.tag a,.tag span{color:inherit;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tag a:hover{color:var(--accent)}
+.tag button{flex:none;border:0;background:none;width:18px;height:18px;border-radius:9px;cursor:pointer;color:var(--muted);padding:0;font-size:13px;line-height:1}
+.tag button:hover{background:var(--line);color:var(--text)}
+.tags input{flex:1;min-width:150px;border:0;background:none;outline:none;padding:3px 4px;font:inherit;font-size:12.5px;color:inherit}
+.chan .tag::before{content:"▶";font-size:8px;color:#e33;margin-right:5px}
+.pf{display:flex;gap:8px;align-items:center;padding:12px 22px;border-top:1px solid var(--line)}
+.pf .msg{flex:1;font-size:12px;color:var(--muted)}.pf .msg.bad{color:var(--gold)}
+.pf label{font-size:12.5px;gap:6px}
+.pf select{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:4px 6px}
+.linkbtn{border:0;background:none;color:var(--muted);cursor:pointer;padding:6px 4px;font-size:12.5px}.linkbtn:hover{color:var(--text);text-decoration:underline}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}.btn.primary:disabled{opacity:.45;cursor:default}
 </style>
 <header>
   <div class=top><h1>Scout</h1><span id=stats></span>
-    <button class=btn id=allread>Mark all read</button><button class=btn id=refresh>Check now</button></div>
+    <button class=btn id=addbtn title="Save a paper, video, repo or page by its link">+ Add</button><button class=btn id=prefsbtn>Interests</button><button class=btn id=allread>Mark all read</button><button class=btn id=refresh>Check now</button></div>
   <div class=bar>
     <span class=seg id=srcs></span>
     <input id=q type=search placeholder="Search  ( / )">
@@ -966,6 +1198,29 @@ details summary::-webkit-details-marker{display:none}details p{margin:6px 0 0;fo
   <div id=errs></div>
 </header>
 <main id=list></main>
+<dialog id=prefs class=sheet><form id=pform>
+  <div class=ph><h3>Scout interests</h3><p>What Scout searches for, and what Argo ranks highest. Saving runs a fresh check.</p></div>
+  <div class=pb>
+    <div class=sec style="margin-top:10px"><b>What you care about</b>
+      <small>Describe it in plain words. Every item is scored 0–10 against this.</small>
+      <textarea id=p_profile rows=4></textarea></div>
+    <div class="sec two">
+      <div><b>Papers &amp; repos</b><small>Searched on arXiv and GitHub</small><div class=tags id=t_kw></div><small class=err></small></div>
+      <div><b>Papers only</b><small>Broad terms for arXiv only (they'd flood GitHub)</small><div class=tags id=t_ax></div><small class=err></small></div>
+    </div>
+    <div class=sec><b>YouTube channels</b><small>New videos from these channels. Add one by @handle or channel link.</small>
+      <div class="tags chan" id=t_yt></div><small class=err></small></div>
+  </div>
+  <div class=pf><label>Check every <select id=p_hours></select></label><span class=msg id=p_msg></span>
+    <button type=button class=linkbtn id=p_reset>Reset to defaults</button>
+    <button type=button class=btn id=p_cancel>Cancel</button><button class="btn primary" id=p_save>Save</button></div>
+</form></dialog>
+<dialog id=adddlg class=sheet><form id=aform>
+  <div class=ph><h3>Save a link</h3><p>An arXiv paper, YouTube video, GitHub repo, or any web page. It goes straight to Saved.</p></div>
+  <div class=pb><div class=sec style="margin-top:10px"><textarea id=a_urls rows=3
+    placeholder="Paste a link and press Enter (several links: one per line)"></textarea><div id=a_log></div></div></div>
+  <div class=pf><span class=msg></span><button type=button class=btn id=a_cancel>Close</button><button class="btn primary" id=a_save>Save</button></div>
+</form></dialog>
 <script>
 const SRCS=['All','arXiv','YouTube','GitHub','Saved'];
 let feed={items:[]}, src=localStorage.src||'All';
@@ -983,7 +1238,7 @@ function card(x){
   sc.title=x.score==null?'Not ranked yet (Argo unreachable?)':'Score '+x.score;
   sc.style.setProperty('--h',x.score==null?220:Math.round(x.score*12));
   const a=$('.title');a.href=x.url;a.textContent=x.title;a.onclick=()=>{if(!x.read)post({id:x.id,read:true})};
-  $('.src').textContent=x.src;$('.by').textContent=[x.by,x.date].filter(Boolean).join(' · ');
+  $('.src').textContent=x.src;$('.by').textContent=[x.by,x.date,x.manual&&'added by you'].filter(Boolean).join(' · ');
   $('.why').textContent=x.why;
   if(x.text)$('details p').textContent=x.text;else $('details').remove();
   const [up,down,save,task]=d.querySelectorAll('.acts button');
@@ -1015,7 +1270,88 @@ async function load(){feed=await (await fetch('/api/feed')).json();render()}
 q.oninput=low.onchange=render;
 refresh.onclick=()=>fetch('/api/feed/refresh',{method:'POST'}).then(()=>setTimeout(load,500));
 allread.onclick=()=>post({all_read:true});
-addEventListener('keydown',e=>{if(e.key==='/'&&document.activeElement.tagName!=='INPUT'){e.preventDefault();q.focus()}});
+// Tag input: Enter (or comma) adds, × or Backspace removes, pasting several lines adds them all.
+// For YouTube, each entry is looked up first and stored as "UC... name".
+function tags(el,ph,lookup){
+  let vals=[];const inp=document.createElement('input'),err=el.nextElementSibling;inp.placeholder=ph;
+  const key=v=>lookup?v.split(' ')[0]:v.toLowerCase();
+  function draw(){
+    el.replaceChildren(...vals.map((v,i)=>{
+      const t=document.createElement('span');t.className='tag';
+      const id=v.split(' ')[0],l=document.createElement(lookup?'a':'span');
+      l.textContent=lookup?v.split(' ').slice(1).join(' ')||id:v;
+      if(lookup){l.href='https://www.youtube.com/channel/'+id;l.target='_blank';l.title=id}
+      const x=document.createElement('button');x.type='button';x.textContent='×';x.title='Remove';
+      x.onclick=()=>{vals.splice(i,1);draw();changed();inp.focus()};
+      t.append(l,x);return t}),inp);
+  }
+  async function add(raw){
+    err.textContent='';
+    for(const it of raw.split(lookup?/\n/:/[\n,]/).map(s=>s.trim()).filter(Boolean)){
+      let v=it;
+      if(lookup){
+        inp.disabled=true;inp.value='';inp.placeholder=`Looking up ${it}…`;
+        const r=await fetch('/api/scout/channel',{method:'POST',body:JSON.stringify({q:it})}),j=await r.json();
+        inp.disabled=false;inp.placeholder=ph;
+        if(!r.ok){err.textContent=`${it}: ${j.error}`;inp.value=it;inp.focus();return}
+        v=j.line;
+      }
+      if(vals.some(x=>key(x)===key(v)))err.textContent=`Already added: ${lookup?v.split(' ').slice(1).join(' '):v}`;else vals.push(v);
+    }
+    inp.value='';draw();changed();inp.focus();
+  }
+  inp.onkeydown=e=>{
+    if(e.key==='Enter'||(e.key===','&&!lookup)){e.preventDefault();if(inp.value.trim())add(inp.value)}
+    else if(e.key==='Backspace'&&!inp.value&&vals.length){vals.pop();draw();changed();inp.focus()}
+  };
+  inp.onpaste=e=>{const t=e.clipboardData.getData('text');if(t.includes('\n')){e.preventDefault();add(t)}};
+  inp.onblur=()=>{if(!lookup&&inp.value.trim())add(inp.value)};
+  el.onclick=e=>{if(e.target===el)inp.focus()};
+  return {set(v){vals=[...v];err.textContent='';inp.value='';draw()},get:()=>vals};
+}
+const kw=tags(t_kw,'Add a term…'),ax=tags(t_ax,'Add a term…'),yt=tags(t_yt,'Add @handle or channel link, then Enter',true);
+const state=()=>JSON.stringify({scout_profile:p_profile.value.trim(),scout_keywords:kw.get(),scout_arxiv_keywords:ax.get(),
+  scout_youtube:yt.get(),scout_hours:+p_hours.value});
+let saved='';
+function changed(){p_save.disabled=state()===saved}
+p_profile.oninput=p_hours.onchange=changed;
+async function openPrefs(){
+  const c=await (await fetch('/api/scout/settings')).json();
+  p_profile.value=c.scout_profile;kw.set(c.scout_keywords);ax.set(c.scout_arxiv_keywords);yt.set(c.scout_youtube);
+  p_hours.replaceChildren(...[...new Set([1,2,3,6,12,24,c.scout_hours])].sort((a,b)=>a-b)
+    .map(h=>new Option(h===1?'hour':h===24?'day':`${h} hours`,h)));
+  p_hours.value=c.scout_hours;p_msg.textContent='';p_msg.className='msg';saved=state();changed();prefs.showModal();
+}
+async function savePrefs(body){
+  p_msg.className='msg';p_msg.textContent=body.reset?'Resetting…':'Saving…';
+  const r=await fetch('/api/scout/settings',{method:'POST',body:JSON.stringify(body)});
+  if(!r.ok){p_msg.className='msg bad';p_msg.textContent=(await r.json()).error;return}
+  prefs.close();setTimeout(load,500);
+}
+const discard=()=>p_save.disabled||confirm('Discard your changes?');
+prefsbtn.onclick=openPrefs;
+addbtn.onclick=()=>{a_urls.value='';a_log.replaceChildren();a_save.disabled=false;adddlg.showModal();a_urls.focus()};
+a_cancel.onclick=()=>adddlg.close();
+a_urls.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();aform.requestSubmit()}};
+aform.onsubmit=async e=>{
+  e.preventDefault();
+  const urls=a_urls.value.split(/\s+/).filter(Boolean),bad=[];if(!urls.length)return;
+  a_save.disabled=true;a_log.replaceChildren();
+  for(const u of urls){
+    const row=document.createElement('div');row.className='alog';row.textContent=`Reading ${u}…`;a_log.append(row);
+    const r=await fetch('/api/feed/add',{method:'POST',body:JSON.stringify({url:u})}),j=await r.json();
+    if(r.ok)row.textContent=(j.existing?'★ Already in Scout, now saved: ':'★ Saved: ')+j.title;
+    else{row.textContent=`⚠︎ ${u}: ${j.error}`;row.classList.add('bad');bad.push(u)}
+  }
+  a_save.disabled=false;a_urls.value=bad.join('\n');
+  src='Saved';localStorage.src=src;load();setTimeout(load,10000);  // Argo's score lands a few seconds later
+  if(!bad.length)setTimeout(()=>adddlg.close(),1200);
+};
+p_cancel.onclick=()=>discard()&&prefs.close();
+prefs.oncancel=e=>{if(!discard())e.preventDefault()};  // Esc
+p_reset.onclick=()=>confirm('Reset interests, search terms and channels to the defaults?')&&savePrefs({reset:true});
+pform.onsubmit=e=>{e.preventDefault();savePrefs(JSON.parse(state()))};
+addEventListener('keydown',e=>{if(e.key==='/'&&!/INPUT|TEXTAREA/.test(document.activeElement.tagName)){e.preventDefault();q.focus()}});
 q.onkeydown=e=>{if(e.key==='Escape'){q.value='';render();q.blur()}};
 let tick=0;setInterval(()=>{if((feed.busy||++tick%6===0)&&!document.querySelector('details[open]'))load()},5000);
 load();
