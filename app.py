@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Survey Corps: local todo list fed by emails dragged from Outlook. Run: python3 app.py"""
+from collections import Counter
 import html, json, re, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email import message_from_bytes, policy
+from email.utils import parseaddr
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -16,7 +18,11 @@ INBOX = DATA / "inbox"   # fallback: drag emails from Outlook into this Finder f
 DB = DATA / "todos.json"
 CONFIG = DATA / "config.json"  # optional: {"argo_user": "<ANL username>", "argo_model": "claudesonnet5"}
 ARGO = "https://apps.inside.anl.gov/argoapi/v1/chat/completions"
+BRIEFED = DATA / "briefed"  # date of the last morning briefing
 lock = threading.Lock()
+retry_busy = threading.Lock()
+argo_ok, argo_at = None, 0.0  # last Argo call: outcome (None = not tried yet) and when; shown in the UI
+busy, busy_lock = Counter(), threading.Lock()  # Argo calls in flight, by tag: task id, "ask", "briefing", "scout", "check"
 
 
 def load():
@@ -45,7 +51,7 @@ def email_text(msg):
 
 
 def clean_suggestion(text, now):
-    """Pull {"labels", "due"} out of the model's reply, dropping anything malformed or already past."""
+    """Pull {"labels", "due", "title", "actions"} out of the model's reply, dropping anything malformed or already past."""
     m = re.search(r"\{.*\}", text, re.S)
     try:
         d = json.loads(m.group(0)) if m else {}
@@ -57,15 +63,22 @@ def clean_suggestion(text, now):
         ok = datetime.strptime(due, "%Y-%m-%dT%H:%M") > now
     except ValueError:
         ok = False
-    return {"labels": [l for l in labels if len(l) <= 24], "due": due if ok else ""}
+    actions = [str(x).strip()[:200] for x in d.get("actions") or [] if str(x).strip()][:8]
+    return {"labels": [l for l in labels if len(l) <= 24], "due": due if ok else "",
+            "title": str(d.get("title") or "").strip()[:200], "actions": actions if len(actions) > 1 else []}
 
 
 def config():
     return json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
 
 
-def argo(prompt, max_tokens):
-    """Ask the lab's Argo LLM. Returns the reply text, or None if unconfigured or unreachable (e.g. no VPN)."""
+def argo_on():
+    return bool(config().get("argo_user"))
+
+
+def argo(prompt, max_tokens, timeout=120, tag=""):
+    """Ask the lab's Argo LLM. Returns the reply text, or None if unconfigured, down or unreachable (e.g. no VPN)."""
+    global argo_ok, argo_at
     cfg = config()
     if not cfg.get("argo_user"):
         return None
@@ -73,27 +86,51 @@ def argo(prompt, max_tokens):
         "model": cfg.get("argo_model", "claudesonnet5"), "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}]}).encode(),
         {"Content-Type": "application/json", "Authorization": "Bearer " + cfg["argo_user"]})
+    with busy_lock:
+        busy[tag] += 1
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            return json.load(r)["choices"][0]["message"]["content"]
-    except Exception:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            text = json.load(r)["choices"][0]["message"]["content"]
+    except Exception:  # down, 5xx, timeout, off VPN, malformed reply: all the same to callers
+        argo_ok = False
         return None
+    finally:
+        argo_at = time.time()
+        with busy_lock:
+            busy[tag] -= 1
+    argo_ok = True
+    return text
+
+
+def check_argo():
+    argo("Reply with OK.", 5, timeout=20, tag="check")
 
 
 def suggest(t, known):
-    """Labels and a due date for a dropped email, or {} if Argo isn't available."""
+    """Labels, due date and action items for a dropped email (or a cleaned title for a typed task).
+    None if Argo didn't answer; {} if it answered nonsense."""
     now = datetime.now()
-    prompt = (f"Today is {now:%A %Y-%m-%d %H:%M} (local time). Existing labels: {json.dumps(known)}.\n"
-              "Below is an email I saved as a to-do. Reply with ONLY a JSON object "
-              '{"labels": [...], "due": "..."}.\n'
-              "- labels: up to 3 short labels (1-2 words, Title Case). Reuse an existing label whenever one fits; "
-              "invent a new one only if none does.\n"
-              '- due: when I must act by, as local YYYY-MM-DDTHH:MM. Resolve relative dates ("by Friday") against the '
-              'email\'s own Date header; if only a date is given use 17:00. Use "" if the email states no deadline '
-              "(do not invent one).\n\n"
-              f"Subject: {t['title']}\nFrom: {t['sender']}\nDate: {t['date']}\n\n{t['body'][:3000]}")
-    reply = argo(prompt, 200)
-    return clean_suggestion(reply, now) if reply else {}
+    labels = ("- labels: up to 3 short labels (1-2 words, Title Case). Reuse an existing label whenever one fits; "
+              "invent a new one only if none does.\n")
+    if t["eml"]:
+        prompt = (f"Today is {now:%A %Y-%m-%d %H:%M} (local time). Existing labels: {json.dumps(known)}.\n"
+                  "Below is an email I saved as a to-do. Reply with ONLY a JSON object "
+                  '{"labels": [...], "due": "...", "actions": [...]}.\n' + labels +
+                  '- due: when I must act by, as local YYYY-MM-DDTHH:MM. Resolve relative dates ("by Friday") against the '
+                  'email\'s own Date header; if only a date is given use 17:00. Use "" if the email states no deadline '
+                  "(do not invent one).\n"
+                  "- actions: if the email asks ME to do several distinct things, each one as a short imperative to-do "
+                  "(max 12 words); otherwise [].\n\n"
+                  f"Subject: {t['title']}\nFrom: {t['sender']}\nDate: {t['date']}\n\n{t['body'][:3000]}")
+    else:
+        prompt = (f"Today is {now:%A %Y-%m-%d %H:%M} (local time). Existing labels: {json.dumps(known)}.\n"
+                  "Below is a to-do I typed. Reply with ONLY a JSON object "
+                  '{"title": "...", "labels": [...], "due": "..."}.\n'
+                  "- title: the task restated cleanly, without the date/time words, first letter capitalised.\n" + labels +
+                  '- due: the deadline it mentions, as local YYYY-MM-DDTHH:MM resolved against today; if only a date is '
+                  'given use 17:00. Use "" if it mentions no time (do not invent one).\n\n' + t["body"][:3000])
+    reply = argo(prompt, 800, tag=t["id"])
+    return None if reply is None else clean_suggestion(reply, now)
 
 
 def enrich(t):
@@ -101,36 +138,147 @@ def enrich(t):
     with lock:
         known = sorted({l for x in load() for l in x.get("labels", [])})
     s = suggest(t, known)
-    if not s:
-        return
     with lock:
         todos = load()
         cur = next((x for x in todos if x["id"] == t["id"]), None)
-        if not cur:
+        if not cur or not argo_on():
             return
+        if s is None:  # Argo down: retry_argo() tries again later
+            cur["retry"] = "enrich"
+            return save(todos)
+        cur.pop("retry", None)
+        if not s:
+            return save(todos)
         if s["labels"] and not cur.get("labels"):
             cur["labels"] = sorted(set(s["labels"]))
         if s["due"] and not cur["due"]:
             cur["due"], cur["notified"] = s["due"], False
+        if s["title"] and not t["eml"] and cur["title"] == t["title"]:  # typed task the user hasn't renamed
+            cur["title"], cur["body"] = s["title"], "" if cur["body"] == t["title"] else cur["body"]
+        if s["actions"] and not cur.get("actions"):
+            cur["actions"] = s["actions"]
         save(todos)
 
 
+def blank():
+    return {"id": uuid.uuid4().hex[:12], "done": False, "due": "", "notified": False, "note": "",
+            "added": datetime.now().isoformat(timespec="minutes")}
+
+
 def make_todo(raw, name):
-    tid = uuid.uuid4().hex[:12]
-    t = {"id": tid, "done": False, "due": "", "notified": False, "note": "",
-         "added": datetime.now().isoformat(timespec="minutes")}
+    t = blank()
+    tid = t["id"]
     msg = message_from_bytes(raw, policy=policy.default)
     if name.lower().endswith(".eml") or (msg["From"] and msg["Subject"] is not None):
         (MAILS / f"{tid}.eml").write_bytes(raw)
         text = email_text(msg)
         t.update(title=str(msg["Subject"] or "(no subject)"), sender=str(msg["From"] or ""),
                  date=str(msg["Date"] or ""), body=text.strip()[:3000], eml=True)
-        threading.Thread(target=enrich, args=(t,), daemon=True).start()
     else:  # plain text (manual todo, or Outlook only handed over text)
         text = raw.decode("utf-8", "replace").strip()
         t.update(title=(text.splitlines() or ["(empty)"])[0][:200], sender="", date="",
                  body=text[:3000], eml=False)
+    threading.Thread(target=enrich, args=(t,), daemon=True).start()
     return t
+
+
+def summarize(t):
+    """Background: a 2-line summary of a Scout reading task in its note, unless the user has written one meanwhile."""
+    text = argo("In 2 short lines: what is this and why might it matter to me?\n"
+                f"My interests: {({**SCOUT, **config()})['scout_profile']}\n\n{t['title'].removeprefix('Read: ')}\n{t['body']}", 600, tag=t["id"])
+    with lock:
+        todos = load()
+        cur = next((x for x in todos if x["id"] == t["id"]), None)
+        if not cur or not argo_on():
+            return
+        if text is None:  # Argo down: retry_argo() tries again later
+            cur["retry"] = "summary"
+        else:
+            cur.pop("retry", None)
+            if not cur["note"]:
+                cur["note"] = text.strip()
+        save(todos)
+
+
+def retry_argo():
+    """Redo Argo work that failed while it was down. Stops at the first failure: still down, try next round."""
+    if not retry_busy.acquire(blocking=False):
+        return
+    try:
+        with lock:
+            todo = [t for t in load() if t.get("retry") and not t["done"]]
+        for t in todo:
+            (summarize if t["retry"] == "summary" else enrich)(t)
+            if not argo_ok:
+                break
+        if argo_on() and time.time() - argo_at > 600:  # idle: ping it so the status in the UI stays current
+            check_argo()
+    finally:
+        retry_busy.release()
+
+
+def draft_reply(t):
+    """Argo drafts a reply; it opens as a new Outlook message (never sent) and is copied to the clipboard."""
+    msg = message_from_bytes((MAILS / f"{t.get('mail', t['id'])}.eml").read_bytes(), policy=policy.default)
+    text = argo("Draft my reply to the email below. Write only the reply body: plain text, no subject line, no signature, "
+                "match the sender's tone and language, keep it short."
+                + (f" My notes on how to answer: {t['note']}" if t["note"] else "")
+                + f"\n\nFrom: {t['sender']}\nDate: {t['date']}\nSubject: {msg['Subject']}\n\n{t['body']}", 1500, timeout=90, tag=t["id"])
+    if not text:
+        return None
+    text = text.strip()
+    subprocess.run(["pbcopy"], input=text.encode())
+    subj = str(msg["Subject"] or "")
+    subj = subj if subj.lower().startswith("re:") else "Re: " + subj
+    url = (f"mailto:{urllib.parse.quote(parseaddr(str(msg['Reply-To'] or msg['From'] or ''))[1])}?"
+           + urllib.parse.urlencode({"subject": subj, "body": text}, quote_via=urllib.parse.quote))
+    if subprocess.run(["open", "-a", "Microsoft Outlook", url]).returncode:
+        subprocess.run(["open", url])
+    return text
+
+
+STOP = set("a an the and or of to in on at for with about what who whom when where which how did does do is are was "
+           "were be been i me my we our you your it its this that these those from by any all there have has had "
+           "ask asked tell told say said".split())
+
+
+def ask(q):
+    """Answer a question from saved emails/tasks: keyword-pick the likeliest ones, then let Argo read them."""
+    words = [w for w in re.findall(r"\w+", q.lower()) if w not in STOP and len(w) > 2]
+    with lock:
+        todos = load()
+    hay = lambda t: " ".join([t["title"], t["sender"], t["date"], t["body"], t["note"], *t.get("labels", [])]).lower()
+    # ponytail: keyword-overlap ranking over <= a few thousand tasks; embeddings if it misses obvious matches
+    hits = sorted(todos, key=lambda t: -sum(hay(t).count(w) for w in words))[:12]
+    ctx = "\n\n".join(f"[{t['title']}] from {t['sender'] or '-'} | {t['date'] or t['added']} | due {t['due'] or 'none'} | "
+                       f"{'done' if t['done'] else 'open'}\n{t['body'][:1500]}" + (f"\nMy notes: {t['note']}" if t["note"] else "")
+                       for t in hits)
+    return argo(f"Today is {datetime.now():%A %Y-%m-%d}. Answer my question using only the saved emails/tasks below. "
+                "Be brief and plain text; name the item (by its [subject]) the answer comes from. "
+                f"If they don't contain the answer, say so.\n\nQuestion: {q}\n\n{ctx}", 2000, timeout=90, tag="ask")
+
+
+def briefing():
+    """Once a day after briefing_hour (default 8): one notification with what's overdue/due today and where to start."""
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    if now.hour < config().get("briefing_hour", 8) or (BRIEFED.exists() and BRIEFED.read_text() == today):
+        return
+    BRIEFED.write_text(today)
+    stamp = now.strftime("%Y-%m-%dT%H:%M")
+    with lock:
+        todos = [t for t in load() if not t["done"] and t["due"]]
+    late = sorted((t for t in todos if t["due"] <= stamp), key=lambda t: t["due"])
+    due = sorted((t for t in todos if t["due"] > stamp and t["due"].startswith(today)), key=lambda t: t["due"])
+    if not late and not due:
+        return
+    head = ", ".join(x for x in (f"{len(late)} overdue" if late else "", f"{len(due)} due today" if due else "") if x)
+    lines = "\n".join(f"- {t['title']} (due {t['due']}{', OVERDUE' if t in late else ''})" for t in (late + due)[:30])
+    def send():  # in its own thread, so a slow or down Argo never holds up due-date notifications
+        tip = argo(f"It's {now:%A %H:%M}. These are my overdue and due-today tasks. In under 25 words, tell me which 3 to "
+                   "start with (short names only). Plain text, no preamble.\n" + lines, 300, timeout=60, tag="briefing")
+        notify(f"Good morning: {head}", (tip or "Start with: " + "; ".join(t["title"] for t in (late + due)[:3])).strip())
+    threading.Thread(target=send, daemon=True).start()
 
 
 def notify(title, msg):
@@ -140,6 +288,7 @@ def notify(title, msg):
 
 
 def watcher():
+    last_retry = 0
     while True:
         now = datetime.now().strftime("%Y-%m-%dT%H:%M")
         with lock:
@@ -154,6 +303,10 @@ def watcher():
                     t["notified"] = changed = True
             if changed:
                 save(todos)
+        briefing()
+        if time.time() - last_retry > 600:  # every 10 min, and right after launch
+            last_retry = time.time()
+            threading.Thread(target=retry_argo, daemon=True).start()
         time.sleep(20)
 
 
@@ -241,7 +394,7 @@ def rank(items, cfg, liked, disliked):
               + (f"Recently I was NOT interested in: {'; '.join(disliked)}\n" if disliked else "")
               + "Rate how much I'd want to see each item below, 0 (irrelevant) to 10 (must read). Reply with ONLY a JSON "
               'array: [{"i": <number>, "score": <0-10>, "why": "<why it matters to me, max 15 words>"}]\n\n' + lines)
-    return clean_scores(argo(prompt, 80 * len(items) + 200))
+    return clean_scores(argo(prompt, 80 * len(items) + 200, tag="scout"))
 
 
 def run_scout():
@@ -333,6 +486,11 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/api/todos":
             with lock:
                 self.reply(200, json.dumps(load()).encode())
+        elif self.path == "/api/status":
+            with busy_lock:
+                working = sorted(k for k, n in busy.items() if n > 0)
+            self.reply(200, json.dumps({"configured": argo_on(), "argo": argo_ok, "checked": argo_at, "busy": working,
+                                        "rev": DB.stat().st_mtime if DB.exists() else 0}).encode())
         elif self.path == "/feed":
             self.reply(200, FEED_PAGE.encode(), "text/html; charset=utf-8")
         elif self.path == "/api/feed":
@@ -352,6 +510,38 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/feed/refresh":
             threading.Thread(target=run_scout, daemon=True).start()
             return self.reply(200)
+        if u.path == "/api/feed/task":  # Scout card -> "Read: ..." task; Argo writes a 2-line summary as its note
+            fid = json.loads(raw or b"{}").get("id")
+            with feed_lock:
+                f = load_feed()
+                x = next((x for x in f["items"] if x["id"] == fid), None)
+                if not x:
+                    return self.reply(404)
+                if x.get("task"):
+                    return self.reply(200)
+                x["task"] = True
+                save_feed(f)
+            t = {**blank(), "title": "Read: " + x["title"], "sender": " · ".join(filter(None, [x["src"], x["by"]])),
+                 "date": x["date"], "body": f"{x['url']}\n\n{x['text']}", "eml": False, "labels": ["Reading"]}
+            with lock:
+                todos = load()
+                todos.insert(0, t)
+                save(todos)
+            threading.Thread(target=summarize, args=(t,), daemon=True).start()
+            return self.reply(200)
+        if u.path == "/api/argo/check":
+            check_argo()
+            return self.reply(200)
+        if u.path == "/api/ask":
+            answer = (ask(json.loads(raw or b"{}").get("q", "")) or "").replace("**", "")  # plain-text box
+            return self.reply(200, json.dumps({"answer": answer}).encode()) if answer else self.reply(503)
+        if u.path.startswith("/api/reply/"):
+            with lock:
+                t = next((x for x in load() if x["id"] == u.path.rsplit("/", 1)[1]), None)
+            if not t or not t.get("eml"):
+                return self.reply(404)
+            text = draft_reply(t)
+            return self.reply(200, json.dumps({"draft": text}).encode()) if text else self.reply(503)
         if u.path == "/api/feed/update":  # {"id": ..., "vote"/"saved"/"read": ...}, or {"all_read": true}
             patch = json.loads(raw or b"{}")
             with feed_lock:
@@ -374,18 +564,26 @@ class H(BaseHTTPRequestHandler):
                     return self.reply(404)
                 if parts[3] == "update":
                     patch = json.loads(raw or b"{}")
-                    for k in ("title", "due", "done", "note"):
+                    for k in ("title", "due", "done", "note", "actions"):
                         if k in patch:
                             t[k] = patch[k]
                     if "labels" in patch:
                         t["labels"] = sorted({str(x).strip() for x in patch["labels"] if str(x).strip()})
                     if "due" in patch:
                         t["notified"] = False
+                elif parts[3] == "split":  # one suggested action item -> its own task, sharing the email
+                    title = json.loads(raw or b"{}").get("title", "").strip()
+                    t["actions"] = [a for a in t.get("actions", []) if a != title]
+                    if title:
+                        todos.insert(0, {**t, **blank(), "title": title, "actions": [], "due": t["due"], "retry": "",
+                                         "mail": t.get("mail", t["id"])})
                 elif parts[3] == "delete":
                     todos.remove(t)
-                    (MAILS / f"{t['id']}.eml").unlink(missing_ok=True)
+                    mid = t.get("mail", t["id"])
+                    if not any(x.get("mail", x["id"]) == mid for x in todos):  # split-off tasks may share the email
+                        (MAILS / f"{mid}.eml").unlink(missing_ok=True)
                 elif parts[3] == "open":
-                    eml = MAILS / f"{t['id']}.eml"
+                    eml = MAILS / f"{t.get('mail', t['id'])}.eml"
                     if subprocess.run(["open", "-a", "Microsoft Outlook", eml]).returncode:
                         subprocess.run(["open", eml])  # Outlook missing: default mail app
             else:
@@ -397,7 +595,7 @@ class H(BaseHTTPRequestHandler):
         pass
 
 
-PAGE = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width"><title>Survey Corps</title>
+PAGE = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width"><title>Task Manager</title>
 <style>
 :root{color-scheme:light dark;--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--muted:#6e6e73;--line:#e2e2e7;--hover:#f0f0f4;
   --accent:#0a84ff;--red:#d70015;--redbg:#ff3b3014;--chipL:32%}
@@ -471,27 +669,46 @@ textarea:focus{border-color:var(--accent)}
   background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 65% var(--chipL))}
 .ev.late{background:var(--redbg);color:var(--red);font-weight:600}.ev.done{text-decoration:line-through;opacity:.55}
 .more{font-size:11px;color:var(--muted);padding:0 5px}
+.ai{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;margin-top:5px;font-size:12px;color:var(--muted)}
+.act{border:1px dashed var(--line);border-radius:10px;padding:1px 8px;cursor:pointer;color:var(--text)}
+.act:hover{border-color:var(--accent);color:var(--accent)}.act b{font-weight:400;margin-left:4px;opacity:.5}.act b:hover{opacity:1;color:var(--red)}
+.icon.busy{opacity:1;animation:pulse 1s infinite}@keyframes pulse{50%{opacity:.25}}
+#ans{position:relative;background:var(--card);border:1px solid var(--accent);border-radius:10px;padding:10px 32px 10px 12px;margin:12px 0 0;white-space:pre-wrap}
+#ans button{position:absolute;top:6px;right:6px;border:0;background:none;cursor:pointer;color:var(--muted)}
+#toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:10;background:var(--text);color:var(--bg);
+  border-radius:8px;padding:8px 14px;font-size:12.5px;opacity:0;transition:opacity .2s;pointer-events:none}#toast.on{opacity:.92}
+.pill{margin-left:auto;align-self:center;display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);
+  border-radius:12px;padding:2px 10px;font-size:12px;color:var(--muted);cursor:pointer}.pill:hover{border-color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}.pill.ok .dot{background:#34c759}.pill.down{color:var(--red)}.pill.down .dot{background:var(--red)}
+.pill.busy{color:var(--accent)}.pill.busy .dot{background:none;border:2px solid var(--accent);border-right-color:transparent;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.ev.thinking{outline:1.5px solid var(--accent);animation:pulse 1s infinite}
+.argoing{display:none;color:var(--accent)}.t.thinking .argoing{display:inline}
+.t.thinking{border-color:var(--accent);background:linear-gradient(90deg,var(--card) 30%,color-mix(in srgb,var(--accent) 12%,var(--card)) 50%,var(--card) 70%) 0 0/300% 100%;
+  animation:shimmer 1.8s linear infinite}@keyframes shimmer{from{background-position:100% 0}to{background-position:0 0}}
 #drop{display:none;position:fixed;inset:8px;z-index:9;pointer-events:none;align-items:center;justify-content:center;
   border:3px dashed var(--accent);border-radius:14px;background:#0a84ff1a;color:var(--accent);font-size:20px;font-weight:600}
 #drop.over{display:flex}
 </style>
-<div id=drop>Drop email to add a task</div>
+<div id=drop>Drop email to add a task</div><div id=toast></div>
 <header>
-  <div class=top><h1>Survey Corps</h1><span id=stats></span></div>
+  <div class=top><h1>Task Manager</h1><span id=stats></span><button id=argo class=pill></button></div>
   <div class=bar>
-    <input id=new placeholder="Add a task and press Enter, or drag an email from Outlook anywhere">
-    <input id=q type=search placeholder="Search  ( / )">
+    <input id=new placeholder="Add a task (&quot;review Bob's draft by Fri 3pm&quot;) or drag in emails from Outlook">
+    <input id=q type=search placeholder="Search, or ask a question ending in ?  ( / )">
     <select id=lf><option value="">All labels</option></select>
     <span class=seg><button id=vl>List</button><button id=vc>Calendar</button></span>
   </div>
 </header>
 <datalist id=labels></datalist>
-<main><div id=cal hidden></div><div id=list></div><details id=donebox><summary id=donehdr></summary><div id=donelist></div></details></main>
+<main><div id=ans hidden></div><div id=cal hidden></div><div id=list></div><details id=donebox><summary id=donehdr></summary><div id=donelist></div></details></main>
 <script>
 const api=(p,b)=>fetch(p,{method:'POST',body:typeof b==='string'||b instanceof Blob?b:JSON.stringify(b)}).then(load);
 const nowStr=()=>new Date(Date.now()-new Date().getTimezoneOffset()*6e4).toISOString().slice(0,16);
 const DAY=864e5, dayDiff=d=>Math.round((new Date(d).setHours(0,0,0,0)-new Date().setHours(0,0,0,0))/DAY);
 const MAIL='<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3.5 6.5 8.5 6 8.5-6"/></svg>';
+const REPLY='<svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 6 6v4"/></svg>';
+function toast(m){const e=document.getElementById('toast');e.textContent=m;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),4000)}
 const TRASH='<svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M5.5 7l1 12a2 2 0 0 0 2 2h7a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>';
 function fmtDue(s){
   const d=new Date(s),n=dayDiff(s),time=d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});
@@ -508,13 +725,13 @@ function senderName(s){return (s||'').replace(/<[^>]*>/,'').replace(/"/g,'').tri
 function shortDate(s){const d=new Date(s);return isNaN(d)?s:d.toLocaleDateString([],{month:'short',day:'numeric',year:d.getFullYear()!==new Date().getFullYear()?'numeric':undefined})}
 function item(t){
   const d=document.createElement('div'),late=t.due&&!t.done&&t.due<=nowStr();
-  d.className='t'+(t.done?' done':'')+(late?' late':'');
+  d.className='t'+(t.done?' done':'')+(late?' late':'')+(st.busy.includes(t.id)?' thinking':''); d.dataset.id=t.id;
   d.innerHTML=`<input type=checkbox class=cb title="Mark done">
     <div class=main><input class=title type=text spellcheck=false>
-      <div class=meta><span class=info></span><span class=chips></span><input class=addl list=labels placeholder="+ label"></div>
+      <div class=meta><span class=argoing>✨ Argo is working on this…</span><span class=info></span><span class=chips></span><input class=addl list=labels placeholder="+ label"></div>
       <details><summary>Email & notes</summary><pre></pre><textarea rows=2 placeholder="Notes…"></textarea></details></div>
     <div class=side><button class=due></button><input type=datetime-local hidden>
-      <button class="icon o" title="Open in Outlook">${MAIL}</button><button class="icon x" title="Delete">${TRASH}</button></div>`;
+      <button class="icon r" title="Draft a reply with Argo">${REPLY}</button><button class="icon o" title="Open in Outlook">${MAIL}</button><button class="icon x" title="Delete">${TRASH}</button></div>`;
   const $=s=>d.querySelector(s), up=p=>api(`/api/todo/${t.id}/update`,p);
   const cb=$('.cb'); cb.checked=t.done; cb.onchange=()=>up({done:cb.checked});
   const ti=$('.title'); ti.value=t.title; ti.title=t.title; ti.onchange=()=>up({title:ti.value});
@@ -528,6 +745,21 @@ function item(t){
   du.value=t.due; du.onchange=()=>{if(du.value)up({due:du.value})};
   db.onclick=()=>{db.hidden=true;du.hidden=false;du.focus();try{du.showPicker()}catch{}};
   du.onblur=()=>{if(du.value===t.due){du.hidden=true;db.hidden=false}};
+  const r=$('.r'); r.hidden=!t.eml;
+  r.onclick=async()=>{if(r.disabled)return;r.disabled=true;r.classList.add('busy');toast('Drafting a reply…');
+    const res=await fetch(`/api/reply/${t.id}`,{method:'POST'}).catch(()=>({}));r.disabled=false;r.classList.remove('busy');
+    load();toast(res.ok?'Draft opened in Outlook (also copied to the clipboard)':'Argo is unavailable right now (down, or not on VPN). Try again later.')};
+  if(t.actions?.length){
+    const a=document.createElement('div');a.className='ai';a.append('Action items:');
+    for(const s of t.actions){
+      const b=document.createElement('span');b.className='act';b.textContent='+ '+s;b.title='Add as its own task';
+      b.onclick=()=>api(`/api/todo/${t.id}/split`,{title:s});
+      const x=document.createElement('b');x.textContent='×';x.title='Dismiss';
+      x.onclick=e=>{e.stopPropagation();up({actions:t.actions.filter(y=>y!==s)})};
+      b.append(x);a.append(b);
+    }
+    $('.meta').after(a);
+  }
   const o=$('.o'); o.hidden=!t.eml; o.onclick=()=>api(`/api/todo/${t.id}/open`);
   $('.x').onclick=()=>confirm(`Delete "${t.title}"?`)&&api(`/api/todo/${t.id}/delete`);
   const info=$('.info'); info.textContent=[senderName(t.sender),t.date&&shortDate(t.date)].filter(Boolean).join(' · ');
@@ -584,6 +816,7 @@ function renderCal(shown){
     for(const t of ts.slice(0,3)){
       const e=el('div','ev'+(t.done?' done':'')+(!t.done&&t.due<=nowStr()?' late':''),t.title);
       e.style.setProperty('--h',(t.labels||[])[0]?hue(t.labels[0]):210);e.title=t.title+'\n'+fmtDue(t.due);
+      e.dataset.id=t.id;if(st.busy.includes(t.id))e.classList.add('thinking');
       e.draggable=true;e.ondragstart=ev=>{dragId=t.id;ev.dataTransfer.setData('application/x-todo',t.id)};e.ondragend=()=>dragId=null;
       c.append(e);
     }
@@ -606,7 +839,7 @@ function render(){
   const cur=lf.value;
   lf.replaceChildren(new Option('All labels',''),...names.map(n=>new Option(n)));
   lf.value=names.includes(cur)?cur:'';
-  const words=q.value.toLowerCase().split(/\s+/).filter(Boolean);
+  const words=q.value.trim().endsWith('?')?[]:q.value.toLowerCase().split(/\s+/).filter(Boolean);
   const shown=all.filter(t=>(!lf.value||(t.labels||[]).includes(lf.value))&&words.every(w=>
     [t.title,t.sender,t.body,t.note,...(t.labels||[])].join(' ').toLowerCase().includes(w)));
   const open=shown.filter(t=>!t.done).sort((a,b)=>(a.due||'z').localeCompare(b.due||'z'));
@@ -629,9 +862,31 @@ function render(){
   donebox.hidden=isCal||!done.length; donehdr.textContent=`Done · ${done.length}`;
   const openAll=all.filter(t=>!t.done), late=openAll.filter(t=>t.due&&t.due<=nowStr()).length;
   stats.textContent=`${openAll.length} open`+(late?` · ${late} overdue`:'');
-  document.title=`Survey Corps (${openAll.length})`;
+  document.title=`Task Manager (${openAll.length})`;
 }
-async function load(){all=await (await fetch('/api/todos')).json();render()}
+let st={busy:[]}, rev=0;
+async function load(){
+  [all,st]=await Promise.all(['/api/todos','/api/status'].map(u=>fetch(u).then(r=>r.json())));rev=st.rev;render();pill()}
+function pill(){  // Argo status in the header: off / reachable / unavailable / working
+  const work=st.busy.filter(x=>x!=='check'), checking=st.busy.includes('check'), waiting=all.filter(t=>t.retry&&!t.done).length;
+  const ago=st.checked?Math.round(Date.now()/6e4-st.checked/60):null;
+  argo.className='pill'+(!st.configured?'':work.length||checking?' busy':st.argo?' ok':st.argo===false?' down':'');
+  const dot=document.createElement('span');dot.className='dot';
+  argo.replaceChildren(dot,!st.configured?'Argo off':work.length?`Argo working${work.length>1?` on ${work.length}`:''}…`
+    :checking?'Checking Argo…':st.argo===false?'Argo unavailable'+(waiting?` · ${waiting} waiting`:''):'Argo');
+  argo.title=!st.configured?'LLM features are off. Set "argo_user" in data/config.json to turn them on.'
+    :(st.argo===false?'Argo is down, or you are off VPN. Waiting work retries every 10 min.':st.argo?'Argo is reachable.':'Not checked yet.')
+    +(ago!=null?` Last contact ${ago<1?'just now':ago<60?ago+' min ago':Math.round(ago/60)+' h ago'}.`:'')+' Click to check now.';
+}
+async function tick(){
+  try{st=await (await fetch('/api/status')).json()}catch{return}
+  pill();
+  for(const e of document.querySelectorAll('[data-id]'))e.classList.toggle('thinking',st.busy.includes(e.dataset.id));
+  // data changed on the server (LLM fill-ins, retries, Scout 📌): reload, unless the user is in the middle of something
+  if(st.rev!==rev&&document.activeElement===document.body&&!document.querySelector('.t details[open]'))load();
+}
+argo.onclick=()=>{fetch('/api/argo/check',{method:'POST'}).then(tick);setTimeout(tick,150)};
+setInterval(tick,2000);
 q.oninput=lf.onchange=render;
 vl.onclick=()=>{view='list';localStorage.view=view;render()};vc.onclick=()=>{view='cal';localStorage.view=view;render()};
 document.getElementById('new').onkeydown=e=>{
@@ -640,7 +895,17 @@ document.getElementById('new').onkeydown=e=>{
   if(e.key==='Escape')e.target.blur();
 };
 addEventListener('keydown',e=>{if(e.key==='/'&&!/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)){e.preventDefault();q.focus()}});
-q.onkeydown=e=>{if(e.key==='Escape'){q.value='';render();q.blur()}};
+function answer(text){const b=document.createElement('button');b.textContent='×';b.title='Close';b.onclick=()=>ans.hidden=true;
+  ans.replaceChildren(text,b);ans.hidden=false}
+q.onkeydown=async e=>{
+  if(e.key==='Escape'){q.value='';ans.hidden=true;render();q.blur()}
+  const v=q.value.trim();
+  if(e.key==='Enter'&&v.endsWith('?')){
+    answer('Asking Argo…');
+    const r=await fetch('/api/ask',{method:'POST',body:JSON.stringify({q:v})}).catch(()=>({}));
+    load();answer(r.ok?(await r.json()).answer:'Argo is unavailable right now (down, or not on VPN). Try again later.');
+  }
+};
 addEventListener('dragover',e=>{e.preventDefault();if(!dragId)drop.classList.add('over')});
 addEventListener('dragleave',e=>{if(!e.relatedTarget)drop.classList.remove('over')});  // only when leaving the window
 addEventListener('drop',async e=>{
@@ -649,9 +914,9 @@ addEventListener('drop',async e=>{
   for(const f of files) await fetch('/api/drop?name='+encodeURIComponent(f.name),{method:'POST',body:f});
   const txt=!files.length&&(e.dataTransfer.getData('text/plain')||e.dataTransfer.getData('text/uri-list'));
   if(txt) await fetch('/api/drop?name=drop.txt',{method:'POST',body:txt});
-  load(); setTimeout(load,8000); setTimeout(load,20000);  // labels/due arrive from the LLM a few seconds later
+  load();
 });
-setInterval(()=>{if(!document.querySelector('.t details[open]')&&document.activeElement===document.body)load()},30000);
+setInterval(()=>{if(!document.querySelector('.t details[open]')&&document.activeElement===document.body)load()},60000);  // due-date groups move with the clock
 load();
 </script>"""
 
@@ -712,7 +977,7 @@ function card(x){
   d.innerHTML=`<div class=score></div><div class=body><a class=title target=_blank></a>
     <div class=meta><span class=src></span> · <span class=by></span></div><div class=why></div>
     <details><summary>Details</summary><p></p></details></div>
-    <div class=acts><button title="More like this">👍</button><button title="Less like this">👎</button><button title="Save">☆</button></div>`;
+    <div class=acts><button title="More like this">👍</button><button title="Less like this">👎</button><button title="Save">☆</button><button title="Add to Task Manager as a reading task">📌</button></div>`;
   const $=s=>d.querySelector(s);
   const sc=$('.score');sc.textContent=x.score==null?'·':Math.round(x.score);
   sc.title=x.score==null?'Not ranked yet (Argo unreachable?)':'Score '+x.score;
@@ -721,7 +986,9 @@ function card(x){
   $('.src').textContent=x.src;$('.by').textContent=[x.by,x.date].filter(Boolean).join(' · ');
   $('.why').textContent=x.why;
   if(x.text)$('details p').textContent=x.text;else $('details').remove();
-  const [up,down,save]=d.querySelectorAll('.acts button');
+  const [up,down,save,task]=d.querySelectorAll('.acts button');
+  task.classList.toggle('on',!!x.task);if(x.task)task.title='Added to Task Manager';
+  task.onclick=()=>x.task||fetch('/api/feed/task',{method:'POST',body:JSON.stringify({id:x.id})}).then(load);
   up.classList.toggle('on',x.vote>0);down.classList.toggle('on',x.vote<0);save.classList.toggle('on',x.saved);
   if(x.saved)save.textContent='★';
   up.onclick=()=>post({id:x.id,vote:x.vote>0?0:1});down.onclick=()=>post({id:x.id,vote:x.vote<0?0:-1,read:true});
@@ -735,7 +1002,7 @@ function render(){
   const shown=feed.items.filter(x=>(src==='All'||(src==='Saved'?x.saved:x.src===src))
     &&(src==='Saved'||(x.vote>=0&&(low.checked||x.score==null||x.score>=5)))
     &&words.every(w=>[x.title,x.by,x.text,x.why].join(' ').toLowerCase().includes(w)))
-    .sort((a,b)=>(a.read-b.read)||((b.score??4.5)-(a.score??4.5))||b.date.localeCompare(a.date));
+    .sort((a,b)=>((b.score??4.5)-(a.score??4.5))||b.date.localeCompare(a.date));
   list.replaceChildren(...shown.slice(0,300).map(card));
   if(!shown.length){const e=document.createElement('div');e.className='empty';
     e.textContent=feed.last?'Nothing here yet.':'First check is running…';list.append(e)}

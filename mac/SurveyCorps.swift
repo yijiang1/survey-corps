@@ -59,7 +59,7 @@ class DropWebView: WKWebView {
 }
 
 // Original plush-chibi pet: swept-back blond hair, thick brows, square jaw, stern look, holding a letter. 64x64 box.
-// scout: the second pet (Scout window) — black hair, grey eyes, red scarf, holding a spyglass.
+// scout: the second pet (Scout window) — Hange-style researcher: messy brown ponytail, glasses, excited grin, magnifying glass.
 func drawPet(_ b: NSRect, scout: Bool = false) {
     let k = min(b.width, b.height) / 64
     NSGraphicsContext.current?.cgContext.scaleBy(x: k, y: k)
@@ -69,15 +69,26 @@ func drawPet(_ b: NSRect, scout: Bool = false) {
     func oval(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) -> NSBezierPath {
         NSBezierPath(ovalIn: NSRect(x: x, y: y, width: w, height: h))
     }
-    let hair = scout ? rgb(48, 44, 56) : rgb(250, 226, 130), hairDark = scout ? rgb(20, 18, 26) : rgb(214, 178, 72), skin = rgb(248, 216, 192), skinEdge = rgb(222, 180, 152)
+    let hair = scout ? rgb(128, 84, 52) : rgb(250, 226, 130), hairDark = scout ? rgb(82, 50, 28) : rgb(214, 178, 72), skin = rgb(248, 216, 192), skinEdge = rgb(222, 180, 152)
     let ink = rgb(35, 28, 26)
     let sh = NSShadow(); sh.shadowBlurRadius = 3; sh.shadowOffset = NSSize(width: 0, height: -1)
     sh.shadowColor = NSColor.black.withAlphaComponent(0.35)
 
-    // back of the hair
+    // back of the hair (scout: plus a messy high ponytail poking up on the right)
     NSGraphicsContext.saveGraphicsState(); sh.set()
+    if scout {
+        let tail = NSBezierPath(); tail.move(to: NSPoint(x: 38, y: 56))
+        for (x, y): (CGFloat, CGFloat) in [(43, 63.5), (46.5, 59.5), (52, 63.5), (52, 58.5), (58, 60), (54.5, 54), (60, 52), (50, 50)] {
+            tail.line(to: NSPoint(x: x, y: y))
+        }
+        tail.close(); tail.lineJoinStyle = .round
+        hair.setFill(); tail.fill(); hairDark.setStroke(); tail.lineWidth = 0.9; tail.stroke()
+    }
     let back = NSBezierPath(roundedRect: NSRect(x: 7, y: 20, width: 50, height: 42), xRadius: 23, yRadius: 22)
     hair.setFill(); back.fill()
+    if scout {  // hair tie at the ponytail's base
+        rgb(176, 48, 48).setFill(); NSBezierPath(roundedRect: NSRect(x: 42.5, y: 56.5, width: 7, height: 4), xRadius: 2, yRadius: 2).fill()
+    }
     NSGraphicsContext.restoreGraphicsState()
 
     // wide plush face
@@ -90,10 +101,10 @@ func drawPet(_ b: NSRect, scout: Bool = false) {
         NSColor.white.setFill(); eye.fill()
         NSGraphicsContext.saveGraphicsState(); eye.addClip()
         let iris = oval(cx - 4.3, 25.5, 8.6, 9.6)
-        NSGradient(starting: scout ? rgb(45, 50, 62) : rgb(15, 70, 160), ending: scout ? rgb(140, 150, 168) : rgb(80, 185, 245))!
+        NSGradient(starting: scout ? rgb(72, 40, 22) : rgb(15, 70, 160), ending: scout ? rgb(186, 120, 62) : rgb(80, 185, 245))!
             .draw(in: iris, angle: -90)
-        (scout ? rgb(30, 32, 40) : rgb(10, 45, 110)).setStroke(); iris.lineWidth = 0.7; iris.stroke()
-        (scout ? rgb(20, 22, 30, 0.85) : rgb(15, 40, 95, 0.8)).setFill(); oval(cx - 2, 28.5, 4, 4.4).fill()
+        (scout ? rgb(60, 32, 18) : rgb(10, 45, 110)).setStroke(); iris.lineWidth = 0.7; iris.stroke()
+        (scout ? rgb(45, 22, 12, 0.85) : rgb(15, 40, 95, 0.8)).setFill(); oval(cx - 2, 28.5, 4, 4.4).fill()
         NSColor.white.setFill(); oval(cx - dir * 1.4 - 1.5, 30.6, 3, 3).fill()      // main highlight
         NSColor.white.withAlphaComponent(0.9).setFill(); oval(cx + dir * 1.6 - 0.7, 27.0, 1.4, 1.4).fill()
         NSGraphicsContext.restoreGraphicsState()
@@ -132,11 +143,28 @@ func drawPet(_ b: NSRect, scout: Bool = false) {
     shine.curve(to: NSPoint(x: 30, y: 60.3), controlPoint1: NSPoint(x: 23, y: 59.5), controlPoint2: NSPoint(x: 26.5, y: 60.3))
     NSColor.white.withAlphaComponent(0.65).setStroke(); shine.lineWidth = 1.5; shine.lineCapStyle = .round; shine.stroke()
 
-    // thick slanted brows showing between the strands
-    for (a, c): ((CGFloat, CGFloat), (CGFloat, CGFloat)) in [((19.5, 38.4), (27, 37.4)), ((44.5, 38.4), (37, 37.4))] {
-        let br = NSBezierPath(); br.move(to: NSPoint(x: a.0, y: a.1)); br.line(to: NSPoint(x: c.0, y: c.1))
-        ink.setStroke(); br.lineWidth = 1.3; br.lineCapStyle = .round; br.stroke()
+    // round glasses with a glint, bridge and arms
+    for cx: CGFloat in [23.5, 40.5] {
+        let lens = NSBezierPath(roundedRect: NSRect(x: cx - 6.3, y: 24.2, width: 12.6, height: 12.4), xRadius: 5.8, yRadius: 5.8)
+        NSColor.white.withAlphaComponent(0.12).setFill(); lens.fill()
+        rgb(60, 40, 30).setStroke(); lens.lineWidth = 1.25; lens.stroke()
+        let glint = NSBezierPath(); glint.move(to: NSPoint(x: cx + 1.5, y: 35)); glint.line(to: NSPoint(x: cx + 4.5, y: 32))
+        NSColor.white.withAlphaComponent(0.75).setStroke(); glint.lineWidth = 1.1; glint.lineCapStyle = .round; glint.stroke()
     }
+    let frame = NSBezierPath()
+    for (a, c): ((CGFloat, CGFloat), (CGFloat, CGFloat)) in [((29.2, 31.5), (34.8, 31.5)), ((17.2, 32), (11.5, 33.5)), ((46.8, 32), (52.5, 33.5))] {
+        frame.move(to: NSPoint(x: a.0, y: a.1)); frame.line(to: NSPoint(x: c.0, y: c.1))
+    }
+    rgb(60, 40, 30).setStroke(); frame.lineWidth = 1.25; frame.lineCapStyle = .round; frame.stroke()
+
+    // excited open grin and rosy cheeks
+    let grin = NSBezierPath(); grin.move(to: NSPoint(x: 28.3, y: 22.6))
+    grin.curve(to: NSPoint(x: 35.7, y: 22.6), controlPoint1: NSPoint(x: 29, y: 16.8), controlPoint2: NSPoint(x: 35, y: 16.8))
+    grin.close(); rgb(130, 40, 45).setFill(); grin.fill()
+    NSGraphicsContext.saveGraphicsState(); grin.addClip(); rgb(240, 120, 130).setFill(); oval(29.5, 17.5, 5, 3).fill()
+    NSGraphicsContext.restoreGraphicsState()
+    ink.setStroke(); grin.lineWidth = 0.8; grin.lineJoinStyle = .round; grin.stroke()
+    rgb(250, 130, 130, 0.35).setFill(); oval(13.5, 21, 6, 3.4).fill(); oval(44.5, 21, 6, 3.4).fill()
 
     } else {
         // swept-back hair with a side part and a high hairline; short sideburns
@@ -175,25 +203,23 @@ func drawPet(_ b: NSRect, scout: Bool = false) {
     }
 
     if scout {
-        // red scarf over the chin, tail hanging to one side
-        let red = rgb(200, 34, 44), redDark = rgb(150, 20, 30)
-        let tail = NSBezierPath(roundedRect: NSRect(x: 41, y: 2, width: 8, height: 12), xRadius: 3, yRadius: 3)
-        let band = NSBezierPath(roundedRect: NSRect(x: 13, y: 9, width: 38, height: 9), xRadius: 4.5, yRadius: 4.5)
-        for p in [tail, band] { red.setFill(); p.fill(); redDark.setStroke(); p.lineWidth = 0.8; p.stroke() }
-        // brass spyglass held across the front
+        // tan uniform jacket collar over a white shirt
+        let jacket = NSBezierPath(roundedRect: NSRect(x: 14, y: 2, width: 36, height: 14), xRadius: 6, yRadius: 6)
+        rgb(196, 160, 112).setFill(); jacket.fill(); rgb(150, 115, 72).setStroke(); jacket.lineWidth = 0.8; jacket.stroke()
+        let shirt = NSBezierPath(); shirt.move(to: NSPoint(x: 26, y: 16)); shirt.line(to: NSPoint(x: 32, y: 6)); shirt.line(to: NSPoint(x: 38, y: 16)); shirt.close()
+        NSColor.white.setFill(); shirt.fill(); rgb(150, 115, 72).setStroke(); shirt.lineWidth = 0.8; shirt.stroke()
+        // magnifying glass held up beside the face
         NSGraphicsContext.saveGraphicsState(); sh.set()
-        let t = NSAffineTransform(); t.translateX(by: 30, yBy: 5); t.rotate(byDegrees: 12); t.concat()
-        let tube = NSBezierPath(roundedRect: NSRect(x: -15, y: -3, width: 26, height: 6), xRadius: 2, yRadius: 2)
-        rgb(196, 146, 66).setFill(); tube.fill()
+        let handle = NSBezierPath(); handle.move(to: NSPoint(x: 45, y: 3)); handle.line(to: NSPoint(x: 51, y: 11.5))
+        rgb(110, 70, 40).setStroke(); handle.lineWidth = 3.2; handle.lineCapStyle = .round; handle.stroke()
+        let ring = oval(48, 10, 13, 13)
+        rgb(170, 225, 250, 0.45).setFill(); ring.fill()
         NSGraphicsContext.restoreGraphicsState()
-        NSGraphicsContext.saveGraphicsState(); t.concat()
-        let lens = NSBezierPath(roundedRect: NSRect(x: 10, y: -4.5, width: 7, height: 9), xRadius: 2, yRadius: 2)
-        rgb(150, 104, 40).setFill(); lens.fill()
-        rgb(150, 230, 255).setFill(); oval(15.2, -3, 1.6, 6).fill()
-        rgb(120, 82, 30).setStroke()
-        for x: CGFloat in [-8, 2] { let r = NSBezierPath(); r.move(to: NSPoint(x: x, y: -3)); r.line(to: NSPoint(x: x, y: 3)); r.lineWidth = 1; r.stroke() }
-        NSGraphicsContext.restoreGraphicsState()
-        for x: CGFloat in [11.5, 38] {
+        rgb(196, 146, 66).setStroke(); ring.lineWidth = 2.2; ring.stroke()
+        let glare = NSBezierPath(); glare.move(to: NSPoint(x: 51.5, y: 18.5))
+        glare.curve(to: NSPoint(x: 55, y: 21), controlPoint1: NSPoint(x: 52, y: 20), controlPoint2: NSPoint(x: 53.5, y: 21))
+        NSColor.white.withAlphaComponent(0.85).setStroke(); glare.lineWidth = 1.2; glare.lineCapStyle = .round; glare.stroke()
+        for x: CGFloat in [10.5, 41.5] {
             let hand = oval(x, 1.5, 7, 7); skin.setFill(); hand.fill(); skinEdge.setStroke(); hand.lineWidth = 0.9; hand.stroke()
         }
         return
@@ -263,7 +289,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
         web.uiDelegate = self
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Survey Corps"
+        window.title = "Task Manager"
         window.minSize = NSSize(width: 820, height: 480)
         window.contentView = web
         window.center()
@@ -287,7 +313,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
         feedWeb.load(URLRequest(url: feedURL))
 
         let view = PetView()
-        view.toolTip = "Survey Corps: click to show/hide, drag to move"
+        view.toolTip = "Task Manager: click to show/hide, drag to move"
         view.onClick = { [unowned self] in self.toggle(self.window) }
         pet = makePet(view, offset: 26)
         let scoutView = PetView()
@@ -394,7 +420,7 @@ app.delegate = delegate
 let mainMenu = NSMenu()
 let appMenu = NSMenu()
 appMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
-appMenu.addItem(withTitle: "Quit Survey Corps", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+appMenu.addItem(withTitle: "Quit Task Manager", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 let editMenu = NSMenu(title: "Edit")
 for (title, sel, key) in [("Undo", "undo:", "z"), ("Redo", "redo:", "Z"), ("Cut", "cut:", "x"),
                           ("Copy", "copy:", "c"), ("Paste", "paste:", "v"), ("Select All", "selectAll:", "a")] {
