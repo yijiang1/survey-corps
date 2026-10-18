@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Survey Corps: local todo list fed by emails dragged from Outlook. Run: python3 app.py"""
-import html, json, re, subprocess, sys, threading, time, urllib.request, uuid
-from datetime import datetime
+import html, json, re, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 from email import message_from_bytes, policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -156,6 +157,168 @@ def watcher():
         time.sleep(20)
 
 
+# ---- Scout: new arXiv papers, YouTube videos and GitHub repos, ranked by Argo against your interests ----
+FEED = DATA / "feed.json"  # {"last": "...", "errors": [...], "seen": [ids], "items": [...]}
+feed_lock, scout_busy = threading.Lock(), threading.Lock()
+SCOUT = {  # defaults; override any of these keys in data/config.json
+    "scout_profile": "Two equally important areas. (1) Ptychography, 4D-STEM and electron/X-ray microscopy; phase retrieval and computational imaging; "
+                     "tomography and CT reconstruction; inverse problems with deep learning or diffusion models; "
+                     "(2) AI/LLM agents (agent architectures, tool use, autonomous research agents, agent benchmarks); "
+                     "recursive self-improvement (RSI): self-improving and self-evolving agents and models.",
+    "scout_keywords": ["ptychography", "phase retrieval", "4D-STEM", "computational imaging", "tomographic reconstruction"],
+    "scout_arxiv_keywords": ["recursive self-improvement", "self-improving agent", "self-evolving agent",
+                             "LLM agent", "AI agent", "agentic"],  # arXiv only (too noisy as GitHub searches)
+    "scout_youtube": [],  # channel ids ("UC..."): the channel page → Share → Copy channel ID
+    "scout_hours": 3,     # how often to check
+}
+ATOM, YT, MEDIA = "{http://www.w3.org/2005/Atom}", "{http://www.youtube.com/xml/schemas/2015}", "{http://search.yahoo.com/mrss/}"
+
+
+def load_feed():
+    return json.loads(FEED.read_text()) if FEED.exists() else {"last": "", "errors": [], "seen": [], "items": []}
+
+
+def save_feed(f):
+    tmp = FEED.with_suffix(".tmp")
+    tmp.write_text(json.dumps(f, indent=1, ensure_ascii=False))
+    tmp.replace(FEED)
+
+
+def fetch(url, headers=None):
+    req = urllib.request.Request(url, headers={"User-Agent": "survey-corps", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
+def flat(s, n=1200):
+    return " ".join((s or "").split())[:n]
+
+
+def parse_arxiv(xml):
+    out = []
+    for e in ET.fromstring(xml).iter(ATOM + "entry"):
+        aid = re.sub(r"v\d+$", "", e.findtext(ATOM + "id", "").split("/abs/")[-1])
+        authors = [a.findtext(ATOM + "name", "") for a in e.findall(ATOM + "author")]
+        out.append({"id": "arxiv:" + aid, "src": "arXiv", "title": flat(e.findtext(ATOM + "title")),
+                    "url": "https://arxiv.org/abs/" + aid, "date": e.findtext(ATOM + "published", "")[:10],
+                    "by": ", ".join(authors[:3]) + (" et al." if len(authors) > 3 else ""),
+                    "text": flat(e.findtext(ATOM + "summary"))})
+    return out
+
+
+def parse_youtube(xml):
+    return [{"id": "yt:" + e.findtext(YT + "videoId"), "src": "YouTube", "title": flat(e.findtext(ATOM + "title")),
+             "url": "https://www.youtube.com/watch?v=" + e.findtext(YT + "videoId"),
+             "by": e.findtext(f"{ATOM}author/{ATOM}name", ""), "date": e.findtext(ATOM + "published", "")[:10],
+             "text": flat(e.findtext(f"{MEDIA}group/{MEDIA}description"))}
+            for e in ET.fromstring(xml).iter(ATOM + "entry")]
+
+
+def parse_github(data):
+    return [{"id": "gh:" + r["full_name"], "src": "GitHub", "title": r["full_name"], "url": r["html_url"],
+             "by": f"★ {r['stargazers_count']}" + (f" · {r['language']}" if r.get("language") else ""),
+             "date": r["pushed_at"][:10], "text": flat(r.get("description"))}
+            for r in json.loads(data)["items"]]
+
+
+def clean_scores(text):
+    """{index: (score 0-10, why)} from the model's JSON array reply. Each {...} is parsed on its own,
+    so a reply cut off mid-array still keeps the entries before the cut; malformed ones are dropped."""
+    out = {}
+    for m in re.finditer(r"\{[^{}]*\}", text or ""):
+        try:
+            r = json.loads(m.group(0))
+            out[int(r["i"])] = (max(0.0, min(10.0, float(r["score"]))), flat(str(r.get("why", "")), 160))
+        except (KeyError, TypeError, ValueError):
+            pass
+    return out
+
+
+def rank(items, cfg, liked, disliked):
+    lines = "\n".join(f"{i}. [{x['src']}] {x['title']} ({x['by']}): {x['text'][:400]}" for i, x in enumerate(items))
+    prompt = (f"My interests: {cfg['scout_profile']}\n"
+              + (f"Recently I liked: {'; '.join(liked)}\n" if liked else "")
+              + (f"Recently I was NOT interested in: {'; '.join(disliked)}\n" if disliked else "")
+              + "Rate how much I'd want to see each item below, 0 (irrelevant) to 10 (must read). Reply with ONLY a JSON "
+              'array: [{"i": <number>, "score": <0-10>, "why": "<why it matters to me, max 15 words>"}]\n\n' + lines)
+    return clean_scores(argo(prompt, 80 * len(items) + 200))
+
+
+def run_scout():
+    """Fetch every source, keep the unseen items, then score anything not scored yet (in batches)."""
+    if not scout_busy.acquire(blocking=False):
+        return
+    try:
+        cfg = {**SCOUT, **config()}
+        since = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        gh = {"Authorization": "Bearer " + cfg["github_token"]} if cfg.get("github_token") else {}
+        # one query per keyword, so a busy topic (agents) can't crowd a quiet one (ptychography) out of the results
+        jobs = [(f"arXiv '{k}'", lambda k=k: parse_arxiv(fetch("https://export.arxiv.org/api/query?search_query="
+                                                              + urllib.parse.quote(f'all:"{k}"')
+                                                              + "&sortBy=submittedDate&sortOrder=descending&max_results=15")))
+                for k in cfg["scout_keywords"] + cfg["scout_arxiv_keywords"]]
+        jobs += [(f"YouTube {c}", lambda c=c: parse_youtube(fetch("https://www.youtube.com/feeds/videos.xml?channel_id=" + c)))
+                 for c in cfg["scout_youtube"]]
+        jobs += [(f"GitHub '{k}'", lambda k=k: parse_github(fetch("https://api.github.com/search/repositories?sort=stars&per_page=10&q="
+                                                                  + urllib.parse.quote(f'"{k}" pushed:>{since}'), gh)))
+                 for k in cfg["scout_keywords"]]
+        found, errors, arxiv_down = [], [], False
+        for name, job in jobs:
+            is_arxiv = name.startswith("arXiv")
+            if is_arxiv and arxiv_down:
+                continue  # rate-limited/down: more calls only extend the block
+            try:
+                found += job()
+            except Exception as e:
+                arxiv_down = is_arxiv
+                errors.append(f"arXiv unavailable ({e}); skipped arXiv this round, will retry next check" if is_arxiv
+                              else f"{name}: {e}")
+            if is_arxiv:
+                time.sleep(3)  # arXiv API asks for 3 s between calls
+        with feed_lock:
+            f = load_feed()
+            seen = set(f["seen"])
+            now = datetime.now().isoformat(timespec="minutes")
+            for x in found:
+                if x["id"] not in seen:
+                    seen.add(x["id"])
+                    f["items"].insert(0, {**x, "added": now, "score": None, "why": "", "vote": 0, "saved": False, "read": False})
+            f["seen"] = sorted(seen)
+            # ponytail: keeps the newest 1000 + saved; ids stay in "seen" so pruned items never come back
+            f["items"] = [x for i, x in enumerate(f["items"]) if i < 1000 or x["saved"]]
+            f["last"], f["errors"] = now, errors
+            todo = [x for x in f["items"] if x["score"] is None]
+            liked = [x["title"] for x in f["items"] if x["vote"] > 0 or x["saved"]][:15]
+            disliked = [x["title"] for x in f["items"] if x["vote"] < 0][:15]
+            save_feed(f)
+        picks = 0
+        for i in range(0, len(todo), 25):
+            batch = todo[i:i + 25]
+            scores = rank(batch, cfg, liked, disliked)
+            if not scores:
+                break  # Argo unreachable: leave them unscored, retry next round
+            with feed_lock:
+                f = load_feed()
+                by_id = {x["id"]: x for x in f["items"]}
+                for j, (score, why) in scores.items():
+                    if 0 <= j < len(batch) and batch[j]["id"] in by_id:
+                        by_id[batch[j]["id"]].update(score=score, why=why)
+                        picks += score >= 8
+                save_feed(f)
+        if picks:
+            notify("Scout", f"{picks} new pick{'s' * (picks > 1)} for you")
+    finally:
+        scout_busy.release()
+
+
+def scout_loop():
+    while True:
+        hours = {**SCOUT, **config()}["scout_hours"]
+        if load_feed()["last"] < (datetime.now() - timedelta(hours=hours)).isoformat(timespec="minutes"):
+            run_scout()  # also catches up right after launch if the Mac was off
+        time.sleep(600)
+
+
 class H(BaseHTTPRequestHandler):
     def reply(self, code, body=b"{}", ctype="application/json"):
         self.send_response(code)
@@ -170,6 +333,14 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/api/todos":
             with lock:
                 self.reply(200, json.dumps(load()).encode())
+        elif self.path == "/feed":
+            self.reply(200, FEED_PAGE.encode(), "text/html; charset=utf-8")
+        elif self.path == "/api/feed":
+            with feed_lock:
+                f = load_feed()
+            f.pop("seen")
+            f["busy"] = scout_busy.locked()
+            self.reply(200, json.dumps(f).encode())
         else:
             self.reply(404)
 
@@ -178,6 +349,20 @@ class H(BaseHTTPRequestHandler):
             return self.reply(403)
         u = urlparse(self.path)
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if u.path == "/api/feed/refresh":
+            threading.Thread(target=run_scout, daemon=True).start()
+            return self.reply(200)
+        if u.path == "/api/feed/update":  # {"id": ..., "vote"/"saved"/"read": ...}, or {"all_read": true}
+            patch = json.loads(raw or b"{}")
+            with feed_lock:
+                f = load_feed()
+                for x in f["items"]:
+                    if patch.get("all_read"):
+                        x["read"] = True
+                    elif x["id"] == patch.get("id"):
+                        x.update({k: patch[k] for k in ("vote", "saved", "read") if k in patch})
+                save_feed(f)
+            return self.reply(200)
         parts = u.path.strip("/").split("/")  # api/drop | api/todo/<id>/<action>
         with lock:
             todos = load()
@@ -470,10 +655,110 @@ setInterval(()=>{if(!document.querySelector('.t details[open]')&&document.active
 load();
 </script>"""
 
+FEED_PAGE = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width"><title>Scout</title>
+<style>
+:root{color-scheme:light dark;--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--muted:#6e6e73;--line:#e2e2e7;--hover:#f0f0f4;--accent:#0a84ff;--gold:#b25000}
+@media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2a2a2d;--text:#f2f2f7;--muted:#98989f;--line:#3a3a3d;--hover:#323236;--gold:#ffb340}}
+*{box-sizing:border-box}
+body{font:13.5px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;margin:0;background:var(--bg);color:var(--text)}
+button,input{font:inherit;color:inherit}
+header{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 85%,transparent);backdrop-filter:blur(12px);
+  padding:14px 20px 10px;border-bottom:1px solid var(--line)}
+.top{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}h1{font-size:20px;margin:0}#stats{color:var(--muted);flex:1}
+.bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.bar input[type=search]{flex:1;min-width:160px;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 10px;outline:none}
+.bar input:focus{border-color:var(--accent)}
+.seg{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button,.btn{border:0;background:var(--card);padding:6px 12px;cursor:pointer}.seg .on{background:var(--accent);color:#fff}
+.btn{border:1px solid var(--line);border-radius:8px}.btn:hover{background:var(--hover)}
+label{color:var(--muted);font-size:12px;display:flex;gap:4px;align-items:center}
+#errs{color:var(--gold);font-size:12px;margin-top:6px}
+main{padding:6px 20px 40px}
+.empty{text-align:center;color:var(--muted);padding:60px 0;font-size:15px}
+.c{display:flex;gap:12px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:6px 0}
+.c:hover{background:var(--hover)}.c.read{opacity:.6}
+.score{flex:none;width:34px;height:34px;border-radius:9px;display:grid;place-content:center;font-weight:700;font-size:14px;
+  background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 60% 40%)}
+@media (prefers-color-scheme:dark){.score{color:hsl(var(--h) 70% 72%)}}
+.body{flex:1;min-width:0}
+.title{font-weight:600;font-size:14px;color:inherit;text-decoration:none}.title:hover{color:var(--accent);text-decoration:underline}
+.meta{color:var(--muted);font-size:12px;margin-top:2px}.src{font-weight:600}
+.why{margin-top:4px;font-style:italic}
+details summary{font-size:12px;color:var(--muted);cursor:pointer;margin-top:4px;list-style:none}
+details summary::-webkit-details-marker{display:none}details p{margin:6px 0 0;font-size:12.5px;line-height:1.5}
+.acts{flex:none;display:flex;gap:2px;align-items:flex-start}
+.acts button{border:0;background:none;border-radius:6px;width:30px;height:28px;cursor:pointer;opacity:.35;font-size:14px}
+.c:hover .acts button{opacity:.8}.acts button:hover{background:var(--line);opacity:1}.acts .on{opacity:1!important}
+</style>
+<header>
+  <div class=top><h1>Scout</h1><span id=stats></span>
+    <button class=btn id=allread>Mark all read</button><button class=btn id=refresh>Check now</button></div>
+  <div class=bar>
+    <span class=seg id=srcs></span>
+    <input id=q type=search placeholder="Search  ( / )">
+    <label><input type=checkbox id=low> Show low scores</label>
+  </div>
+  <div id=errs></div>
+</header>
+<main id=list></main>
+<script>
+const SRCS=['All','arXiv','YouTube','GitHub','Saved'];
+let feed={items:[]}, src=localStorage.src||'All';
+const post=b=>fetch('/api/feed/update',{method:'POST',body:JSON.stringify(b)}).then(load);
+function ago(s){if(!s)return 'never';const m=Math.round((Date.now()-new Date(s))/6e4);
+  return m<1?'just now':m<60?m+' min ago':m<1440?Math.round(m/60)+' h ago':Math.round(m/1440)+' d ago'}
+function card(x){
+  const d=document.createElement('div');d.className='c'+(x.read?' read':'');
+  d.innerHTML=`<div class=score></div><div class=body><a class=title target=_blank></a>
+    <div class=meta><span class=src></span> · <span class=by></span></div><div class=why></div>
+    <details><summary>Details</summary><p></p></details></div>
+    <div class=acts><button title="More like this">👍</button><button title="Less like this">👎</button><button title="Save">☆</button></div>`;
+  const $=s=>d.querySelector(s);
+  const sc=$('.score');sc.textContent=x.score==null?'·':Math.round(x.score);
+  sc.title=x.score==null?'Not ranked yet (Argo unreachable?)':'Score '+x.score;
+  sc.style.setProperty('--h',x.score==null?220:Math.round(x.score*12));
+  const a=$('.title');a.href=x.url;a.textContent=x.title;a.onclick=()=>{if(!x.read)post({id:x.id,read:true})};
+  $('.src').textContent=x.src;$('.by').textContent=[x.by,x.date].filter(Boolean).join(' · ');
+  $('.why').textContent=x.why;
+  if(x.text)$('details p').textContent=x.text;else $('details').remove();
+  const [up,down,save]=d.querySelectorAll('.acts button');
+  up.classList.toggle('on',x.vote>0);down.classList.toggle('on',x.vote<0);save.classList.toggle('on',x.saved);
+  if(x.saved)save.textContent='★';
+  up.onclick=()=>post({id:x.id,vote:x.vote>0?0:1});down.onclick=()=>post({id:x.id,vote:x.vote<0?0:-1,read:true});
+  save.onclick=()=>post({id:x.id,saved:!x.saved});
+  return d;
+}
+function render(){
+  srcs.replaceChildren(...SRCS.map(s=>{const b=document.createElement('button');b.textContent=s;b.className=s===src?'on':'';
+    b.onclick=()=>{src=s;localStorage.src=s;render()};return b}));
+  const words=q.value.toLowerCase().split(/\s+/).filter(Boolean);
+  const shown=feed.items.filter(x=>(src==='All'||(src==='Saved'?x.saved:x.src===src))
+    &&(src==='Saved'||(x.vote>=0&&(low.checked||x.score==null||x.score>=5)))
+    &&words.every(w=>[x.title,x.by,x.text,x.why].join(' ').toLowerCase().includes(w)))
+    .sort((a,b)=>(a.read-b.read)||((b.score??4.5)-(a.score??4.5))||b.date.localeCompare(a.date));
+  list.replaceChildren(...shown.slice(0,300).map(card));
+  if(!shown.length){const e=document.createElement('div');e.className='empty';
+    e.textContent=feed.last?'Nothing here yet.':'First check is running…';list.append(e)}
+  const picks=feed.items.filter(x=>!x.read&&x.vote>=0&&x.score>=7).length;
+  stats.textContent=(feed.busy?'Checking… · ':'')+`Last checked ${ago(feed.last)}`+(picks?` · ${picks} unread pick${picks>1?'s':''}`:'');
+  errs.textContent=(feed.errors||[]).map(e=>'⚠︎ '+e).join('  ');
+  document.title=picks?`Scout (${picks})`:'Scout';
+}
+async function load(){feed=await (await fetch('/api/feed')).json();render()}
+q.oninput=low.onchange=render;
+refresh.onclick=()=>fetch('/api/feed/refresh',{method:'POST'}).then(()=>setTimeout(load,500));
+allread.onclick=()=>post({all_read:true});
+addEventListener('keydown',e=>{if(e.key==='/'&&document.activeElement.tagName!=='INPUT'){e.preventDefault();q.focus()}});
+q.onkeydown=e=>{if(e.key==='Escape'){q.value='';render();q.blur()}};
+let tick=0;setInterval(()=>{if((feed.busy||++tick%6===0)&&!document.querySelector('details[open]'))load()},5000);
+load();
+</script>"""
+
 if __name__ == "__main__":
     for d in (MAILS, INBOX):
         d.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=watcher, daemon=True).start()
+    threading.Thread(target=scout_loop, daemon=True).start()
     print(f"Survey Corps on {ORIGIN}  (data in {DATA}, Finder fallback inbox: {INBOX})")
     if "--no-browser" not in sys.argv:  # the Mac app passes this and shows its own window
         subprocess.run(["open", "-a", "Safari", ORIGIN])  # Chromium browsers drop Outlook drags

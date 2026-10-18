@@ -6,6 +6,7 @@ import WebKit
 let appPy = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
     .appendingPathComponent("app.py").path
 let base = URL(string: "http://127.0.0.1:8765")!
+let feedURL = base.appendingPathComponent("feed")
 let petSize: CGFloat = 96  // pet icon size in points
 
 class DropWebView: WKWebView {
@@ -57,8 +58,9 @@ class DropWebView: WKWebView {
     }
 }
 
-// Original plush-chibi pet: shaggy blond hair, big blue eyes, serious face, holding a letter. 64x64 box.
-func drawPet(_ b: NSRect) {
+// Original plush-chibi pet: swept-back blond hair, thick brows, square jaw, stern look, holding a letter. 64x64 box.
+// scout: the second pet (Scout window) — black hair, grey eyes, red scarf, holding a spyglass.
+func drawPet(_ b: NSRect, scout: Bool = false) {
     let k = min(b.width, b.height) / 64
     NSGraphicsContext.current?.cgContext.scaleBy(x: k, y: k)
     func rgb(_ r: CGFloat, _ g: CGFloat, _ bl: CGFloat, _ a: CGFloat = 1) -> NSColor {
@@ -67,7 +69,7 @@ func drawPet(_ b: NSRect) {
     func oval(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) -> NSBezierPath {
         NSBezierPath(ovalIn: NSRect(x: x, y: y, width: w, height: h))
     }
-    let hair = rgb(250, 226, 130), hairDark = rgb(214, 178, 72), skin = rgb(248, 216, 192), skinEdge = rgb(222, 180, 152)
+    let hair = scout ? rgb(48, 44, 56) : rgb(250, 226, 130), hairDark = scout ? rgb(20, 18, 26) : rgb(214, 178, 72), skin = rgb(248, 216, 192), skinEdge = rgb(222, 180, 152)
     let ink = rgb(35, 28, 26)
     let sh = NSShadow(); sh.shadowBlurRadius = 3; sh.shadowOffset = NSSize(width: 0, height: -1)
     sh.shadowColor = NSColor.black.withAlphaComponent(0.35)
@@ -79,7 +81,8 @@ func drawPet(_ b: NSRect) {
     NSGraphicsContext.restoreGraphicsState()
 
     // wide plush face
-    let face = oval(11, 15, 42, 36); skin.setFill(); face.fill(); skinEdge.setStroke(); face.lineWidth = 0.8; face.stroke()
+    let face = scout ? oval(11, 15, 42, 36) : NSBezierPath(roundedRect: NSRect(x: 12, y: 15, width: 40, height: 35), xRadius: 16, yRadius: 15)
+    skin.setFill(); face.fill(); skinEdge.setStroke(); face.lineWidth = 0.8; face.stroke()
 
     // eyes: large, round, thick upper lash, glossy blue iris
     for (cx, dir): (CGFloat, CGFloat) in [(23.5, -1), (40.5, 1)] {
@@ -87,9 +90,10 @@ func drawPet(_ b: NSRect) {
         NSColor.white.setFill(); eye.fill()
         NSGraphicsContext.saveGraphicsState(); eye.addClip()
         let iris = oval(cx - 4.3, 25.5, 8.6, 9.6)
-        NSGradient(starting: rgb(15, 70, 160), ending: rgb(80, 185, 245))!.draw(in: iris, angle: -90)
-        rgb(10, 45, 110).setStroke(); iris.lineWidth = 0.7; iris.stroke()
-        rgb(15, 40, 95, 0.8).setFill(); oval(cx - 2, 28.5, 4, 4.4).fill()
+        NSGradient(starting: scout ? rgb(45, 50, 62) : rgb(15, 70, 160), ending: scout ? rgb(140, 150, 168) : rgb(80, 185, 245))!
+            .draw(in: iris, angle: -90)
+        (scout ? rgb(30, 32, 40) : rgb(10, 45, 110)).setStroke(); iris.lineWidth = 0.7; iris.stroke()
+        (scout ? rgb(20, 22, 30, 0.85) : rgb(15, 40, 95, 0.8)).setFill(); oval(cx - 2, 28.5, 4, 4.4).fill()
         NSColor.white.setFill(); oval(cx - dir * 1.4 - 1.5, 30.6, 3, 3).fill()      // main highlight
         NSColor.white.withAlphaComponent(0.9).setFill(); oval(cx + dir * 1.6 - 0.7, 27.0, 1.4, 1.4).fill()
         NSGraphicsContext.restoreGraphicsState()
@@ -108,6 +112,7 @@ func drawPet(_ b: NSRect) {
     mouth.curve(to: NSPoint(x: 34.2, y: 21.6), controlPoint1: NSPoint(x: 31, y: 21.7), controlPoint2: NSPoint(x: 33, y: 21.7))
     ink.setStroke(); mouth.lineWidth = 0.9; mouth.lineCapStyle = .round; mouth.stroke()
 
+    if scout {
     // bangs: shaggy pointed strands over the forehead, long side locks
     let bangs = NSBezierPath(); bangs.move(to: NSPoint(x: 8, y: 40))
     bangs.curve(to: NSPoint(x: 32, y: 62), controlPoint1: NSPoint(x: 7, y: 56), controlPoint2: NSPoint(x: 18, y: 62))
@@ -133,6 +138,67 @@ func drawPet(_ b: NSRect) {
         ink.setStroke(); br.lineWidth = 1.3; br.lineCapStyle = .round; br.stroke()
     }
 
+    } else {
+        // swept-back hair with a side part and a high hairline; short sideburns
+        let top = NSBezierPath(); top.move(to: NSPoint(x: 8, y: 40))
+        top.curve(to: NSPoint(x: 32, y: 62), controlPoint1: NSPoint(x: 7, y: 56), controlPoint2: NSPoint(x: 18, y: 62))
+        top.curve(to: NSPoint(x: 56, y: 40), controlPoint1: NSPoint(x: 46, y: 62), controlPoint2: NSPoint(x: 57, y: 56))
+        for (x, y): (CGFloat, CGFloat) in [(54, 30), (50, 32), (49, 43)] { top.line(to: NSPoint(x: x, y: y)) }
+        top.curve(to: NSPoint(x: 15, y: 43), controlPoint1: NSPoint(x: 40, y: 49), controlPoint2: NSPoint(x: 24, y: 49))
+        for (x, y): (CGFloat, CGFloat) in [(14, 32), (10, 30)] { top.line(to: NSPoint(x: x, y: y)) }
+        top.close(); top.lineJoinStyle = .round
+        hair.setFill(); top.fill(); hairDark.setStroke(); top.lineWidth = 0.9; top.stroke()
+        let strands: [(CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat)] = [
+            (29, 59, 49, 52, 36, 61, 44, 58), (27, 54, 51, 44, 34, 57, 44, 52), (25, 50.5, 50, 38, 33, 52, 43, 47),
+            (22, 58, 10, 48, 15, 59, 10, 54), (21, 52, 11, 41, 15, 53, 11, 47)]
+        for (x0, y0, x1, y1, c1x, c1y, c2x, c2y) in strands {
+            let st = NSBezierPath(); st.move(to: NSPoint(x: x0, y: y0))
+            st.curve(to: NSPoint(x: x1, y: y1), controlPoint1: NSPoint(x: c1x, y: c1y), controlPoint2: NSPoint(x: c2x, y: c2y))
+            hairDark.withAlphaComponent(0.6).setStroke(); st.lineWidth = 0.8; st.lineCapStyle = .round; st.stroke()
+        }
+        let part = NSBezierPath(); part.move(to: NSPoint(x: 23.5, y: 47))
+        part.curve(to: NSPoint(x: 28, y: 61), controlPoint1: NSPoint(x: 23, y: 53), controlPoint2: NSPoint(x: 25, y: 58))
+        hairDark.setStroke(); part.lineWidth = 1.2; part.lineCapStyle = .round; part.stroke()
+        let shine = NSBezierPath(); shine.move(to: NSPoint(x: 33, y: 58.5))
+        shine.curve(to: NSPoint(x: 45, y: 54), controlPoint1: NSPoint(x: 37, y: 60), controlPoint2: NSPoint(x: 42, y: 57.5))
+        NSColor.white.withAlphaComponent(0.6).setStroke(); shine.lineWidth = 1.4; shine.lineCapStyle = .round; shine.stroke()
+        // thick, flat, stern brows
+        for (a, c): ((CGFloat, CGFloat), (CGFloat, CGFloat)) in [((17.5, 38.8), (28.5, 37.6)), ((46.5, 38.8), (35.5, 37.6))] {
+            let br = NSBezierPath(); br.move(to: NSPoint(x: a.0, y: a.1)); br.line(to: NSPoint(x: c.0, y: c.1))
+            rgb(120, 88, 36).setStroke(); br.lineWidth = 3; br.lineCapStyle = .round; br.stroke()
+        }
+        // small nose and chin dimple
+        let nose = NSBezierPath(); nose.move(to: NSPoint(x: 32, y: 27)); nose.line(to: NSPoint(x: 33, y: 24.6))
+        skinEdge.setStroke(); nose.lineWidth = 0.9; nose.lineCapStyle = .round; nose.stroke()
+        let dimple = NSBezierPath(); dimple.move(to: NSPoint(x: 30.8, y: 18)); dimple.line(to: NSPoint(x: 33.2, y: 18))
+        skinEdge.setStroke(); dimple.lineWidth = 0.8; dimple.lineCapStyle = .round; dimple.stroke()
+    }
+
+    if scout {
+        // red scarf over the chin, tail hanging to one side
+        let red = rgb(200, 34, 44), redDark = rgb(150, 20, 30)
+        let tail = NSBezierPath(roundedRect: NSRect(x: 41, y: 2, width: 8, height: 12), xRadius: 3, yRadius: 3)
+        let band = NSBezierPath(roundedRect: NSRect(x: 13, y: 9, width: 38, height: 9), xRadius: 4.5, yRadius: 4.5)
+        for p in [tail, band] { red.setFill(); p.fill(); redDark.setStroke(); p.lineWidth = 0.8; p.stroke() }
+        // brass spyglass held across the front
+        NSGraphicsContext.saveGraphicsState(); sh.set()
+        let t = NSAffineTransform(); t.translateX(by: 30, yBy: 5); t.rotate(byDegrees: 12); t.concat()
+        let tube = NSBezierPath(roundedRect: NSRect(x: -15, y: -3, width: 26, height: 6), xRadius: 2, yRadius: 2)
+        rgb(196, 146, 66).setFill(); tube.fill()
+        NSGraphicsContext.restoreGraphicsState()
+        NSGraphicsContext.saveGraphicsState(); t.concat()
+        let lens = NSBezierPath(roundedRect: NSRect(x: 10, y: -4.5, width: 7, height: 9), xRadius: 2, yRadius: 2)
+        rgb(150, 104, 40).setFill(); lens.fill()
+        rgb(150, 230, 255).setFill(); oval(15.2, -3, 1.6, 6).fill()
+        rgb(120, 82, 30).setStroke()
+        for x: CGFloat in [-8, 2] { let r = NSBezierPath(); r.move(to: NSPoint(x: x, y: -3)); r.line(to: NSPoint(x: x, y: 3)); r.lineWidth = 1; r.stroke() }
+        NSGraphicsContext.restoreGraphicsState()
+        for x: CGFloat in [11.5, 38] {
+            let hand = oval(x, 1.5, 7, 7); skin.setFill(); hand.fill(); skinEdge.setStroke(); hand.lineWidth = 0.9; hand.stroke()
+        }
+        return
+    }
+
     // the letter, held with two little hands
     NSGraphicsContext.saveGraphicsState(); sh.set()
     let env = NSBezierPath(roundedRect: NSRect(x: 15, y: 1, width: 34, height: 16), xRadius: 3, yRadius: 3)
@@ -149,18 +215,19 @@ func drawPet(_ b: NSRect) {
 // Floating pet that stays on every desktop. Click: show/hide Survey Corps. Drag: move it.
 class PetView: NSView {
     var onClick: () -> Void = {}
+    var scout = false, frameName = "pet", badgeColor = NSColor.systemRed
     var grab = NSPoint.zero, moved = false
-    var overdue = 0 { didSet { if overdue != oldValue { needsDisplay = true } } }
+    var overdue = 0 { didSet { if overdue != oldValue { needsDisplay = true } } }  // badge count
     override func draw(_ r: NSRect) {
         // Fully transparent pixels let clicks fall through; a near-invisible fill makes the whole square clickable.
         NSColor.black.withAlphaComponent(0.01).setFill(); bounds.fill()
-        NSGraphicsContext.saveGraphicsState(); drawPet(bounds); NSGraphicsContext.restoreGraphicsState()
+        NSGraphicsContext.saveGraphicsState(); drawPet(bounds, scout: scout); NSGraphicsContext.restoreGraphicsState()
         guard overdue > 0 else { return }
         let text = NSAttributedString(string: overdue > 99 ? "99+" : "\(overdue)", attributes: [
             .font: NSFont.boldSystemFont(ofSize: 15), .foregroundColor: NSColor.white])
         let w = max(26, text.size().width + 12), r = NSRect(x: bounds.maxX - w - 2, y: bounds.maxY - 28, width: w, height: 26)
         let pill = NSBezierPath(roundedRect: r, xRadius: 13, yRadius: 13)
-        NSColor.systemRed.setFill(); pill.fill(); NSColor.white.setStroke(); pill.lineWidth = 2; pill.stroke()
+        badgeColor.setFill(); pill.fill(); NSColor.white.setStroke(); pill.lineWidth = 2; pill.stroke()
         text.draw(at: NSPoint(x: r.midX - text.size().width / 2, y: r.midY - text.size().height / 2))
     }
     override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
@@ -171,13 +238,14 @@ class PetView: NSView {
         window?.setFrameOrigin(NSPoint(x: p.x - grab.x, y: p.y - grab.y))
     }
     override func mouseUp(with e: NSEvent) {
-        if moved { window?.saveFrame(usingName: "pet") } else { onClick() }
+        if moved { window?.saveFrame(usingName: frameName) } else { onClick() }
     }
 }
 
 class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
-    var window: NSWindow!
-    var pet: NSPanel!
+    var window: NSWindow!, feedWindow: NSWindow!
+    var pet: NSPanel!, scoutPet: NSPanel!
+    var feedWeb: WKWebView!
     let server = Process()
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -204,22 +272,29 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
         window.makeKeyAndOrderFront(nil)
         web.load(URLRequest(url: base))
 
-        pet = NSPanel(contentRect: NSRect(x: 0, y: 0, width: petSize, height: petSize),
-                      styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        pet.level = .floating
-        pet.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-        pet.backgroundColor = .clear
-        pet.isOpaque = false
-        pet.hasShadow = false
+        // Scout window: starts hidden, shown by the scout pet
+        feedWeb = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        feedWeb.navigationDelegate = self
+        feedWeb.uiDelegate = self
+        feedWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 760),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        feedWindow.title = "Scout"
+        feedWindow.minSize = NSSize(width: 560, height: 400)
+        feedWindow.contentView = feedWeb
+        feedWindow.center()
+        feedWindow.setFrameAutosaveName("feed")
+        feedWindow.isReleasedWhenClosed = false
+        feedWeb.load(URLRequest(url: feedURL))
+
         let view = PetView()
         view.toolTip = "Survey Corps: click to show/hide, drag to move"
-        view.onClick = { [unowned self] in self.toggle() }
-        pet.contentView = view
-        if !pet.setFrameUsingName("pet"), let f = NSScreen.main?.visibleFrame {
-            pet.setFrameOrigin(NSPoint(x: f.maxX - petSize - 26, y: f.minY + 20))  // bottom-right corner
-        }
-        pet.setContentSize(NSSize(width: petSize, height: petSize))  // saved frame may hold an old size
-        pet.orderFrontRegardless()
+        view.onClick = { [unowned self] in self.toggle(self.window) }
+        pet = makePet(view, offset: 26)
+        let scoutView = PetView()
+        scoutView.scout = true; scoutView.frameName = "scoutPet"; scoutView.badgeColor = .systemBlue
+        scoutView.toolTip = "Scout: new papers, videos and repos. Click to show/hide, drag to move"
+        scoutView.onClick = { [unowned self] in self.toggle(self.feedWindow) }
+        scoutPet = makePet(scoutView, offset: 26 + petSize + 8)
 
         // red badge on the pet: open, not-done tasks whose due time has passed
         let refresh = { [weak view] in
@@ -231,22 +306,49 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
                 DispatchQueue.main.async { view?.overdue = n }
             }.resume()
         }
-        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in refresh() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { refresh() }
+        // blue badge on the scout pet: unread picks (score 7+, not thumbed down)
+        let refreshScout = { [weak scoutView] in
+            URLSession.shared.dataTask(with: base.appendingPathComponent("api/feed")) { data, _, _ in
+                guard let data, let f = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let items = f["items"] as? [[String: Any]] else { return }
+                let n = items.filter { ($0["read"] as? Bool) != true && (($0["vote"] as? Int) ?? 0) >= 0
+                                       && (($0["score"] as? Double) ?? 0) >= 7 }.count
+                DispatchQueue.main.async { scoutView?.overdue = n }
+            }.resume()
+        }
+        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in refresh(); refreshScout() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { refresh(); refreshScout() }
     }
 
-    func toggle() {
-        if window.isVisible && NSApp.isActive {
-            window.orderOut(nil)
+    func makePet(_ view: PetView, offset: CGFloat) -> NSPanel {
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: petSize, height: petSize),
+                        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.level = .floating
+        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        p.backgroundColor = .clear
+        p.isOpaque = false
+        p.hasShadow = false
+        p.contentView = view
+        if !p.setFrameUsingName(view.frameName), let f = NSScreen.main?.visibleFrame {
+            p.setFrameOrigin(NSPoint(x: f.maxX - petSize - offset, y: f.minY + 20))  // bottom-right corner
+        }
+        p.setContentSize(NSSize(width: petSize, height: petSize))  // saved frame may hold an old size
+        p.orderFrontRegardless()
+        return p
+    }
+
+    func toggle(_ w: NSWindow) {
+        if w.isVisible && w.isKeyWindow && NSApp.isActive {
+            w.orderOut(nil)
         } else {
             NSApp.activate(ignoringOtherApps: true)
-            window.makeKeyAndOrderFront(nil)
+            w.makeKeyAndOrderFront(nil)
         }
     }
 
     // server takes a moment to start; keep retrying
     func webView(_ w: WKWebView, didFailProvisionalNavigation n: WKNavigation!, withError e: Error) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.load(URLRequest(url: base)) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.load(URLRequest(url: w === self.feedWeb ? feedURL : base)) }
     }
 
     func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool {

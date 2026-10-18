@@ -20,6 +20,12 @@ A small local task manager for macOS that turns Outlook emails into to-dos.
 - Search across title, sender, email body, notes and labels (press `/` to focus, `Esc` to clear).
 - Notes on each task, editable titles, and a collapsible Done section.
 
+**Scout (second pet, second window)**
+- A second pet (black hair, red scarf, spyglass) opens the **Scout** window. Its blue badge counts unread picks.
+- Every few hours, it pulls new arXiv papers and GitHub repos matching your keywords, plus new videos from YouTube channels you list. Argo scores each item 0-10 against your interests, with a one-line reason why. Off VPN, items still show up, just unscored, and get scored on a later check.
+- 👍 / 👎 / ☆ on each card feed the next round of ranking. You get a notification when something scores 8 or higher.
+- Configure in `data/config.json` (all optional): `scout_profile` (your interests, in plain text), `scout_keywords` (list; arXiv + GitHub), `scout_arxiv_keywords` (list; arXiv only), `scout_youtube` (list of channel ids, `UC...`), `scout_hours` (default 3), `github_token`. Results live in `data/feed.json`. Only titles and abstracts go to Argo.
+
 **macOS integration**
 - macOS notification when a task comes due.
 - Native app with a Dock icon, light and dark mode.
