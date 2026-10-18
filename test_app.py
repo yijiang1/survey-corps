@@ -48,4 +48,24 @@ page = '<meta property="og:title" content="Chan &amp; Co"><script>var ytInitialD
 v = parse_youtube_page(page)
 assert [(x["id"], x["title"], x["by"]) for x in v] == [("yt:abc", "Agents rule", "Chan & Co")], v
 assert v[0]["date"] == (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
+
+# Library: Argo's suggestion is validated, groups/labels edits cascade to items, folders are split into projects
+assert app.clean_lib_suggestion('x {"summary": " A  tool ", "group": "projects", "labels": ["Py", "", "' + "x" * 30 + '"]}', ["Projects"]) == {
+    "summary": "A tool", "group": "Projects", "labels": ["Py"]}
+assert app.clean_lib_suggestion('{"group": "Made Up"}', ["Projects"])["group"] == "" and app.clean_lib_suggestion("nope", []) == {"summary": "", "group": "", "labels": []}
+lib = {"groups": ["A", "B"], "labels": {"X": 40}, "items": [{"group": "A", "labels": ["X", "Y"]}, {"group": "B", "labels": ["Y"]}]}
+app.lib_meta(lib, {"op": "rename_group", "name": "A", "to": "B"})  # merge
+assert lib["groups"] == ["B"] and [x["group"] for x in lib["items"]] == ["B", "B"]
+app.lib_meta(lib, {"op": "rename_label", "name": "X", "to": "Y"})
+assert lib["labels"] == {"Y": 40} and [x["labels"] for x in lib["items"]] == [["Y"], ["Y"]]
+app.lib_meta(lib, {"op": "delete_group", "name": "B"}); app.lib_meta(lib, {"op": "delete_label", "name": "Y"})
+assert lib["groups"] == [] and lib["items"] == [{"group": "", "labels": []}, {"group": "", "labels": []}] and lib["labels"] == {}
+root = Path(tempfile.mkdtemp())
+app.LIB = root / "library.json"
+(root / "proj1").mkdir(); (root / "proj1" / "README.md").write_text("# Ptycho recon"); (root / "proj2").mkdir(); (root / ".hidden").mkdir()
+app.lib_enrich = lambda i: None
+new, skipped = app.lib_add([str(root), str(root / "nope"), ""], split=True)
+assert sorted(x["name"] for x in new) == ["proj1", "proj2"] and skipped == [f"{root / 'nope'}: not found"], (new, skipped)
+assert "README.md" in new[0]["peek"] and "# Ptycho recon" in new[0]["peek"]
+assert app.lib_add([str(root / "proj1")])[1] == ["proj1: already in the Library"]
 print("ok")

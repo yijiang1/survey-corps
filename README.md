@@ -32,6 +32,15 @@ A small local task manager for macOS that turns Outlook emails into to-dos.
 - **+ Add** in the Scout window: paste links (arXiv paper, YouTube video, GitHub repo, or any web page) to save them straight to Saved. Scout fills in the title, authors and abstract, and Argo scores them like everything else.
 - **Interests** button in the Scout window: edit what you're interested in (plain words Argo ranks against), search terms (arXiv + GitHub, plus arXiv-only ones), YouTube channels (paste an `@handle`, a channel link or an ID) and how often to check. Saving starts a new check; **Reset to defaults** goes back to the built-in AI agents / RSI / ptychography setup. Settings are saved to `data/config.json` (optional `github_token` there too); results live in `data/feed.json`. Only titles and abstracts go to Argo.
 
+**Library (third pet, third window)**
+- A third pet (blond bob, open book) opens the **Library**: one place for your local projects, files and docs.
+- Drag folders or files in from Finder, or use **+ Add** and paste paths (⌥⌘C in Finder copies them). Tick "Add each subfolder as its own item" and paste `~/Research/Projects` to add every project at once.
+- Each item sits in one **group** (Projects, Papers, Docs, Data to start) and can have any number of coloured **labels**. Change them inline, or drag an item onto a group or label in the sidebar. **Edit groups & labels…** adds, renames (renaming onto an existing name merges), recolours and deletes them.
+- With Argo, each new item gets a one-line summary, a group and labels, from its name plus a folder's file list and README, or a file's first few KB (PDFs: title and authors only). It never overrides what you set; if Argo is down, it retries later.
+- Search covers names, paths, groups, labels, notes, summaries and that contents snippet. End the search with `?` to ask Argo ("where's my beamtime analysis?").
+- Buttons on each item: Open, Show in Finder, open in your editor (`"library_editor"` in `data/config.json`, default Visual Studio Code), open in Terminal, copy path, and remove (only from the Library; the file stays on disk). Items that moved are flagged; fix the path under Notes & contents.
+- Stored in `data/library.json`. Only the summary inputs above go to Argo.
+
 **macOS integration**
 - macOS notification when a task comes due.
 - Native app with a Dock icon, light and dark mode.

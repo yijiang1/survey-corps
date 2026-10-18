@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Survey Corps: local todo list fed by emails dragged from Outlook. Run: python3 app.py"""
 from collections import Counter
-import html, json, re, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
+import html, json, re, socket, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email import message_from_bytes, policy
@@ -81,6 +81,12 @@ def argo(prompt, max_tokens, timeout=120, tag=""):
     global argo_ok, argo_at
     cfg = config()
     if not cfg.get("argo_user"):
+        return None
+    u = urlparse(ARGO)
+    try:  # off VPN the host resolves but connections hang until the timeout: find out in 3 s instead of minutes
+        socket.create_connection((u.hostname, u.port or 443), timeout=3).close()
+    except OSError:
+        argo_ok, argo_at = False, time.time()
         return None
     req = urllib.request.Request(ARGO, json.dumps({
         "model": cfg.get("argo_model", "claudesonnet5"), "max_tokens": max_tokens,
@@ -206,9 +212,11 @@ def retry_argo():
         return
     try:
         with lock:
-            todo = [t for t in load() if t.get("retry") and not t["done"]]
-        for t in todo:
-            (summarize if t["retry"] == "summary" else enrich)(t)
+            jobs = [((summarize if t["retry"] == "summary" else enrich), t) for t in load() if t.get("retry") and not t["done"]]
+        with lib_lock:
+            jobs += [(lib_enrich, x["id"]) for x in load_lib()["items"] if x.get("retry")]
+        for fn, arg in jobs:
+            fn(arg)
             if not argo_ok:
                 break
         if argo_on() and time.time() - argo_at > 600:  # idle: ping it so the status in the UI stays current
@@ -242,14 +250,18 @@ STOP = set("a an the and or of to in on at for with about what who whom when whe
            "ask asked tell told say said".split())
 
 
+def top_hits(items, q, hay, n=12):
+    """The n items whose text (hay) mentions the question's keywords most."""
+    words = [w for w in re.findall(r"\w+", q.lower()) if w not in STOP and len(w) > 2]
+    # ponytail: keyword-overlap ranking over <= a few thousand items; embeddings if it misses obvious matches
+    return sorted(items, key=lambda t: -sum(hay(t).lower().count(w) for w in words))[:n]
+
+
 def ask(q):
     """Answer a question from saved emails/tasks: keyword-pick the likeliest ones, then let Argo read them."""
-    words = [w for w in re.findall(r"\w+", q.lower()) if w not in STOP and len(w) > 2]
     with lock:
         todos = load()
-    hay = lambda t: " ".join([t["title"], t["sender"], t["date"], t["body"], t["note"], *t.get("labels", [])]).lower()
-    # ponytail: keyword-overlap ranking over <= a few thousand tasks; embeddings if it misses obvious matches
-    hits = sorted(todos, key=lambda t: -sum(hay(t).count(w) for w in words))[:12]
+    hits = top_hits(todos, q, lambda t: " ".join([t["title"], t["sender"], t["date"], t["body"], t["note"], *t.get("labels", [])]))
     ctx = "\n\n".join(f"[{t['title']}] from {t['sender'] or '-'} | {t['date'] or t['added']} | due {t['due'] or 'none'} | "
                        f"{'done' if t['done'] else 'open'}\n{t['body'][:1500]}" + (f"\nMy notes: {t['note']}" if t["note"] else "")
                        for t in hits)
@@ -576,23 +588,29 @@ def run_scout():
         jobs += [(f"GitHub '{k}'", lambda k=k: parse_github(fetch("https://api.github.com/search/repositories?sort=stars&per_page=10&q="
                                                                   + urllib.parse.quote(f'"{k}" pushed:>{since}'), gh)))
                  for k in cfg["scout_keywords"]]
-        found, errors, arxiv_down = [], [], False
+        found, errors, arxiv_down, ok = [], [], False, 0
         for name, job in jobs:
             is_arxiv = name.startswith("arXiv")
             if is_arxiv and arxiv_down:
                 continue  # rate-limited/down: more calls only extend the block
             try:
                 found += job()
+                ok += 1
             except Exception as e:
                 arxiv_down = is_arxiv
                 errors.append(f"arXiv unavailable ({e}); skipped arXiv this round, will retry next check" if is_arxiv
                               else f"{name}: {e}")
             if is_arxiv:
                 time.sleep(3)  # arXiv API asks for 3 s between calls
-        yt = [e.split(": ", 1)[0][len("YouTube "):] for e in errors if e.startswith("YouTube ")]
-        if yt:  # one line, not one per channel
-            errors = [e for e in errors if not e.startswith("YouTube ")]
-            errors.append(f"YouTube: couldn't load {', '.join(yt)}; will retry next check")
+        offline = bool(jobs) and not ok  # nothing reachable: no network, or a background wake while the Mac sleeps
+        if offline:
+            errors = ["Offline: couldn't reach arXiv, GitHub or YouTube (no network, or the Mac was asleep); "
+                      "will retry in a few minutes"]
+        for src in ("YouTube", "GitHub"):  # one line per source, not one per channel / search term
+            names = [e.split(": ", 1)[0][len(src) + 1:] for e in errors if e.startswith(src + " ")]
+            if names:
+                errors = [e for e in errors if not e.startswith(src + " ")] + [
+                    f"{src}: couldn't load {', '.join(names)}; will retry next check"]
         with feed_lock:
             f = load_feed()
             seen = set(f["seen"])
@@ -604,7 +622,9 @@ def run_scout():
             f["seen"] = sorted(seen)
             # ponytail: keeps the newest 1000 + saved; ids stay in "seen" so pruned items never come back
             f["items"] = [x for i, x in enumerate(f["items"]) if i < 1000 or x["saved"]]
-            f["last"], f["errors"] = now, errors
+            if not offline:  # an offline round doesn't count, so scout_loop retries within 10 minutes
+                f["last"] = now
+            f["errors"] = errors
             todo = [x for x in f["items"] if x["score"] is None]
             liked = [x["title"] for x in f["items"] if x["vote"] > 0 or x["saved"]][:15]
             disliked = [x["title"] for x in f["items"] if x["vote"] < 0][:15]
@@ -637,6 +657,174 @@ def scout_loop():
         time.sleep(600)
 
 
+# ---- Library: local projects, files and docs, with groups and labels; Argo summarizes and files each one ----
+LIB = DATA / "library.json"  # {"groups": [names], "labels": {name: hue}, "items": [...]}
+lib_lock = threading.Lock()
+TEXT_EXT = set("txt md markdown rst tex bib py ipynb json csv tsv yaml yml toml ini cfg swift js ts tsx jsx html htm css "
+               "c h cc cpp hpp m r jl sh zsh sql xml log".split())
+
+
+def load_lib():
+    return json.loads(LIB.read_text()) if LIB.exists() else {"groups": ["Projects", "Papers", "Docs", "Data"], "labels": {}, "items": []}
+
+
+def save_lib(lib):
+    tmp = LIB.with_suffix(".tmp")
+    tmp.write_text(json.dumps(lib, indent=1, ensure_ascii=False))
+    tmp.replace(LIB)
+
+
+def peek(p):
+    """A few KB that say what a path is (for search and for Argo): a folder's listing + README, or a file's text."""
+    p = Path(p)
+    try:
+        if p.is_dir():
+            kids = sorted((x for x in p.iterdir() if not x.name.startswith(".")), key=lambda x: x.name.lower())
+            readme = next((x for x in kids if x.name.lower().startswith("readme") and x.is_file()), None)
+            return ("Contains: " + ", ".join(x.name + "/" * x.is_dir() for x in kids[:60]) + " …" * (len(kids) > 60)
+                    + ("\n\n" + peek(readme) if readme else ""))[:3000]
+        ext = p.suffix.lower()[1:]
+        if ext in TEXT_EXT:
+            with open(p, errors="replace") as f:
+                return f.read(3000)
+        if ext in ("docx", "doc", "rtf", "rtfd", "odt", "webarchive"):
+            out = subprocess.run(["textutil", "-convert", "txt", "-stdout", p], capture_output=True, timeout=30).stdout
+            return out.decode("utf-8", "replace")[:3000]
+        # ponytail: PDFs and the rest get Spotlight's title/authors only; full text would need PDFKit on the Swift side
+        out = subprocess.run(["mdls", "-name", "kMDItemTitle", "-name", "kMDItemAuthors", "-name", "kMDItemDescription", p],
+                             capture_output=True, timeout=10).stdout.decode("utf-8", "replace")
+        lines = re.sub(r"\s*kMDItem(\w+) = ", r"\n\1: ", " ".join(out.split())).splitlines()  # "Title: ...", "Authors: ..."
+        return "\n".join(" ".join(re.sub(r'[()"]', "", l).split()) for l in lines if l.strip() and "(null)" not in l)[:3000]
+    except Exception:
+        return ""
+
+
+def lib_item(path, group=""):
+    p = Path(path).expanduser().resolve()
+    return {"id": uuid.uuid4().hex[:12], "path": str(p), "name": p.name or str(p), "folder": p.is_dir(),
+            "group": group, "labels": [], "note": "", "summary": "", "peek": peek(p),
+            "added": datetime.now().isoformat(timespec="minutes"), "opened": "",
+            "retry": True}  # cleared once Argo answers, so a quit or crash mid-call still gets retried
+
+
+def lib_add(paths, split=False, group=""):
+    """Add paths (each subfolder of them instead, with split). Returns (items added, paths skipped with why)."""
+    want, skipped = [], []
+    for raw in filter(str.strip, paths):
+        p = Path(raw.strip().strip("'\"")).expanduser()  # Finder's "Copy as Pathname" may come quoted
+        if not p.exists():
+            skipped.append(f"{raw.strip()}: not found")
+        elif split and p.is_dir():
+            want += [x for x in sorted(p.iterdir()) if x.is_dir() and not x.name.startswith(".")]
+        else:
+            want.append(p)
+    with lib_lock:
+        lib = load_lib()
+        have = {x["path"] for x in lib["items"]}
+        new = []
+        for p in want:
+            if str(p.resolve()) in have:
+                skipped.append(f"{p.name}: already in the Library")
+            else:
+                new.append(lib_item(p, group))
+                have.add(new[-1]["path"])
+        lib["items"] = new + lib["items"]
+        if group and group not in lib["groups"]:
+            lib["groups"].append(group)
+        save_lib(lib)
+    # one at a time, so adding a folder of 200 projects doesn't fire 200 Argo calls at once
+    threading.Thread(target=lambda: [lib_enrich(x["id"]) for x in new], daemon=True).start()
+    return new, skipped
+
+
+def clean_lib_suggestion(text, groups):
+    """{"summary", "group", "labels"} from the model's reply; a group it made up is dropped."""
+    m = re.search(r"\{.*\}", text or "", re.S)
+    try:
+        d = json.loads(m.group(0)) if m else {}
+    except ValueError:
+        return {}
+    labels = [str(x).strip() for x in d.get("labels") or [] if 0 < len(str(x).strip()) <= 24][:3]
+    group = next((g for g in groups if g.lower() == str(d.get("group") or "").strip().lower()), "")
+    return {"summary": flat(str(d.get("summary") or ""), 300), "group": group, "labels": labels}
+
+
+def lib_enrich(item_id):
+    """Background: Argo's one-line summary, group and labels for a new item, never overwriting what the user set."""
+    with lib_lock:
+        lib = load_lib()
+        x = next((x for x in lib["items"] if x["id"] == item_id), None)
+        known = sorted({l for y in lib["items"] for l in y["labels"]} | set(lib["labels"]))
+    if not x or not argo_on():
+        return
+    reply = argo(f"Below is a local {'folder' if x['folder'] else 'file'} I keep in my library of projects, files and docs. "
+                 'Reply with ONLY a JSON object {"summary": "...", "group": "...", "labels": [...]}.\n'
+                 "- summary: one plain line (max 20 words) saying what it is.\n"
+                 f"- group: the best fit of {json.dumps(lib['groups'])}, or \"\" if none fits.\n"
+                 f"- labels: up to 3 short labels (1-2 words, Title Case). Existing labels: {json.dumps(known)}. Reuse one "
+                 "whenever it fits; invent a new one only if none does.\n\n"
+                 f"Path: {x['path']}\n\n{x['peek']}", 600, tag=item_id)
+    with lib_lock:
+        lib = load_lib()
+        cur = next((y for y in lib["items"] if y["id"] == item_id), None)
+        if not cur:
+            return
+        if reply is None:  # Argo down: retry_argo() tries again later
+            cur["retry"] = True
+            return save_lib(lib)
+        cur.pop("retry", None)
+        s = clean_lib_suggestion(reply, lib["groups"])
+        if s.get("summary") and not cur["summary"]:
+            cur["summary"] = s["summary"]
+        if s.get("group") and not cur["group"]:
+            cur["group"] = s["group"]
+        if s.get("labels") and not cur["labels"]:
+            cur["labels"] = sorted(set(s["labels"]))
+        save_lib(lib)
+
+
+def lib_meta(lib, d):
+    """Groups/labels editor: {"op": "add_group"|"rename_group"|"delete_group"|"add_label"|"rename_label"|
+    "delete_label"|"color_label", "name", "to", "hue"}. Renaming onto an existing name merges the two."""
+    op, name, to = d.get("op", ""), str(d.get("name") or "").strip(), " ".join(str(d.get("to") or "").split())[:40]
+    if op == "add_group" and name and name not in lib["groups"]:
+        lib["groups"].append(name)
+    elif op in ("rename_group", "delete_group"):
+        new = to if op == "rename_group" else ""
+        if op == "rename_group" and not new:
+            return
+        lib["groups"] = list(dict.fromkeys(new if g == name else g for g in lib["groups"] if g != name or new))
+        for x in lib["items"]:
+            if x["group"] == name:
+                x["group"] = new
+    elif op == "add_label" and name:
+        lib["labels"].setdefault(name, None)  # None: colour from the name's hash, like Task Manager
+    elif op in ("rename_label", "delete_label"):
+        new = to if op == "rename_label" else ""
+        if op == "rename_label" and not new:
+            return
+        hue = lib["labels"].pop(name, None)
+        if new:
+            lib["labels"][new] = lib["labels"].get(new, hue)
+        for x in lib["items"]:
+            if name in x["labels"]:
+                x["labels"] = sorted({new if l == name else l for l in x["labels"]} - {""})
+    elif op == "color_label" and name:
+        lib["labels"][name] = max(0, min(359, int(d.get("hue") or 0)))
+
+
+def lib_ask(q):
+    """Answer a question ("where's my beamtime analysis?") from the Library's names, notes, summaries and contents."""
+    with lib_lock:
+        items = load_lib()["items"]
+    hits = top_hits(items, q, lambda x: " ".join([x["name"], x["path"], x["group"], x["note"], x["summary"], x["peek"], *x["labels"]]))
+    ctx = "\n\n".join(f"[{x['name']}] {x['path']} | group {x['group'] or '-'} | labels {', '.join(x['labels']) or '-'}\n"
+                      f"{x['summary']}\n{x['note']}\n{x['peek'][:1200]}" for x in hits)
+    return argo("Answer my question using only the items from my library of local projects, files and docs below. "
+                "Be brief and plain text; name the item(s) by their [name] and give the path. "
+                f"If they don't contain the answer, say so.\n\nQuestion: {q}\n\n{ctx}", 2000, timeout=90, tag="ask")
+
+
 class H(BaseHTTPRequestHandler):
     def reply(self, code, body=b"{}", ctype="application/json"):
         self.send_response(code)
@@ -655,11 +843,21 @@ class H(BaseHTTPRequestHandler):
             with busy_lock:
                 working = sorted(k for k, n in busy.items() if n > 0)
             self.reply(200, json.dumps({"configured": argo_on(), "argo": argo_ok, "checked": argo_at, "busy": working,
-                                        "rev": DB.stat().st_mtime if DB.exists() else 0}).encode())
+                                        "rev": DB.stat().st_mtime if DB.exists() else 0,
+                                        "lib_rev": LIB.stat().st_mtime if LIB.exists() else 0}).encode())
         elif self.path == "/feed":
             self.reply(200, FEED_PAGE.encode(), "text/html; charset=utf-8")
         elif self.path == "/api/scout/settings":
             self.reply(200, json.dumps({k: {**SCOUT, **config()}[k] for k in SCOUT}).encode())
+        elif self.path == "/library":
+            self.reply(200, LIB_PAGE.encode(), "text/html; charset=utf-8")
+        elif self.path == "/api/library":
+            with lib_lock:
+                lib = load_lib()
+            for x in lib["items"]:
+                x["missing"] = not Path(x["path"]).exists()
+            lib["editor"] = config().get("library_editor", "Visual Studio Code")
+            self.reply(200, json.dumps(lib).encode())
         elif self.path == "/api/feed":
             with feed_lock:
                 f = load_feed()
@@ -745,6 +943,50 @@ class H(BaseHTTPRequestHandler):
             if x["score"] is None:
                 threading.Thread(target=score_one, args=(x["id"],), daemon=True).start()
             return self.reply(200, json.dumps({"title": x["title"], "existing": existed}).encode())
+        if u.path == "/api/library/add":  # {"paths": [...], "split": bool, "group": ""}
+            d = json.loads(raw or b"{}")
+            new, skipped = lib_add(d.get("paths") or [], bool(d.get("split")), str(d.get("group") or "").strip())
+            return self.reply(200, json.dumps({"added": [x["name"] for x in new], "skipped": skipped}).encode())
+        if u.path == "/api/library/ask":
+            answer = (lib_ask(json.loads(raw or b"{}").get("q", "")) or "").replace("**", "")
+            return self.reply(200, json.dumps({"answer": answer}).encode()) if answer else self.reply(503)
+        if u.path == "/api/library/meta" or u.path.startswith("/api/library/item/"):  # .../item/<id>/<action>
+            d, act = json.loads(raw or b"{}"), u.path.rsplit("/", 1)[1]
+            with lib_lock:
+                lib = load_lib()
+                if u.path == "/api/library/meta":
+                    lib_meta(lib, d)
+                    save_lib(lib)
+                    return self.reply(200)
+                x = next((x for x in lib["items"] if x["id"] == u.path.split("/")[-2]), None)
+                if not x:
+                    return self.reply(404)
+                if act == "update":
+                    x["name"] = str(d.get("name") or "").strip() or x["name"]
+                    x["group"] = str(d["group"]).strip() if "group" in d else x["group"]
+                    x["note"] = str(d.get("note", x["note"]))
+                    if "labels" in d:
+                        x["labels"] = sorted({str(l).strip()[:40] for l in d["labels"] if str(l).strip()})
+                    if x["group"] and x["group"] not in lib["groups"]:
+                        lib["groups"].append(x["group"])
+                    if d.get("path"):  # moved on disk: point it at the new place
+                        x["path"] = str(Path(d["path"].strip()).expanduser().resolve())
+                        x["folder"], x["peek"] = Path(x["path"]).is_dir(), peek(x["path"])
+                elif act == "delete":  # only forgets it; the file stays where it is
+                    lib["items"].remove(x)
+                elif act in ("open", "reveal", "edit", "terminal", "copy"):
+                    cmd = {"open": ["open", x["path"]], "reveal": ["open", "-R", x["path"]],
+                           "edit": ["open", "-a", config().get("library_editor", "Visual Studio Code"), x["path"]],
+                           "terminal": ["open", "-a", "Terminal", x["path"] if x["folder"] else str(Path(x["path"]).parent)]}
+                    if act == "copy":
+                        subprocess.run(["pbcopy"], input=x["path"].encode())
+                    elif subprocess.run(cmd[act], capture_output=True).returncode:
+                        return self.reply(400, json.dumps({"error": f"Couldn't {act} {x['name']}"}).encode())
+                    x["opened"] = datetime.now().isoformat(timespec="minutes")
+                else:
+                    return self.reply(404)
+                save_lib(lib)
+            return self.reply(200)
         if u.path == "/api/feed/update":  # {"id": ..., "vote"/"saved"/"read": ...}, or {"all_read": true}
             patch = json.loads(raw or b"{}")
             with feed_lock:
@@ -1354,6 +1596,315 @@ pform.onsubmit=e=>{e.preventDefault();savePrefs(JSON.parse(state()))};
 addEventListener('keydown',e=>{if(e.key==='/'&&!/INPUT|TEXTAREA/.test(document.activeElement.tagName)){e.preventDefault();q.focus()}});
 q.onkeydown=e=>{if(e.key==='Escape'){q.value='';render();q.blur()}};
 let tick=0;setInterval(()=>{if((feed.busy||++tick%6===0)&&!document.querySelector('details[open]'))load()},5000);
+load();
+</script>"""
+
+LIB_PAGE = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width"><title>Library</title>
+<style>
+:root{color-scheme:light dark;--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--muted:#6e6e73;--line:#e2e2e7;--hover:#f0f0f4;
+  --accent:#0a84ff;--red:#d70015;--chipL:32%}
+@media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2a2a2d;--text:#f2f2f7;--muted:#98989f;--line:#3a3a3d;
+  --hover:#323236;--red:#ff6961;--chipL:76%}}
+*{box-sizing:border-box}
+body{font:13.5px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;margin:0;background:var(--bg);color:var(--text)}
+button,input,select,textarea{font:inherit;color:inherit}
+header{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 85%,transparent);backdrop-filter:blur(12px);
+  padding:14px 20px 10px;border-bottom:1px solid var(--line)}
+.top{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}h1{font-size:20px;margin:0}#stats{color:var(--muted)}
+.bar{display:flex;gap:8px;align-items:center}
+.bar input{flex:1;min-width:160px;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 10px;outline:none}
+.bar input:focus{border-color:var(--accent);box-shadow:0 0 0 3px #0a84ff33}
+.seg{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button,.btn{border:0;background:var(--card);padding:6px 12px;cursor:pointer}.seg .on{background:var(--accent);color:#fff}
+.btn{border:1px solid var(--line);border-radius:8px}.btn:hover{background:var(--hover)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}.btn.primary:disabled{opacity:.45;cursor:default}
+.wrap{display:flex;align-items:flex-start}
+aside{flex:none;width:200px;position:sticky;top:96px;max-height:calc(100vh - 96px);overflow:auto;padding:14px 8px 30px 14px}
+aside h2{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:16px 8px 4px;font-weight:600}
+.nav{display:flex;align-items:center;gap:6px;width:100%;border:0;background:none;border-radius:7px;padding:5px 8px;cursor:pointer;text-align:left}
+.nav:hover,.nav.over{background:var(--line)}.nav.on{background:var(--accent);color:#fff}.nav.on .n{color:#fff}
+.nav span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nav .n{flex:none;color:var(--muted);font-size:12px}
+.nav i{flex:none;width:9px;height:9px;border-radius:50%;background:hsl(var(--h) 70% 50%)}.nav.miss{color:var(--red)}
+.linkbtn{border:0;background:none;color:var(--muted);cursor:pointer;padding:6px 8px;font-size:12.5px}.linkbtn:hover{color:var(--text);text-decoration:underline}
+main{flex:1;min-width:0;padding:6px 20px 40px 6px}
+.empty{text-align:center;color:var(--muted);padding:60px 0;font-size:15px;line-height:1.7}
+.c{display:flex;gap:12px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:6px 0}
+.c:hover{background:var(--hover)}.c.missing{border-left:3px solid var(--red)}
+.ico{flex:none;width:34px;height:34px;border-radius:9px;display:grid;place-content:center;cursor:pointer;font-weight:700;font-size:10.5px;
+  background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 65% var(--chipL))}
+.ico svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linejoin:round}
+.body{flex:1;min-width:0}
+.title{width:100%;border:0;background:none;font-weight:600;font-size:14px;padding:0;outline:none;text-overflow:ellipsis}
+.meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;margin-top:3px;font-size:12px}
+.path{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;max-width:340px;direction:rtl;text-align:left}
+.grp{border:0;border-radius:6px;background:var(--bg);color:var(--text);padding:1px 4px;font-size:12px;cursor:pointer;max-width:130px}
+.grp.none{color:var(--muted)}
+.chips{display:contents}.chip{border-radius:10px;padding:1px 8px;cursor:pointer;background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 65% var(--chipL));font-weight:500}
+.chip b{display:inline-block;vertical-align:bottom;max-width:0;overflow:hidden;font-weight:400;opacity:0}.chip:hover b{max-width:1em;margin-left:3px;opacity:.7}.chip b:hover{opacity:1}
+.addl{border:0;background:none;width:0;padding:1px 0;color:var(--muted);outline:none;opacity:0}
+.c:hover .addl,.addl:focus{opacity:1;width:58px;padding:1px 2px}.addl:focus{width:180px;color:var(--text)}
+.why{margin-top:4px;font-style:italic;color:var(--muted)}.warn{color:var(--red);margin-top:4px;font-size:12px}
+details summary{display:inline-block;font-size:12px;color:var(--muted);cursor:pointer;margin-top:4px;list-style:none;user-select:none}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:"›";display:inline-block;margin-right:5px;transition:transform .15s}
+details[open] summary::before{transform:rotate(90deg)}
+textarea,.pathin{width:100%;background:var(--bg);border:1px solid transparent;border-radius:8px;padding:8px 10px;outline:none}
+textarea{resize:vertical;margin-top:6px}textarea:focus,.pathin:focus{border-color:var(--accent)}.pathin{margin-top:6px;font-size:12px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 ui-monospace,Menlo,monospace;max-height:260px;overflow:auto;
+  background:var(--bg);border-radius:8px;padding:10px 12px;margin:6px 0}
+.side{flex:none;display:flex;align-items:center;gap:2px}
+.icon{border:0;background:none;width:28px;height:28px;border-radius:6px;color:var(--muted);cursor:pointer;display:grid;place-content:center;opacity:.55}
+.icon[hidden]{display:none}.c:hover .icon{opacity:1}.icon:hover{background:var(--line);color:var(--text)}.icon.x:hover{color:var(--red)}.icon:disabled{opacity:.2!important;cursor:default}
+.icon svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.argoing{display:none;color:var(--accent)}.c.thinking .argoing{display:inline}
+.c.thinking{border-color:var(--accent);background:linear-gradient(90deg,var(--card) 30%,color-mix(in srgb,var(--accent) 12%,var(--card)) 50%,var(--card) 70%) 0 0/300% 100%;
+  animation:shimmer 1.8s linear infinite}@keyframes shimmer{from{background-position:100% 0}to{background-position:0 0}}
+#ans{position:relative;background:var(--card);border:1px solid var(--accent);border-radius:10px;padding:10px 32px 10px 12px;margin:12px 0 0;white-space:pre-wrap}
+#ans button{position:absolute;top:6px;right:6px;border:0;background:none;cursor:pointer;color:var(--muted)}
+#toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:10;background:var(--text);color:var(--bg);
+  border-radius:8px;padding:8px 14px;font-size:12.5px;opacity:0;transition:opacity .2s;pointer-events:none}#toast.on{opacity:.92}
+.pill{margin-left:auto;align-self:center;display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);
+  border-radius:12px;padding:2px 10px;font-size:12px;color:var(--muted);cursor:pointer}.pill:hover{border-color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}.pill.ok .dot{background:#34c759}.pill.down{color:var(--red)}.pill.down .dot{background:var(--red)}
+.pill.busy{color:var(--accent)}.pill.busy .dot{background:none;border:2px solid var(--accent);border-right-color:transparent;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#drop{display:none;position:fixed;inset:8px;z-index:9;pointer-events:none;align-items:center;justify-content:center;
+  border:3px dashed var(--accent);border-radius:14px;background:#0a84ff1a;color:var(--accent);font-size:20px;font-weight:600}
+#drop.over{display:flex}
+dialog.sheet{width:min(720px,calc(100vw - 32px));max-height:calc(100vh - 48px);border:1px solid var(--line);border-radius:14px;
+  padding:0;background:var(--card);color:var(--text);box-shadow:0 24px 70px #0005}
+dialog.sheet::backdrop{background:#0006;backdrop-filter:blur(2px)}
+dialog.sheet form{display:flex;flex-direction:column;max-height:calc(100vh - 50px)}
+dialog#adddlg{width:min(580px,calc(100vw - 32px))}
+.ph{padding:18px 22px 4px}.ph h3{margin:0;font-size:17px}.ph p{margin:3px 0 0;color:var(--muted);font-size:12.5px}
+.pb{padding:4px 22px 18px;overflow:auto}
+.sec{margin-top:14px}.sec b{display:block;font-size:13px;margin-bottom:6px}
+.sheet textarea{background:var(--bg);border:1px solid var(--line);font-size:12.5px;font-family:ui-monospace,Menlo,monospace}
+.sheet textarea:focus{box-shadow:0 0 0 3px #0a84ff26}
+.opt{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:12.5px;color:var(--muted)}.opt label{display:flex;gap:6px;align-items:center}
+.opt select{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:3px 6px}
+.alog{font-size:12.5px;margin-top:8px;overflow-wrap:anywhere}.alog.bad{color:var(--red)}
+#a_browse{background:var(--accent);border-color:var(--accent);color:#fff;margin-bottom:8px}.hint{color:var(--muted);font-size:12px;margin-left:8px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:22px}@media (max-width:600px){.two{grid-template-columns:1fr}}
+.row{display:flex;align-items:center;gap:6px;margin:3px 0}
+.row input[type=text]{flex:1;min-width:0;background:var(--bg);border:1px solid transparent;border-radius:7px;padding:5px 8px;outline:none}
+.row input[type=text]:focus{border-color:var(--accent)}.row input.new{border:1px dashed var(--line)}
+.row small{color:var(--muted);font-size:11.5px;min-width:22px;text-align:right}
+.row button{border:0;background:none;width:22px;height:22px;border-radius:11px;cursor:pointer;color:var(--muted)}.row button:hover{background:var(--line);color:var(--red)}
+.hue{appearance:none;width:64px;height:10px;border-radius:5px;background:linear-gradient(90deg,hsl(0 70% 55%),hsl(60 70% 55%),hsl(120 70% 55%),hsl(180 70% 55%),hsl(240 70% 55%),hsl(300 70% 55%),hsl(359 70% 55%))}
+.hue::-webkit-slider-thumb{appearance:none;width:14px;height:14px;border-radius:50%;background:hsl(var(--h) 70% 50%);border:2px solid #fff;box-shadow:0 0 0 1px #0004}
+.pf{display:flex;gap:8px;align-items:center;padding:12px 22px;border-top:1px solid var(--line)}
+.pf .msg{flex:1;font-size:12px;color:var(--muted)}
+</style>
+<div id=drop>Drop files or folders to add them</div><div id=toast></div>
+<header>
+  <div class=top><h1>Library</h1><span id=stats></span><button id=argo class=pill></button>
+    <button class=btn id=addbtn title="Add folders, files or docs">+ Add</button></div>
+  <div class=bar>
+    <input id=q type=search placeholder="Search names, paths, labels, notes and contents, or ask a question ending in ?  ( / )">
+    <span class=seg id=sorts></span>
+  </div>
+</header>
+<datalist id=labels></datalist>
+<div class=wrap><aside id=nav></aside><main><div id=ans hidden></div><div id=list></div></main></div>
+<dialog id=adddlg class=sheet><form id=aform>
+  <div class=ph><h3>Add to Library</h3><p>Folders, files or docs on this Mac: choose them, drag them in from Finder, or paste their paths
+    (⌥⌘C in Finder copies them).</p></div>
+  <div class=pb><div class=sec><button type=button class=btn id=a_browse>Choose in Finder…</button>
+    <span class=hint id=a_hint>Pick several with ⌘-click. New project? Use New Folder in the picker.</span><textarea id=a_paths rows=4 placeholder="~/Research/Projects/survey-corps&#10;~/Documents/beamtime-proposal.docx"></textarea></div>
+    <div class=opt><label><input type=checkbox id=a_split> Add each subfolder as its own item</label>
+      <label>Group <select id=a_grp></select></label></div><div id=a_log></div></div>
+  <div class=pf><span class=msg>Argo writes a one-line summary and picks a group and labels; it never overrides yours.</span>
+    <button type=button class=btn id=a_close>Close</button><button class="btn primary" id=a_save>Add</button></div>
+</form></dialog>
+<dialog id=mdlg class=sheet><form id=mform>
+  <div class=ph><h3>Groups &amp; labels</h3><p>Each item sits in one group and can have any number of labels. Renaming onto an existing name merges the two.</p></div>
+  <div class="pb two"><div class=sec><b>Groups</b><div id=m_groups></div><div class=row><input id=m_ng class=new type=text placeholder="+ New group"></div></div>
+    <div class=sec><b>Labels</b><div id=m_labels></div><div class=row><input id=m_nl class=new type=text placeholder="+ New label"></div></div></div>
+  <div class=pf><span class=msg>Tip: drag an item onto a group or label in the sidebar.</span><button class="btn primary">Done</button></div>
+</form></dialog>
+<script>
+const SVG=p=>`<svg viewBox="0 0 24 24">${p}</svg>`;
+const I={folder:SVG('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
+  open:SVG('<path d="M14 4h6v6M20 4l-9 9M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/>'),
+  reveal:SVG('<circle cx="11" cy="11" r="6"/><path d="m20 20-4.5-4.5"/>'),
+  edit:SVG('<path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/>'),
+  term:SVG('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M12.5 15H17"/>'),
+  copy:SVG('<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>'),
+  x:SVG('<path d="M6 6l12 12M18 6 6 18"/>')};
+const SORTS={recent:'Recent',name:'Name',added:'Added'};
+let lib={groups:[],labels:{},items:[]}, st={busy:[]}, rev=0, dragId=null;
+let sel=localStorage.libsel||'all', sort=localStorage.libsort||'recent';
+const hue=s=>[...s].reduce((h,c)=>(h*31+c.charCodeAt(0))%360,7);  // same colours as Task Manager labels
+const lhue=l=>lib.labels[l]??hue(l);
+const el=(tag,cls,txt)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e};
+function toast(m){const e=document.getElementById('toast');e.textContent=m;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),4000)}
+async function api(p,b){
+  const r=await fetch(p,{method:'POST',body:JSON.stringify(b||{})}).catch(()=>({}));
+  if(!r.ok)toast((await r.json?.().catch(()=>({})))?.error||'Something went wrong');
+  await load();return r;
+}
+const meta=b=>api('/api/library/meta',b);
+const allLabels=()=>[...new Set([...Object.keys(lib.labels),...lib.items.flatMap(x=>x.labels)])].sort((a,b)=>a.localeCompare(b));
+const matches=x=>sel==='all'||(sel==='missing'?x.missing:sel.startsWith('g:')?x.group===sel.slice(2):x.labels.includes(sel.slice(2)));
+function go(s){sel=s;localStorage.libsel=s;render()}
+function navBtn(key,text,n,h){
+  const b=el('button','nav'+(sel===key?' on':'')+(key==='missing'?' miss':''));
+  if(h!=null){const i=el('i');i.style.setProperty('--h',h);b.append(i)}
+  b.append(el('span',0,text),el('span','n',n));b.title=text;b.onclick=()=>go(key);
+  if(key.startsWith('g:')||key.startsWith('l:')){  // drop an item here: move it to the group / add the label
+    b.ondragover=e=>{if(dragId){e.preventDefault();b.classList.add('over')}};b.ondragleave=()=>b.classList.remove('over');
+    b.ondrop=e=>{e.preventDefault();b.classList.remove('over');const x=lib.items.find(y=>y.id===dragId);if(!x)return;
+      api(`/api/library/item/${x.id}/update`,key.startsWith('g:')?{group:key.slice(2)}:{labels:[...x.labels,key.slice(2)]})};
+  }
+  return b;
+}
+function renderNav(){
+  const it=lib.items,out=[navBtn('all','All items',it.length),el('h2',0,'Groups')];
+  for(const g of lib.groups)out.push(navBtn('g:'+g,g,it.filter(x=>x.group===g).length||''));
+  const none=it.filter(x=>!x.group).length;if(none)out.push(navBtn('g:','Ungrouped',none));
+  const ls=allLabels();
+  if(ls.length){out.push(el('h2',0,'Labels'));for(const l of ls)out.push(navBtn('l:'+l,l,it.filter(x=>x.labels.includes(l)).length||'',lhue(l)))}
+  const miss=it.filter(x=>x.missing).length;if(miss)out.push(el('h2',0,'Needs attention'),navBtn('missing','Missing on disk',miss));
+  const e=el('button','linkbtn','Edit groups & labels…');e.onclick=openManage;out.push(el('div'),e);
+  nav.replaceChildren(...out);
+}
+function card(x){
+  const d=el('div','c'+(x.missing?' missing':'')+(st.busy.includes(x.id)?' thinking':''));d.dataset.id=x.id;
+  d.innerHTML=`<div class=ico></div><div class=body><input class=title spellcheck=false>
+    <div class=meta><span class=argoing>✨ Argo is reading this…</span><select class=grp title="Group"></select><span class=chips></span>
+      <input class=addl list=labels placeholder="+ label"><span class=path></span></div>
+    <div class=why></div><details><summary>Notes &amp; contents</summary><textarea rows=2 placeholder="Notes…"></textarea>
+      <input class=pathin spellcheck=false title="Path on disk (fix it here if you moved the item)"><pre></pre></details></div>
+    <div class=side><button class=icon data-a=open title="Open">${I.open}</button><button class=icon data-a=reveal title="Show in Finder">${I.reveal}</button>
+      <button class=icon data-a=edit title="Open in ${lib.editor}">${I.edit}</button><button class=icon data-a=terminal title="Open in Terminal">${I.term}</button>
+      <button class=icon data-a=copy title="Copy path">${I.copy}</button><button class="icon x" title="Remove from Library (the file stays on disk)">${I.x}</button></div>`;
+  const $=s=>d.querySelector(s),up=p=>api(`/api/library/item/${x.id}/update`,p);
+  const ext=x.folder?'':(x.name.match(/\.(\w{1,5})$/)||['',''])[1].toUpperCase();
+  const ico=$('.ico');ico.innerHTML=x.folder?I.folder:'';if(!x.folder)ico.textContent=ext||'DOC';
+  ico.style.setProperty('--h',x.folder?212:hue(ext||'doc'));ico.title=x.folder?'Open folder':'Open';
+  ico.onclick=()=>act('open');
+  const ti=$('.title');ti.value=x.name;ti.title=x.name;ti.onchange=()=>up({name:ti.value});ti.onkeydown=e=>{if(e.key==='Enter')ti.blur()};
+  const g=$('.grp');g.replaceChildren(new Option('No group',''),...lib.groups.map(n=>new Option(n)));g.value=x.group;
+  g.classList.toggle('none',!x.group);g.onchange=()=>up({group:g.value});
+  for(const l of x.labels){
+    const c=el('span','chip',l);c.style.setProperty('--h',lhue(l));c.title='Show only this label';c.onclick=()=>go('l:'+l);
+    const b=el('b',0,'×');b.title='Remove label';b.onclick=e=>{e.stopPropagation();up({labels:x.labels.filter(y=>y!==l)})};
+    c.append(b);$('.chips').append(c);
+  }
+  const al=$('.addl');al.onchange=()=>{const v=al.value.trim();if(v)up({labels:[...x.labels,v]})};
+  const p=$('.path');p.textContent='\u200e'+x.path.replace(/^\/Users\/[^/]+/,'~')+'\u200e';  // LRM: keeps ~/ in front under rtl (which ellipsizes the start)
+  p.title=x.path;
+  const why=$('.why');if(x.missing){why.className='warn';why.textContent='⚠︎ Not found at this path. Moved or renamed? Fix the path under Notes & contents.'}
+  else if(x.summary)why.textContent=x.summary;else why.remove();
+  const n=$('textarea');n.value=x.note;n.onchange=()=>up({note:n.value});
+  const pi=$('.pathin');pi.value=x.path;pi.onchange=()=>pi.value.trim()&&up({path:pi.value});
+  if(x.peek)$('pre').textContent=x.peek;else $('pre').remove();
+  $('summary').textContent='Notes & contents'+(x.note?' ✎':'');
+  function act(a){return api(`/api/library/item/${x.id}/${a}`).then(r=>r.ok&&a==='copy'&&toast('Path copied'))}
+  for(const b of d.querySelectorAll('[data-a]')){b.onclick=()=>act(b.dataset.a);b.disabled=x.missing&&b.dataset.a!=='copy'}
+  if(!x.folder&&!/^(txt|md|py|ipynb|json|tex|bib|ya?ml|toml|js|ts|swift|sh|csv|c|h|cpp|m|r|jl|html|css|xml)$/i.test(ext))$('[data-a=edit]').hidden=true;
+  $('.x').onclick=()=>confirm(`Remove "${x.name}" from the Library? The ${x.folder?'folder':'file'} itself stays on disk.`)&&api(`/api/library/item/${x.id}/delete`);
+  d.draggable=true;d.ondragstart=e=>{if(/INPUT|TEXTAREA|SELECT/.test(e.target.tagName))return e.preventDefault();dragId=x.id;e.dataTransfer.setData('application/x-lib',x.id)};
+  d.ondragend=()=>dragId=null;
+  return d;
+}
+function render(){
+  const name=sel.slice(2);  // the selected group/label may have been renamed or deleted
+  if(!['all','missing','g:'].includes(sel)&&!(sel.startsWith('g:')?lib.groups:allLabels()).includes(name))sel='all';
+  renderNav();
+  labels.replaceChildren(...allLabels().map(l=>new Option(l)));
+  sorts.replaceChildren(...Object.entries(SORTS).map(([k,v])=>{const b=el('button',k===sort?'on':'',v);b.onclick=()=>{sort=k;localStorage.libsort=k;render()};return b}));
+  const words=q.value.trim().endsWith('?')?[]:q.value.toLowerCase().split(/\s+/).filter(Boolean);
+  const key={recent:x=>-Date.parse((x.opened>x.added?x.opened:x.added)||0),name:x=>x.name.toLowerCase(),added:x=>-Date.parse(x.added)}[sort];
+  const shown=lib.items.filter(x=>matches(x)&&words.every(w=>[x.name,x.path,x.group,x.note,x.summary,x.peek,...x.labels].join(' ').toLowerCase().includes(w)))
+    .sort((a,b)=>{const p=key(a),r=key(b);return p<r?-1:p>r?1:0});
+  list.replaceChildren(...shown.slice(0,400).map(card));
+  if(!shown.length){const e=el('div','empty');
+    e.innerHTML=lib.items.length?'Nothing matches.':'Your Library is empty.<br>Click <b>+ Add</b> to choose folders, files or docs, or drag them in from Finder.';list.append(e)}
+  stats.textContent=`${lib.items.length} item${lib.items.length===1?'':'s'}`+(shown.length!==lib.items.length?` · ${shown.length} shown`:'');
+  if(mdlg.open&&!mdlg.contains(document.activeElement))drawManage();
+}
+async function load(){[lib,st]=await Promise.all(['/api/library','/api/status'].map(u=>fetch(u).then(r=>r.json())));rev=st.lib_rev;render();pill()}
+function pill(){  // Argo status, as in Task Manager
+  const work=st.busy.filter(x=>x!=='check'),waiting=lib.items.filter(x=>x.retry).length;
+  argo.className='pill'+(!st.configured?'':work.length||st.busy.includes('check')?' busy':st.argo?' ok':st.argo===false?' down':'');
+  argo.replaceChildren(el('span','dot'),!st.configured?'Argo off':work.length?'Argo working…':st.argo===false?'Argo unavailable'+(waiting?` · ${waiting} waiting`:''):'Argo');
+  argo.title=!st.configured?'LLM features are off. Set "argo_user" in data/config.json to turn them on.'
+    :st.argo===false?'Argo is down, or you are off VPN. New items get summarized when it is back.':'Argo is reachable. Click to check now.';
+}
+async function tick(){
+  try{st=await (await fetch('/api/status')).json()}catch{return}
+  pill();
+  for(const e of document.querySelectorAll('.c[data-id]'))e.classList.toggle('thinking',st.busy.includes(e.dataset.id));
+  if(st.lib_rev!==rev&&document.activeElement===document.body&&!document.querySelector('.c details[open]')&&!dragId)load();
+}
+argo.onclick=()=>{fetch('/api/argo/check',{method:'POST'}).then(tick);setTimeout(tick,150)};
+setInterval(tick,2000);
+// ---- groups & labels editor: every change is saved right away ----
+function mrow(name,count,ren,del,h){
+  const r=el('div','row');
+  if(h!=null){const s=el('input','hue');s.type='range';s.min=0;s.max=359;s.value=h;s.style.setProperty('--h',h);s.title='Colour';
+    s.oninput=()=>s.style.setProperty('--h',s.value);s.onchange=()=>meta({op:'color_label',name,hue:+s.value});r.append(s)}
+  const i=el('input');i.type='text';i.value=name;i.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();i.blur()}};
+  i.onchange=()=>{const v=i.value.trim();if(v&&v!==name)ren(v);else i.value=name};
+  const x=el('button',0,'×');x.type='button';x.title='Delete';x.onclick=del;
+  r.append(i,el('small',0,count||''),x);return r;
+}
+for(const [i,op] of [[m_ng,'add_group'],[m_nl,'add_label']])
+  i.onkeydown=async e=>{if(e.key!=='Enter')return;e.preventDefault();const name=i.value.trim();i.value='';if(name){await meta({op,name});drawManage()}};
+function drawManage(){
+  const n=f=>lib.items.filter(f).length;
+  m_groups.replaceChildren(...lib.groups.map(g=>mrow(g,n(x=>x.group===g),to=>meta({op:'rename_group',name:g,to}),
+    ()=>confirm(`Delete the group "${g}"? Its items stay, ungrouped.`)&&meta({op:'delete_group',name:g}))));
+  m_labels.replaceChildren(...allLabels().map(l=>mrow(l,n(x=>x.labels.includes(l)),to=>meta({op:'rename_label',name:l,to}),
+    ()=>confirm(`Delete the label "${l}" from every item?`)&&meta({op:'delete_label',name:l}),lhue(l))));
+}
+function openManage(){drawManage();mdlg.showModal()}
+mform.onsubmit=e=>{e.preventDefault();mdlg.close()};
+mdlg.addEventListener('focusout',()=>setTimeout(()=>{if(mdlg.open&&!mdlg.contains(document.activeElement))drawManage()}));
+// ---- add ----
+addbtn.onclick=()=>{a_paths.value='';a_log.replaceChildren();a_save.disabled=false;
+  a_grp.replaceChildren(new Option('Let Argo choose',''),...lib.groups.map(g=>new Option(g)));
+  if(sel.startsWith('g:')&&sel.length>2)a_grp.value=sel.slice(2);adddlg.showModal();a_paths.focus()};
+a_close.onclick=()=>adddlg.close();
+const picker=window.webkit?.messageHandlers?.choose;  // only in the Mac app
+a_browse.hidden=a_hint.hidden=!picker;a_browse.onclick=()=>picker.postMessage(0);
+function chosen(paths){  // called by the Mac app with the picked paths
+  const have=a_paths.value.split('\n').filter(s=>s.trim());
+  a_paths.value=[...new Set([...have,...paths])].join('\n');a_save.focus();
+}
+function added(j){
+  const rows=[...j.added.length?[el('div','alog',`✓ Added ${j.added.length}: ${j.added.slice(0,8).join(', ')}${j.added.length>8?' …':''}`)]:[],
+    ...j.skipped.map(s=>el('div','alog bad','⚠︎ '+s))];
+  return rows;
+}
+aform.onsubmit=async e=>{
+  e.preventDefault();const paths=a_paths.value.split('\n').filter(s=>s.trim());if(!paths.length)return;
+  a_save.disabled=true;a_log.replaceChildren(el('div','alog','Reading…'));
+  const r=await fetch('/api/library/add',{method:'POST',body:JSON.stringify({paths,split:a_split.checked,group:a_grp.value})});
+  const j=await r.json();a_log.replaceChildren(...added(j));a_save.disabled=false;load();
+  if(!j.skipped.length){a_paths.value='';setTimeout(()=>adddlg.close(),1200)}
+};
+function dropped(j){drop.classList.remove('over');load();  // called by the Mac app after a Finder drop
+  toast([j.added.length&&`Added ${j.added.length} to the Library`,j.skipped.length&&j.skipped.join('; ')].filter(Boolean).join(' · ')||'Nothing added')}
+addEventListener('dragover',e=>{e.preventDefault();if(!dragId)drop.classList.add('over')});
+addEventListener('dragleave',e=>{if(!e.relatedTarget)drop.classList.remove('over')});
+addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('over');  // only reached in a browser: it hides file paths
+  if(!dragId)toast('Browsers hide file paths: use + Add and paste them (⌥⌘C in Finder), or use the Mac app')});
+// ---- search & ask ----
+function answer(text){const b=el('button',0,'×');b.title='Close';b.onclick=()=>ans.hidden=true;ans.replaceChildren(text,b);ans.hidden=false}
+q.oninput=render;
+q.onkeydown=async e=>{
+  if(e.key==='Escape'){q.value='';ans.hidden=true;render();q.blur()}
+  const v=q.value.trim();
+  if(e.key==='Enter'&&v.endsWith('?')){
+    answer('Asking Argo…');
+    const r=await fetch('/api/library/ask',{method:'POST',body:JSON.stringify({q:v})}).catch(()=>({}));
+    answer(r.ok?(await r.json()).answer:'Argo is unavailable right now (down, or not on VPN). Try again later.');
+  }
+};
+addEventListener('keydown',e=>{if(e.key==='/'&&!/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)){e.preventDefault();q.focus()}});
 load();
 </script>"""
 

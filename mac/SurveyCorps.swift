@@ -7,9 +7,11 @@ let appPy = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deleting
     .appendingPathComponent("app.py").path
 let base = URL(string: "http://127.0.0.1:8765")!
 let feedURL = base.appendingPathComponent("feed")
+let libURL = base.appendingPathComponent("library")
 let petSize: CGFloat = 96  // pet icon size in points
 
 class DropWebView: WKWebView {
+    var library = false  // Library window: Finder drops add the paths themselves, not the files' contents
     static let promiseTypes = NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) }
 
     override init(frame: NSRect, configuration: WKWebViewConfiguration) {
@@ -32,6 +34,17 @@ class DropWebView: WKWebView {
     override func performDragOperation(_ s: NSDraggingInfo) -> Bool {
         guard isFile(s) else { return super.performDragOperation(s) }
         let pb = s.draggingPasteboard
+        if library {
+            let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+            var req = URLRequest(url: base.appendingPathComponent("api/library/add"))
+            req.httpMethod = "POST"
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["paths": urls.map(\.path)])
+            URLSession.shared.dataTask(with: req) { data, _, _ in
+                let json = data.flatMap { String(data: $0, encoding: .utf8) } ?? "{\"added\":[],\"skipped\":[]}"
+                DispatchQueue.main.async { self.evaluateJavaScript("dropped(\(json))") }
+            }.resume()
+            return true
+        }
         if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
             urls.forEach(upload)
         } else if let promises = pb.readObjects(forClasses: [NSFilePromiseReceiver.self]) as? [NSFilePromiseReceiver] {
@@ -59,8 +72,9 @@ class DropWebView: WKWebView {
 }
 
 // Original plush-chibi pet: swept-back blond hair, thick brows, square jaw, stern look, holding a letter. 64x64 box.
+// librarian: the third pet (Library window) — Armin-style: blond bob with a fringe, big blue eyes, holding an open book.
 // scout: the second pet (Scout window) — Hange-style researcher: messy brown ponytail, glasses, excited grin, magnifying glass.
-func drawPet(_ b: NSRect, scout: Bool = false) {
+func drawPet(_ b: NSRect, scout: Bool = false, librarian: Bool = false) {
     let k = min(b.width, b.height) / 64
     NSGraphicsContext.current?.cgContext.scaleBy(x: k, y: k)
     func rgb(_ r: CGFloat, _ g: CGFloat, _ bl: CGFloat, _ a: CGFloat = 1) -> NSColor {
@@ -84,7 +98,8 @@ func drawPet(_ b: NSRect, scout: Bool = false) {
         tail.close(); tail.lineJoinStyle = .round
         hair.setFill(); tail.fill(); hairDark.setStroke(); tail.lineWidth = 0.9; tail.stroke()
     }
-    let back = NSBezierPath(roundedRect: NSRect(x: 7, y: 20, width: 50, height: 42), xRadius: 23, yRadius: 22)
+    let back = NSBezierPath(roundedRect: librarian ? NSRect(x: 6, y: 15, width: 52, height: 47) : NSRect(x: 7, y: 20, width: 50, height: 42),
+                            xRadius: 23, yRadius: 22)
     hair.setFill(); back.fill()
     if scout {  // hair tie at the ponytail's base
         rgb(176, 48, 48).setFill(); NSBezierPath(roundedRect: NSRect(x: 42.5, y: 56.5, width: 7, height: 4), xRadius: 2, yRadius: 2).fill()
@@ -166,6 +181,26 @@ func drawPet(_ b: NSRect, scout: Bool = false) {
     ink.setStroke(); grin.lineWidth = 0.8; grin.lineJoinStyle = .round; grin.stroke()
     rgb(250, 130, 130, 0.35).setFill(); oval(13.5, 21, 6, 3.4).fill(); oval(44.5, 21, 6, 3.4).fill()
 
+    } else if librarian {
+        // bob: rounded crown, a fringe of soft points down to the brows, side locks to the jaw
+        let bob = NSBezierPath(); bob.move(to: NSPoint(x: 8, y: 36))
+        bob.curve(to: NSPoint(x: 32, y: 62), controlPoint1: NSPoint(x: 7, y: 55), controlPoint2: NSPoint(x: 18, y: 62))
+        bob.curve(to: NSPoint(x: 56, y: 36), controlPoint1: NSPoint(x: 46, y: 62), controlPoint2: NSPoint(x: 57, y: 55))
+        for (x, y): (CGFloat, CGFloat) in [(56, 19), (51.5, 17.5), (50.5, 37), (46, 41.5), (41.5, 38.5), (36.5, 42), (32, 38.5),
+                                           (27.5, 42), (22.5, 38.5), (18, 41.5), (13.5, 37), (12.5, 17.5), (8, 19)] {
+            bob.line(to: NSPoint(x: x, y: y))
+        }
+        bob.close(); bob.lineJoinStyle = .round
+        hair.setFill(); bob.fill(); hairDark.setStroke(); bob.lineWidth = 0.9; bob.stroke()
+        for (x0, y0, x1, y1): (CGFloat, CGFloat, CGFloat, CGFloat) in [(24, 57, 22.5, 41), (32, 59, 32, 41), (40, 57, 41.5, 41),
+                                                                       (11, 44, 10.5, 22), (53, 44, 53.5, 22)] {
+            let s = NSBezierPath(); s.move(to: NSPoint(x: x0, y: y0)); s.line(to: NSPoint(x: x1, y: y1))
+            hairDark.withAlphaComponent(0.55).setStroke(); s.lineWidth = 0.7; s.lineCapStyle = .round; s.stroke()
+        }
+        let shine = NSBezierPath(); shine.move(to: NSPoint(x: 19, y: 56.5))
+        shine.curve(to: NSPoint(x: 30, y: 60), controlPoint1: NSPoint(x: 22, y: 58.8), controlPoint2: NSPoint(x: 26, y: 60))
+        NSColor.white.withAlphaComponent(0.65).setStroke(); shine.lineWidth = 1.5; shine.lineCapStyle = .round; shine.stroke()
+        rgb(250, 140, 140, 0.3).setFill(); oval(14.5, 21, 6, 3.4).fill(); oval(43.5, 21, 6, 3.4).fill()
     } else {
         // swept-back hair with a side part and a high hairline; short sideburns
         let top = NSBezierPath(); top.move(to: NSPoint(x: 8, y: 40))
@@ -225,6 +260,27 @@ func drawPet(_ b: NSRect, scout: Bool = false) {
         return
     }
 
+    if librarian {  // an open book, held with two little hands
+        NSGraphicsContext.saveGraphicsState(); sh.set()
+        let book = NSBezierPath(); book.move(to: NSPoint(x: 13, y: 4)); book.line(to: NSPoint(x: 32, y: 1.5)); book.line(to: NSPoint(x: 51, y: 4))
+        book.line(to: NSPoint(x: 51, y: 17)); book.line(to: NSPoint(x: 32, y: 15)); book.line(to: NSPoint(x: 13, y: 17)); book.close()
+        rgb(46, 110, 80).setFill(); book.fill()
+        NSGraphicsContext.restoreGraphicsState()
+        for side: CGFloat in [-1, 1] {
+            let page = NSBezierPath(); page.move(to: NSPoint(x: 32, y: 3)); page.line(to: NSPoint(x: 32 + side * 17.5, y: 5.3))
+            page.line(to: NSPoint(x: 32 + side * 17.5, y: 16.2)); page.line(to: NSPoint(x: 32, y: 14)); page.close()
+            rgb(255, 250, 238).setFill(); page.fill(); rgb(200, 185, 160).setStroke(); page.lineWidth = 0.6; page.stroke()
+            for y: CGFloat in [7.5, 10, 12.5] {
+                let line = NSBezierPath(); line.move(to: NSPoint(x: 32 + side * 3, y: y)); line.line(to: NSPoint(x: 32 + side * 14, y: y + 1.3))
+                rgb(150, 150, 165, 0.7).setStroke(); line.lineWidth = 0.7; line.stroke()
+            }
+        }
+        for x: CGFloat in [9.5, 47.5] {
+            let hand = oval(x, 5, 7, 7); skin.setFill(); hand.fill(); skinEdge.setStroke(); hand.lineWidth = 0.9; hand.stroke()
+        }
+        return
+    }
+
     // the letter, held with two little hands
     NSGraphicsContext.saveGraphicsState(); sh.set()
     let env = NSBezierPath(roundedRect: NSRect(x: 15, y: 1, width: 34, height: 16), xRadius: 3, yRadius: 3)
@@ -241,13 +297,13 @@ func drawPet(_ b: NSRect, scout: Bool = false) {
 // Floating pet that stays on every desktop. Click: show/hide Survey Corps. Drag: move it.
 class PetView: NSView {
     var onClick: () -> Void = {}
-    var scout = false, frameName = "pet", badgeColor = NSColor.systemRed
+    var scout = false, librarian = false, frameName = "pet", badgeColor = NSColor.systemRed
     var grab = NSPoint.zero, moved = false
     var overdue = 0 { didSet { if overdue != oldValue { needsDisplay = true } } }  // badge count
     override func draw(_ r: NSRect) {
         // Fully transparent pixels let clicks fall through; a near-invisible fill makes the whole square clickable.
         NSColor.black.withAlphaComponent(0.01).setFill(); bounds.fill()
-        NSGraphicsContext.saveGraphicsState(); drawPet(bounds, scout: scout); NSGraphicsContext.restoreGraphicsState()
+        NSGraphicsContext.saveGraphicsState(); drawPet(bounds, scout: scout, librarian: librarian); NSGraphicsContext.restoreGraphicsState()
         guard overdue > 0 else { return }
         let text = NSAttributedString(string: overdue > 99 ? "99+" : "\(overdue)", attributes: [
             .font: NSFont.boldSystemFont(ofSize: 15), .foregroundColor: NSColor.white])
@@ -268,10 +324,10 @@ class PetView: NSView {
     }
 }
 
-class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
-    var window: NSWindow!, feedWindow: NSWindow!
-    var pet: NSPanel!, scoutPet: NSPanel!
-    var feedWeb: WKWebView!
+class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+    var window: NSWindow!, feedWindow: NSWindow!, libWindow: NSWindow!
+    var pet: NSPanel!, scoutPet: NSPanel!, libPet: NSPanel!
+    var feedWeb: WKWebView!, libWeb: DropWebView!
     let server = Process()
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -312,6 +368,23 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
         feedWindow.isReleasedWhenClosed = false
         feedWeb.load(URLRequest(url: feedURL))
 
+        // Library window: starts hidden, shown by the librarian pet
+        let libConfig = WKWebViewConfiguration()
+        libConfig.userContentController.add(self, name: "choose")  // the page's "Choose in Finder…" button
+        libWeb = DropWebView(frame: .zero, configuration: libConfig)
+        libWeb.library = true
+        libWeb.navigationDelegate = self
+        libWeb.uiDelegate = self
+        libWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 760),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        libWindow.title = "Library"
+        libWindow.minSize = NSSize(width: 720, height: 420)
+        libWindow.contentView = libWeb
+        libWindow.center()
+        libWindow.setFrameAutosaveName("library")
+        libWindow.isReleasedWhenClosed = false
+        libWeb.load(URLRequest(url: libURL))
+
         let view = PetView()
         view.toolTip = "Task Manager: click to show/hide, drag to move"
         view.onClick = { [unowned self] in self.toggle(self.window) }
@@ -321,6 +394,11 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
         scoutView.toolTip = "Scout: new papers, videos and repos. Click to show/hide, drag to move"
         scoutView.onClick = { [unowned self] in self.toggle(self.feedWindow) }
         scoutPet = makePet(scoutView, offset: 26 + petSize + 8)
+        let libView = PetView()
+        libView.librarian = true; libView.frameName = "libPet"
+        libView.toolTip = "Library: your projects, files and docs. Click to show/hide, drag to move"
+        libView.onClick = { [unowned self] in self.toggle(self.libWindow) }
+        libPet = makePet(libView, offset: 26 + 2 * (petSize + 8))
 
         // red badge on the pet: open, not-done tasks whose due time has passed
         let refresh = { [weak view] in
@@ -372,9 +450,21 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
         }
     }
 
+    // Library "Choose in Finder…": the standard Open panel (files and folders, several at once, New Folder for a new project)
+    func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+        let p = NSOpenPanel()
+        p.canChooseFiles = true; p.canChooseDirectories = true; p.allowsMultipleSelection = true; p.canCreateDirectories = true
+        p.prompt = "Choose"; p.message = "Pick projects, files or docs (⌘-click for several). New Folder starts a new project."
+        p.beginSheetModal(for: libWindow) { r in
+            guard r == .OK, let data = try? JSONSerialization.data(withJSONObject: p.urls.map(\.path)),
+                  let json = String(data: data, encoding: .utf8) else { return }
+            self.libWeb.evaluateJavaScript("chosen(\(json))")
+        }
+    }
+
     // server takes a moment to start; keep retrying
     func webView(_ w: WKWebView, didFailProvisionalNavigation n: WKNavigation!, withError e: Error) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.load(URLRequest(url: w === self.feedWeb ? feedURL : base)) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.load(URLRequest(url: w === self.feedWeb ? feedURL : w === self.libWeb ? libURL : base)) }
     }
 
     func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool {
