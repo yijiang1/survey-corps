@@ -8,6 +8,7 @@ let appPy = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deleting
 let base = URL(string: "http://127.0.0.1:8765")!
 let feedURL = base.appendingPathComponent("feed")
 let libURL = base.appendingPathComponent("library")
+let settingsURL = base.appendingPathComponent("settings")
 let petSize: CGFloat = 96  // pet icon size in points
 
 class DropWebView: WKWebView {
@@ -325,10 +326,27 @@ class PetView: NSView {
 }
 
 class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
-    var window: NSWindow!, feedWindow: NSWindow!, libWindow: NSWindow!
+    var window: NSWindow!, feedWindow: NSWindow!, libWindow: NSWindow!, settingsWindow: NSWindow!
     var pet: NSPanel!, scoutPet: NSPanel!, libPet: NSPanel!
-    var feedWeb: WKWebView!, libWeb: DropWebView!
+    var feedWeb: WKWebView!, libWeb: DropWebView!, settingsWeb: WKWebView!
     let server = Process()
+
+    @objc func openSettings() {  // Survey Corps > Settings… (⌘,): its own window, like any Mac app
+        if settingsWindow == nil {
+            settingsWeb = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+            settingsWeb.navigationDelegate = self
+            settingsWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 540),
+                                      styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            settingsWindow.title = "Settings"
+            settingsWindow.contentView = settingsWeb
+            settingsWindow.center()
+            settingsWindow.setFrameAutosaveName("settings")
+            settingsWindow.isReleasedWhenClosed = false
+            settingsWeb.load(URLRequest(url: settingsURL))
+        }
+        settingsWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let logPath = NSHomeDirectory() + "/Library/Logs/SurveyCorps.log"
@@ -464,7 +482,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
 
     // server takes a moment to start; keep retrying
     func webView(_ w: WKWebView, didFailProvisionalNavigation n: WKNavigation!, withError e: Error) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.load(URLRequest(url: w === self.feedWeb ? feedURL : w === self.libWeb ? libURL : base)) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.load(URLRequest(url: w === self.feedWeb ? feedURL : w === self.libWeb ? libURL : w === self.settingsWeb ? settingsURL : base)) }
     }
 
     func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool {
@@ -509,8 +527,12 @@ app.delegate = delegate
 // Menus: Cmd+Q/W, plus Edit so Cmd+C/V/Z work in text fields.
 let mainMenu = NSMenu()
 let appMenu = NSMenu()
+let settingsItem = NSMenuItem(title: "Settings…", action: #selector(App.openSettings), keyEquivalent: ",")
+settingsItem.target = delegate
+appMenu.addItem(settingsItem)
+appMenu.addItem(.separator())
 appMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
-appMenu.addItem(withTitle: "Quit Task Manager", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+appMenu.addItem(withTitle: "Quit Survey Corps", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 let editMenu = NSMenu(title: "Edit")
 for (title, sel, key) in [("Undo", "undo:", "z"), ("Redo", "redo:", "Z"), ("Cut", "cut:", "x"),
                           ("Copy", "copy:", "c"), ("Paste", "paste:", "v"), ("Select All", "selectAll:", "a")] {

@@ -18,6 +18,8 @@ A small local task manager for macOS that turns Outlook emails into to-dos.
 - **Ask**: type a question ending in `?` in the search box and press Enter ("what did Bob ask me about the beamtime?"). Argo answers from your saved emails and tasks.
 - **Morning briefing**: once a day after 8:00 (`"briefing_hour"` in `data/config.json`), one notification with what's overdue and due today, and which three to start with.
 
+**Settings** (Survey Corps menu → Settings…, or ⌘,), in its own window; changes save as you make them: Argo username and model, how often to retry work Argo missed, the morning briefing time (or off), the Library's editor app and an optional GitHub token. Saved to `data/config.json`; the token is never shown again after saving.
+
 **Organising**
 - Due dates with friendly labels ("Tomorrow 12:33 AM", "Fri 11:26 PM"). Tasks are grouped into Overdue, Today, Tomorrow, Next 7 days, Later and No due date.
 - Labels: create new ones or reuse existing ones; each gets its own colour. Click a label to filter by it.

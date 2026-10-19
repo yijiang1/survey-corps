@@ -72,6 +72,38 @@ def config():
     return json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
 
 
+SETTINGS = {  # editable in the app's Settings dialog -> (default, max for ints / None for text)
+    "argo_user": ("", None), "argo_model": ("claudesonnet5", None), "retry_minutes": (10, 1440),
+    "briefing_hour": (8, 24), "library_editor": ("Visual Studio Code", None), "github_token": ("", None)}
+
+
+def get_settings():
+    cfg = config()
+    out = {k: cfg.get(k, d) for k, (d, _) in SETTINGS.items()}
+    out["github_token_set"], out["github_token"] = bool(out["github_token"]), ""  # never send the token back
+    return out
+
+
+def set_settings(new):
+    with config_lock:
+        cfg = config()
+        for k, v in new.items():
+            if k not in SETTINGS:
+                continue
+            d, hi = SETTINGS[k]
+            v = max(0, min(hi, int(v))) if hi else str(v).strip()
+            if k == "github_token" and not v:
+                continue  # blank = keep; clear_github_token removes it
+            cfg[k] = v if v != "" else d
+            if v == "" or v == d and k not in ("retry_minutes", "briefing_hour"):
+                cfg.pop(k, None)  # back to the default
+        if new.get("clear_github_token"):
+            cfg.pop("github_token", None)
+        tmp = CONFIG.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cfg, indent=1, ensure_ascii=False))
+        tmp.replace(CONFIG)
+
+
 def argo_on():
     return bool(config().get("argo_user"))
 
@@ -840,6 +872,8 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/api/todos":
             with lock:
                 self.reply(200, json.dumps(load()).encode())
+        elif self.path == "/api/settings":
+            self.reply(200, json.dumps(get_settings()).encode())
         elif self.path == "/api/status":
             with busy_lock:
                 working = sorted(k for k, n in busy.items() if n > 0)
@@ -851,6 +885,8 @@ class H(BaseHTTPRequestHandler):
             self.reply(200, FEED_PAGE.encode(), "text/html; charset=utf-8")
         elif self.path == "/api/scout/settings":
             self.reply(200, json.dumps({k: {**SCOUT, **config()}[k] for k in SCOUT}).encode())
+        elif self.path == "/settings":
+            self.reply(200, SETTINGS_PAGE.encode(), "text/html; charset=utf-8")
         elif self.path == "/library":
             self.reply(200, LIB_PAGE.encode(), "text/html; charset=utf-8")
         elif self.path == "/api/library":
@@ -918,14 +954,11 @@ class H(BaseHTTPRequestHandler):
             if argo_ok:
                 retry_argo()
             return self.reply(200)
-        if u.path == "/api/argo/auto":
-            m = max(0, min(1440, int(json.loads(raw or b"{}").get("minutes", 10))))
-            with config_lock:
-                cfg = config()
-                cfg["retry_minutes"] = m
-                tmp = CONFIG.with_suffix(".tmp")
-                tmp.write_text(json.dumps(cfg, indent=1, ensure_ascii=False))
-                tmp.replace(CONFIG)
+        if u.path == "/api/settings":
+            try:
+                set_settings(json.loads(raw or b"{}"))
+            except (ValueError, TypeError):
+                return self.reply(400)
             return self.reply(200)
         if u.path == "/api/ask":
             answer = (ask(json.loads(raw or b"{}").get("q", "")) or "").replace("**", "")  # plain-text box
@@ -1094,6 +1127,12 @@ h2 span{font-weight:400;margin-left:4px}h2.late{color:var(--red)}
 .done .title{text-decoration:line-through;color:var(--muted)}
 .meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;margin-top:3px;font-size:12px}
 .info{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+#lbar{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.lb{border:1px solid transparent;border-radius:10px;padding:1px 9px;font-size:12px;cursor:pointer;font-weight:500;
+  background:hsl(var(--h,210) 70% 50% / .14);color:hsl(var(--h,210) 65% var(--chipL))}
+.lb b{font-weight:400;opacity:.6;margin-left:5px}.lb:hover{border-color:hsl(var(--h,210) 65% 50% / .5)}
+.lb.on{background:hsl(var(--h,210) 70% 50%);color:#fff}.lb.on b{opacity:.85}
+.lb:first-child{background:none;border-color:var(--line);color:var(--muted)}.lb:first-child.on{background:var(--text);color:var(--bg);border-color:var(--text)}
 .chips{display:contents}.chip{border-radius:10px;padding:1px 8px;cursor:pointer;background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 65% var(--chipL));font-weight:500}
 .chip b{display:inline-block;vertical-align:bottom;max-width:0;overflow:hidden;font-weight:400;opacity:0}.chip:hover b{max-width:1em;margin-left:3px;opacity:.7}.chip b:hover{opacity:1}
 .addl{border:0;background:none;width:0;padding:1px 0;color:var(--muted);outline:none;opacity:0}
@@ -1113,6 +1152,7 @@ textarea:focus{border-color:var(--accent)}
 .due:hover{background:var(--line)}.due.unset{opacity:0}.t:hover .due.unset{opacity:1}
 .due b{font-weight:400;margin-left:4px;opacity:0}.due:hover b{opacity:.6}.due b:hover{opacity:1}
 .side input{background:var(--card);border:1px solid var(--accent);border-radius:6px;padding:2px 6px;font-size:12px}
+[hidden]{display:none!important}  /* .icon/.pill set display, which would otherwise beat the hidden attribute */
 .icon{border:0;background:none;width:28px;height:28px;border-radius:6px;color:var(--muted);cursor:pointer;display:grid;place-content:center;opacity:.55}
 .t:hover .icon{opacity:1}.icon:hover{background:var(--line);color:var(--text)}.icon.x:hover{color:var(--red)}
 .icon svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
@@ -1156,14 +1196,13 @@ textarea:focus{border-color:var(--accent)}
 <div id=drop>Drop email to add a task</div><div id=toast></div>
 <header>
   <div class=top><h1>Task Manager</h1><span id=stats></span><button id=argo class=pill></button>
-    <button id=rt class=pill hidden title="Retry the work Argo missed, now">Retry now</button>
-    <select id=ar class=pill title="Automatic retry"></select></div>
+    <button id=rt class=pill hidden title="Retry the work Argo missed, now">Retry now</button></div>
   <div class=bar>
     <input id=new placeholder="Add a task (&quot;review Bob's draft by Fri 3pm&quot;) or drag in emails from Outlook">
     <input id=q type=search placeholder="Search, or ask a question ending in ?  ( / )">
-    <select id=lf><option value="">All labels</option></select>
     <span class=seg><button id=vl>List</button><button id=vc>Calendar</button></span>
   </div>
+  <div id=lbar></div>
 </header>
 <datalist id=labels></datalist>
 <main><div id=ans hidden></div><div id=cal hidden></div><div id=list></div><details id=donebox><summary id=donehdr></summary><div id=donelist></div></details></main>
@@ -1232,7 +1271,7 @@ function item(t){
   const labels=t.labels||[];
   for(const l of labels){
     const c=document.createElement('span');c.className='chip';c.style.setProperty('--h',hue(l));
-    c.textContent=l;c.title='Show only this label';c.onclick=()=>{lf.value=l;render()};
+    c.textContent=l;c.title='Show only this label';c.onclick=()=>{lf=l;render()};
     const x=document.createElement('b');x.textContent='×';x.title='Remove label';
     x.onclick=e=>{e.stopPropagation();up({labels:labels.filter(y=>y!==l)})};
     c.append(x);$('.chips').append(c);
@@ -1298,14 +1337,18 @@ function renderCal(shown){
     ...(ts.length?ts.map(item):[el('div','empty','Nothing due this day.')]))}
   cal.replaceChildren(...out);
 }
+let lf='';  // label filter ('' = all), set by the label row under the search bar or by clicking a label
 function render(){
   const names=[...new Set(all.flatMap(t=>t.labels||[]))].sort();
   labels.replaceChildren(...names.map(n=>new Option(n)));
-  const cur=lf.value;
-  lf.replaceChildren(new Option('All labels',''),...names.map(n=>new Option(n)));
-  lf.value=names.includes(cur)?cur:'';
+  if(!names.includes(lf))lf='';
+  const lchip=(name,text,n)=>{const c=document.createElement('button');c.className='lb'+(lf===name?' on':'');
+    if(name)c.style.setProperty('--h',hue(name));c.textContent=text;if(n){const b=document.createElement('b');b.textContent=n;c.append(b)}
+    c.onclick=()=>{lf=lf===name?'':name;render()};return c};
+  const undone=all.filter(t=>!t.done);
+  lbar.replaceChildren(lchip('','All labels'),...names.map(n=>lchip(n,n,undone.filter(t=>(t.labels||[]).includes(n)).length||'')));
   const words=q.value.trim().endsWith('?')?[]:q.value.toLowerCase().split(/\s+/).filter(Boolean);
-  const shown=all.filter(t=>(!lf.value||(t.labels||[]).includes(lf.value))&&words.every(w=>
+  const shown=all.filter(t=>(!lf||(t.labels||[]).includes(lf))&&words.every(w=>
     [t.title,t.sender,t.body,t.note,...(t.labels||[])].join(' ').toLowerCase().includes(w)));
   const open=shown.filter(t=>!t.done).sort((a,b)=>(a.due||'z').localeCompare(b.due||'z'));
   const done=shown.filter(t=>t.done);
@@ -1340,8 +1383,6 @@ function pill(){  // Argo status in the header: off / reachable / unavailable / 
   argo.replaceChildren(dot,!st.configured?'Argo off':work.length?`Argo working${work.length>1?` on ${work.length}`:''}…`
     :checking?'Checking Argo…':st.argo===false?'Argo unavailable'+(waiting?` · ${waiting} waiting`:''):'Argo');
   rt.hidden=!st.configured||!waiting;
-  if(!ar.options.length&&st.configured){for(const [v,l] of [[0,'Auto-retry: off'],[5,'Retry every 5 min'],[10,'Retry every 10 min'],[30,'Retry every 30 min'],[60,'Retry every hour']])ar.add(new Option(l,v));ar.value=st.retry_minutes}
-  ar.hidden=!st.configured;
   argo.title=!st.configured?'LLM features are off. Set "argo_user" in data/config.json to turn them on.'
     :(st.argo===false?'Argo is down, or you are off VPN. Waiting work retries '+(st.retry_minutes?'every '+st.retry_minutes+' min':'only when you press Retry now')+'.':st.argo?'Argo is reachable.':'Not checked yet.')
     +(ago!=null?` Last contact ${ago<1?'just now':ago<60?ago+' min ago':Math.round(ago/60)+' h ago'}.`:'')+' Click to check now.';
@@ -1355,9 +1396,9 @@ async function tick(){
 }
 argo.onclick=()=>{fetch('/api/argo/check',{method:'POST'}).then(tick);setTimeout(tick,150)};
 rt.onclick=()=>{rt.disabled=true;fetch('/api/argo/retry',{method:'POST'}).then(()=>{rt.disabled=false;tick();load()});setTimeout(tick,150)};
-ar.onchange=()=>fetch('/api/argo/auto',{method:'POST',body:JSON.stringify({minutes:+ar.value})});
+
 setInterval(tick,2000);
-q.oninput=lf.onchange=render;
+q.oninput=render;
 vl.onclick=()=>{view='list';localStorage.view=view;render()};vc.onclick=()=>{view='cal';localStorage.view=view;render()};
 document.getElementById('new').onkeydown=e=>{
   const v=e.target.value.trim();
@@ -1623,6 +1664,71 @@ q.onkeydown=e=>{if(e.key==='Escape'){q.value='';render();q.blur()}};
 let tick=0;setInterval(()=>{if((feed.busy||++tick%6===0)&&!document.querySelector('details[open]'))load()},5000);
 load();
 </script>"""
+
+SETTINGS_PAGE = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width"><title>Settings</title>
+<style>
+:root{color-scheme:light dark;--bg:#ececec;--card:#fff;--text:#1d1d1f;--muted:#6e6e73;--line:#dcdce0;--accent:#0a84ff;--red:#d70015;--green:#248a3d}
+@media (prefers-color-scheme:dark){:root{--bg:#1e1e1e;--card:#2a2a2d;--text:#f2f2f7;--muted:#98989f;--line:#3a3a3d;--red:#ff6961;--green:#30d158}}
+*{box-sizing:border-box}
+body{font:13px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:18px 20px;background:var(--bg);color:var(--text);-webkit-user-select:none;cursor:default}
+h2{font-size:13px;font-weight:600;margin:16px 0 6px}h2:first-child{margin-top:0}
+.group{background:var(--card);border:1px solid var(--line);border-radius:10px}
+.r{display:flex;align-items:center;gap:12px;padding:8px 12px;min-height:38px}.r+.r{border-top:1px solid var(--line)}
+.r>label{flex:1}.r small{display:block;color:var(--muted);font-size:11.5px}
+input,select{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 7px;width:220px;-webkit-user-select:text}
+input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:6px;padding:3px 12px}
+.ok{color:var(--green)}.bad{color:var(--red)}#res{font-size:12px}
+.foot{color:var(--muted);font-size:11.5px;margin-top:12px;display:flex;justify-content:space-between}
+</style>
+<h2>Argo</h2>
+<div class=group>
+  <div class=r><label for=argo_user>ANL username<small>Blank turns all LLM features off</small></label><input id=argo_user autocomplete=off spellcheck=false></div>
+  <div class=r><label for=argo_model>Model</label><input id=argo_model spellcheck=false placeholder=claudesonnet5></div>
+  <div class=r><label for=retry_minutes>Retry missed work<small>When Argo was down or off VPN</small></label><select id=retry_minutes></select></div>
+  <div class=r><label>Connection<small id=res>&nbsp;</small></label><button id=test>Test Connection</button></div>
+</div>
+<h2>Notifications</h2>
+<div class=group>
+  <div class=r><label for=briefing_hour>Morning briefing<small>What's overdue and due today, once a day</small></label><select id=briefing_hour></select></div>
+</div>
+<h2>Library &amp; Scout</h2>
+<div class=group>
+  <div class=r><label for=library_editor>Editor app<small>Opens Library files and folders</small></label><input id=library_editor spellcheck=false placeholder="Visual Studio Code"></div>
+  <div class=r><label for=github_token>GitHub token<small id=ghs>Optional, raises Scout's GitHub rate limit</small></label><input id=github_token type=password autocomplete=off></div>
+</div>
+<div class=foot><span>Changes save automatically. Scout's interests are set in the Scout window.</span><span id=msg></span></div>
+<script>
+const $=id=>document.getElementById(id), post=(u,b)=>fetch(u,{method:'POST',body:JSON.stringify(b)});
+const fill=(sel,opts)=>{for(const [v,l] of opts)sel.add(new Option(l,v))};
+fill($('retry_minutes'),[[0,'Never (use Retry now)'],[5,'Every 5 min'],[10,'Every 10 min'],[30,'Every 30 min'],[60,'Every hour']]);
+fill($('briefing_hour'),[[24,'Off'],...[...Array(24).keys()].map(h=>[h,'Daily after '+h+':00'])]);
+async function load(){
+  const c=await (await fetch('/api/settings')).json();
+  for(const k in c){const e=$(k);if(e&&e.type!=='password'&&document.activeElement!==e)e.value=c[k]}
+  $('github_token').placeholder=c.github_token_set?'Saved (type to replace)':'';
+  $('ghs').innerHTML=c.github_token_set?'Saved. <a href=# id=rm>Remove</a>':"Optional, raises Scout's GitHub rate limit";
+  if($('rm'))$('rm').onclick=e=>{e.preventDefault();save({clear_github_token:true})};
+}
+let pending=Promise.resolve();
+async function save(b){  // macOS style: every change is saved as soon as it's made
+  const p=post('/api/settings',b);pending=p;const r=await p, m=$('msg');
+  m.className=r.ok?'ok':'bad';m.textContent=r.ok?'Saved':'Could not save';setTimeout(()=>m.textContent='',1500);
+  if(b.github_token)$('github_token').value='';
+  load();
+}
+for(const e of document.querySelectorAll('input,select'))e.onchange=()=>save({[e.id]:e.value});
+$('test').onclick=async()=>{
+  const res=$('res');res.className='';res.textContent='Checking…';
+  await pending;  // a just-edited username saves (on blur) before the check
+  await post('/api/argo/check',{});
+  const st=await (await fetch('/api/status')).json();
+  res.className=st.argo?'ok':'bad';
+  res.textContent=!st.configured?'No username set':st.argo?'Argo is reachable':'Unreachable: Argo is down, or you are off VPN';
+};
+window.onfocus=load;load();
+</script>"""
+
 
 LIB_PAGE = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width"><title>Library</title>
 <style>

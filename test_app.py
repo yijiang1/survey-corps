@@ -68,4 +68,16 @@ new, skipped = app.lib_add([str(root), str(root / "nope"), ""], split=True)
 assert sorted(x["name"] for x in new) == ["proj1", "proj2"] and skipped == [f"{root / 'nope'}: not found"], (new, skipped)
 assert "README.md" in new[0]["peek"] and "# Ptycho recon" in new[0]["peek"]
 assert app.lib_add([str(root / "proj1")])[1] == ["proj1: already in the Library"]
+# Settings: saved to config.json, blank text = default, blank token keeps the old one, token never read back
+import tempfile
+app.CONFIG = Path(tempfile.mkdtemp()) / "config.json"
+app.config = lambda: __import__("json").loads(app.CONFIG.read_text()) if app.CONFIG.exists() else {}  # undo earlier patch
+app.set_settings({"argo_user": " bob ", "retry_minutes": "30", "github_token": "tok", "bogus": 1, "argo_model": "claudesonnet5"})
+c = app.get_settings()
+assert (c["argo_user"], c["retry_minutes"], c["github_token"], c["github_token_set"]) == ("bob", 30, "", True), c
+assert "argo_model" not in app.config() and "bogus" not in app.config()  # default values aren't stored
+app.set_settings({"github_token": "", "retry_minutes": 9999, "argo_user": ""})
+assert app.config() == {"retry_minutes": 1440, "github_token": "tok"}, app.config()
+app.set_settings({"clear_github_token": True})
+assert "github_token" not in app.config()
 print("ok")
