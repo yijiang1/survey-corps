@@ -277,12 +277,13 @@ def retry_argo():
         retry_busy.release()
 
 
-def draft_reply(t):
-    """Argo drafts a reply; it opens as a new Outlook message (never sent) and is copied to the clipboard."""
+def draft_reply(t, how=""):
+    """Argo drafts a reply (following `how`, if given); it opens as a new Outlook message (never sent) and is copied to the clipboard."""
     msg = message_from_bytes((MAILS / f"{t.get('mail', t['id'])}.eml").read_bytes(), policy=policy.default)
     text = argo("Draft my reply to the email below. Write only the reply body: plain text, no subject line, no signature, "
                 "match the sender's tone and language, keep it short."
                 + (f" My notes on how to answer: {t['note']}" if t["note"] else "")
+                + (f" Instructions for this reply: {how}" if how else "")
                 + f"\n\nFrom: {t['sender']}\nDate: {t['date']}\nSubject: {msg['Subject']}\n\n{t['body']}", 1500, timeout=90, tag=t["id"])
     if not text:
         return None
@@ -320,6 +321,13 @@ def ask(q):
     return argo(f"Today is {datetime.now():%A %Y-%m-%d}. Answer my question using only the saved emails/tasks below. "
                 "Be brief and plain text; name the item (by its [subject]) the answer comes from. "
                 f"If they don't contain the answer, say so.\n\nQuestion: {q}\n\n{ctx}", 2000, timeout=90, tag="ask")
+
+
+def ask_mail(t, q):
+    """Answer a question about one saved email."""
+    return argo(f"Today is {datetime.now():%A %Y-%m-%d}. Answer my question about the email below. Be brief and plain text. "
+                f"If the email doesn't say, say so.\n\nQuestion: {q}\n\nFrom: {t['sender']}\nDate: {t['date']}\n"
+                f"Subject: {t['title']}\n\n{t['body']}", 1500, timeout=90, tag=t["id"])
 
 
 def briefing():
@@ -1080,15 +1088,20 @@ class H(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 return self.reply(400)
             return self.reply(200)
-        if u.path == "/api/ask":
-            answer = (ask(json.loads(raw or b"{}").get("q", "")) or "").replace("**", "")  # plain-text box
+        if u.path == "/api/ask":  # {"q"}: across all tasks, or {"q", "id"}: about that one email
+            d = json.loads(raw or b"{}")
+            with lock:
+                t = next((x for x in load() if x["id"] == d.get("id")), None)
+            if d.get("id") and not t:
+                return self.reply(404)
+            answer = ((ask_mail(t, d.get("q", "")) if t else ask(d.get("q", ""))) or "").replace("**", "")  # plain-text box
             return self.reply(200, json.dumps({"answer": answer}).encode()) if answer else self.reply(503)
         if u.path.startswith("/api/reply/"):
             with lock:
                 t = next((x for x in load() if x["id"] == u.path.rsplit("/", 1)[1]), None)
             if not t or not t.get("eml"):
                 return self.reply(404)
-            text = draft_reply(t)
+            text = draft_reply(t, str(json.loads(raw or b"{}").get("how") or "").strip())
             return self.reply(200, json.dumps({"draft": text}).encode()) if text else self.reply(503)
         if u.path == "/api/feed/add":  # {"url": ...} -> fetched, saved to the Saved list, then scored in the background
             try:
@@ -1244,6 +1257,7 @@ h2 span{font-weight:400;margin-left:4px}h2.late{color:var(--red)}
 .t{display:flex;gap:10px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:10px;
   padding:10px 12px;margin:6px 0;transition:background .1s}
 .t:hover{background:var(--hover)}
+.t{flex-wrap:wrap;row-gap:0}.t>details{flex:0 0 calc(100% - 28px);margin-left:28px;min-width:0}  /* full-width row, lined up with the title */
 .t.late{border-left:3px solid var(--red)}
 .cb{appearance:none;flex:none;width:18px;height:18px;margin:2px 0 0;border:1.5px solid var(--muted);border-radius:50%;cursor:pointer;display:grid;place-content:center}
 .cb:hover{border-color:var(--accent)}
@@ -1269,11 +1283,14 @@ details summary{display:inline-block;font-size:12px;color:var(--muted);cursor:po
 details summary::-webkit-details-marker{display:none}
 details summary::before{content:"›";display:inline-block;margin-right:5px;transition:transform .15s}
 details[open] summary::before{transform:rotate(90deg)}
-pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12.5px/1.5 -apple-system,sans-serif;max-height:340px;overflow:auto;
-  background:var(--bg);border-radius:8px;padding:10px 12px;margin:8px 0 6px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.55 -apple-system,sans-serif;max-height:280px;overflow:auto;
+  background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:8px 0 0}
+.quoted{display:block;margin-top:10px;padding-left:10px;border-left:2px solid var(--line);color:var(--muted)}
+.more{border:0;background:none;color:var(--accent);cursor:pointer;padding:0;margin-top:8px;font-size:12px}
+.lbl{display:block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:12px 0 4px}
 pre a{color:var(--accent)}
-textarea{width:100%;background:var(--bg);border:1px solid transparent;border-radius:8px;padding:8px 10px;resize:vertical;outline:none}
-textarea:focus{border-color:var(--accent)}
+textarea{width:100%;background:var(--bg);border:1px solid transparent;border-radius:8px;padding:8px 10px;resize:none;outline:none;overflow:hidden;min-height:38px}
+textarea:focus,.askm:focus{border-color:var(--accent)}
 .side{flex:none;display:flex;align-items:center;gap:2px}
 .due{border:0;border-radius:6px;padding:3px 8px;background:none;color:var(--muted);cursor:pointer;font-size:12px;white-space:nowrap}
 .due.set{background:var(--bg);color:var(--text)}.late .due.set{background:var(--redbg);color:var(--red);font-weight:600}
@@ -1300,6 +1317,12 @@ textarea:focus{border-color:var(--accent)}
   background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 65% var(--chipL))}
 .ev.late{background:var(--redbg);color:var(--red);font-weight:600}.ev.done{text-decoration:line-through;opacity:.55}
 .more{font-size:11px;color:var(--muted);padding:0 5px}
+.askm{width:100%;box-sizing:border-box;background:var(--bg);border:1px solid transparent;border-radius:8px;padding:7px 10px;outline:none}
+details .askm{border-color:color-mix(in srgb,var(--accent) 35%,transparent)}
+.rbox{display:flex;gap:6px;margin-top:6px}.rbox[hidden]{display:none}.rbox .askm{margin:0;flex:1}
+.rgo,.rno{border:0;border-radius:8px;padding:0 12px;background:var(--accent);color:#fff;cursor:pointer;white-space:nowrap}
+.rno{background:var(--line);color:var(--text)}
+.askans{white-space:pre-wrap;margin-top:6px;padding:6px 10px;border-left:3px solid var(--accent);font-size:13px}
 .ai{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;margin-top:5px;font-size:12px;color:var(--muted)}
 .act{border:1px dashed var(--line);border-radius:10px;padding:1px 8px;cursor:pointer;color:var(--text)}
 .act:hover{border-color:var(--accent);color:var(--accent)}.act b{font-weight:400;margin-left:4px;opacity:.5}.act b:hover{opacity:1;color:var(--red)}
@@ -1361,9 +1384,13 @@ function item(t){
   d.innerHTML=`<input type=checkbox class=cb title="Mark done">
     <div class=main><input class=title type=text spellcheck=false>
       <div class=meta><span class=argoing>✨ Argo is working on this…</span><span class=info></span><span class=chips></span><input class=addl list=labels placeholder="+ label"></div>
-      <details><summary>Email & notes</summary><pre></pre><textarea rows=2 placeholder="Notes…"></textarea></details></div>
+      <div class=rbox hidden><input class=askm placeholder="Reply instructions (optional, e.g. &quot;decline politely&quot;), then Enter"><button class=rgo>Draft in Outlook</button><button class=rno>Cancel</button></div>
+</div>
     <div class=side><button class=due></button><input type=datetime-local hidden>
-      <button class="icon r" title="Draft a reply with Argo">${REPLY}</button><button class="icon o" title="Open in Outlook">${MAIL}</button><button class="icon x" title="Delete">${TRASH}</button></div>`;
+      <button class="icon r" title="Draft a reply with Argo">${REPLY}</button><button class="icon o" title="Open in Outlook">${MAIL}</button><button class="icon x" title="Delete">${TRASH}</button></div>
+      <details><summary>Email & notes</summary><pre></pre>
+        <div class=askw><span class=lbl>✨ Ask Argo</span><input class=askm placeholder="e.g. What's the deadline? (press Enter)"><div class=askans hidden></div></div>
+        <span class=lbl>Notes</span><textarea rows=1 placeholder="Your notes (Argo also uses these when drafting a reply)…"></textarea></details>`;
   const $=s=>d.querySelector(s), up=p=>api(`/api/todo/${t.id}/update`,p);
   const cb=$('.cb'); cb.checked=t.done; cb.onchange=()=>up({done:cb.checked});
   const ti=$('.title'); ti.value=t.title; ti.title=t.title; ti.onchange=()=>up({title:ti.value});
@@ -1378,8 +1405,13 @@ function item(t){
   db.onclick=()=>{db.hidden=true;du.hidden=false;du.focus();try{du.showPicker()}catch{}};
   du.onblur=()=>{if(du.value===t.due){du.hidden=true;db.hidden=false}};
   const r=$('.r'); r.hidden=!t.eml;
-  r.onclick=async()=>{if(r.disabled)return;r.disabled=true;r.classList.add('busy');toast('Drafting a reply…');
-    const res=await fetch(`/api/reply/${t.id}`,{method:'POST'}).catch(()=>({}));r.disabled=false;r.classList.remove('busy');
+  const rb=$('.rbox'),ri=$('.rbox input');
+  r.onclick=()=>{if(r.disabled)return;rb.hidden=!rb.hidden;if(!rb.hidden)ri.focus()};
+  ri.onkeydown=e=>{if(e.key==='Enter')draft();if(e.key==='Escape'){rb.hidden=true;ri.blur()}};
+  $('.rgo').onclick=()=>draft(); $('.rno').onclick=()=>rb.hidden=true;
+  const draft=async()=>{if(r.disabled)return;const how=ri.value.trim();rb.hidden=true;ri.blur();
+    r.disabled=true;r.classList.add('busy');toast('Drafting a reply…');
+    const res=await fetch(`/api/reply/${t.id}`,{method:'POST',body:JSON.stringify({how})}).catch(()=>({}));r.disabled=false;r.classList.remove('busy');
     load();toast(res.ok?'Draft opened in Outlook (also copied to the clipboard)':'Argo is unavailable right now (down, or not on VPN). Try again later.')};
   if(t.actions?.length){
     const a=document.createElement('div');a.className='ai';a.append('Action items:');
@@ -1392,6 +1424,11 @@ function item(t){
     }
     $('.meta').after(a);
   }
+  const am=$('details .askm'),aa=$('.askans'); $('.askw').hidden=!t.body;
+  am.onkeydown=async e=>{const v=am.value.trim();if(e.key!=='Enter'||!v)return;
+    aa.hidden=false;aa.textContent='Asking Argo…';
+    const res=await fetch('/api/ask',{method:'POST',body:JSON.stringify({q:v,id:t.id})}).catch(()=>({}));
+    aa.textContent=res.ok?(await res.json()).answer:'Argo is unavailable right now (down, or not on VPN). Try again later.'};
   const o=$('.o'); o.hidden=!t.eml; o.onclick=()=>api(`/api/todo/${t.id}/open`);
   $('.x').onclick=()=>confirm(`Delete "${t.title}"?`)&&api(`/api/todo/${t.id}/delete`);
   const info=$('.info'); info.textContent=[senderName(t.sender),t.date&&shortDate(t.date)].filter(Boolean).join(' · ');
@@ -1405,8 +1442,10 @@ function item(t){
     c.append(x);$('.chips').append(c);
   }
   const al=$('.addl'); al.onchange=()=>{const v=al.value.trim();if(v)up({labels:[...labels,v]})};
-  const hasBody=t.body&&t.body!==t.title, pre=$('pre'); if(hasBody)linkify(pre,t.body); else pre.remove();
+  const hasBody=t.body&&t.body!==t.title, pre=$('pre'); if(hasBody)showMail(pre,t.body); else pre.remove();
   const n=$('textarea'); n.value=t.note; n.onchange=()=>up({note:n.value});
+  const grow=()=>{n.style.height='auto';n.style.height=n.scrollHeight+2+'px'}; n.oninput=grow;
+  $('details').ontoggle=grow;
   $('summary').textContent=(hasBody?'Email & notes':'Notes')+(t.note?' ✎':'');
   return d;
 }
@@ -1415,6 +1454,17 @@ function pretty(u){
   try{const x=new URL(u);if(x.hostname.endsWith('safelinks.protection.outlook.com'))u=x.searchParams.get('url')||u}catch{}
   const d=u.match(/urldefense\.\w+\/v3\/__(.+?)__;/);if(d)u=d[1];
   return u.length>90?u.slice(0,87)+'…':u;
+}
+// display only (Argo still reads the full text): drop Outlook's external-sender banners, fold the quoted thread
+function showMail(el,text){
+  text=text.replace(/^(This Message Is From an External Sender|This message came from outside your organization\.?)\s*$/gim,'').replace(/\n{3,}/g,'\n\n').trim();
+  const q=text.search(/^(From: .+|On .+wrote:|-{2,} ?Original Message ?-{2,})$/m);
+  if(q<=0)return linkify(el,text);
+  linkify(el,text.slice(0,q).trim());
+  const old=document.createElement('span');old.className='quoted';old.hidden=true;linkify(old,text.slice(q));
+  const b=document.createElement('button');b.className='more';b.textContent='Show earlier messages';
+  b.onclick=()=>{old.hidden=!old.hidden;b.textContent=old.hidden?'Show earlier messages':'Hide earlier messages'};
+  el.append(document.createElement('br'),b,old);
 }
 function linkify(el,text){
   const re=/(?:https?:\/\/|mailto:)[^\s<>"]*[^\s<>".,;)]/g;let i=0,m;

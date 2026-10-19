@@ -101,4 +101,8 @@ s = app.pets()
 assert s["overdue"] == 1 and s["review"][0]["labels"] == ["L"] and s["routines"][0] == {"line": "fri 17 task: what did I finish?", "pet": "task"}
 app.say("scout", "Scout", "2 new picks")
 assert app.pets()["bubbles"][-1]["text"] == "2 new picks" and app.pets(after=app.bubbles[-1]["id"])["bubbles"] == []
+seen = []
+app.argo = lambda prompt, n, **kw: seen.append(prompt) or "Friday."
+assert app.ask_mail({**app.blank(), "title": "Beamtime", "body": "Slot is Friday", "sender": "Bob", "date": ""}, "when?") == "Friday."
+assert "Question: when?" in seen[-1] and "Slot is Friday" in seen[-1]
 print("ok")
