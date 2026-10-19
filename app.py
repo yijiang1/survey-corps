@@ -19,10 +19,12 @@ DB = DATA / "todos.json"
 CONFIG = DATA / "config.json"  # optional: {"argo_user": "<ANL username>", "argo_model": "claudesonnet5"}
 ARGO = "https://apps.inside.anl.gov/argoapi/v1/chat/completions"
 BRIEFED = DATA / "briefed"  # date of the last morning briefing
+RAN = DATA / "routines_ran.json"  # {routine line: date it last ran}
 lock = threading.Lock()
 retry_busy = threading.Lock()
 argo_ok, argo_at = None, 0.0  # last Argo call: outcome (None = not tried yet) and when; shown in the UI
-busy, busy_lock = Counter(), threading.Lock()  # Argo calls in flight, by tag: task id, "ask", "briefing", "scout", "check"
+busy, busy_lock = Counter(), threading.Lock()  # Argo calls in flight, by tag: task id, "ask", "briefing", "scout", "check", "lib…"
+bubbles, pets_seen = [], 0.0  # speech bubbles for the Mac app's pets [{"id", "pet", "title", "text"}]; when it last polled
 
 
 def load():
@@ -74,7 +76,8 @@ def config():
 
 SETTINGS = {  # editable in the app's Settings dialog -> (default, max for ints / None for text)
     "argo_user": ("", None), "argo_model": ("claudesonnet5", None), "retry_minutes": (10, 1440),
-    "briefing_hour": (8, 24), "library_editor": ("Visual Studio Code", None), "github_token": ("", None)}
+    "briefing_hour": (8, 24), "library_editor": ("Visual Studio Code", None), "github_token": ("", None),
+    "routines": ("", None)}
 
 
 def get_settings():
@@ -187,15 +190,32 @@ def enrich(t):
         cur.pop("retry", None)
         if not s:
             return save(todos)
+        rev = {}  # what Argo filled in, for the pet's Keep / Undo
         if s["labels"] and not cur.get("labels"):
-            cur["labels"] = sorted(set(s["labels"]))
+            cur["labels"] = rev["labels"] = sorted(set(s["labels"]))
         if s["due"] and not cur["due"]:
-            cur["due"], cur["notified"] = s["due"], False
+            cur["due"], cur["notified"], rev["due"] = s["due"], False, s["due"]
         if s["title"] and not t["eml"] and cur["title"] == t["title"]:  # typed task the user hasn't renamed
+            rev["title"], rev["was"], rev["body"] = s["title"], t["title"], cur["body"]
             cur["title"], cur["body"] = s["title"], "" if cur["body"] == t["title"] else cur["body"]
         if s["actions"] and not cur.get("actions"):
-            cur["actions"] = s["actions"]
+            cur["actions"] = rev["actions"] = s["actions"]
+        if rev:
+            cur["review"] = rev
         save(todos)
+
+
+def undo_review(t):
+    """Put back whatever Argo filled in, unless the user has changed that field since."""
+    rev = t.pop("review", None) or {}
+    if "labels" in rev and t.get("labels") == rev["labels"]:
+        t["labels"] = []
+    if "due" in rev and t["due"] == rev["due"]:
+        t["due"] = ""
+    if "title" in rev and t["title"] == rev["title"]:
+        t["title"], t["body"] = rev["was"], rev["body"]
+    if "actions" in rev and t.get("actions") == rev["actions"]:
+        t["actions"] = []
 
 
 def blank():
@@ -321,14 +341,80 @@ def briefing():
     def send():  # in its own thread, so a slow or down Argo never holds up due-date notifications
         tip = argo(f"It's {now:%A %H:%M}. These are my overdue and due-today tasks. In under 25 words, tell me which 3 to "
                    "start with (short names only). Plain text, no preamble.\n" + lines, 300, timeout=60, tag="briefing")
-        notify(f"Good morning: {head}", (tip or "Start with: " + "; ".join(t["title"] for t in (late + due)[:3])).strip())
+        say("task", f"Good morning: {head}", (tip or "Start with: " + "; ".join(t["title"] for t in (late + due)[:3])).strip())
     threading.Thread(target=send, daemon=True).start()
+
+
+def say(pet, title, text):
+    """Speech bubble from a pet ("task", "scout", "library"); a macOS notification if the Mac app isn't running."""
+    for _ in range(20):  # right after launch the app hasn't polled yet: give it 10 s
+        if pets_seen:
+            break
+        time.sleep(0.5)
+    if time.time() - pets_seen > 60:
+        return notify(title, text)
+    with busy_lock:
+        bubbles.append({"id": (bubbles[-1]["id"] + 1) if bubbles else 1, "pet": pet, "title": title, "text": text})
+        del bubbles[:-20]
 
 
 def notify(title, msg):
     subprocess.run(["osascript", "-e", "on run argv",
                     "-e", 'display notification (item 2 of argv) with title (item 1 of argv) sound name "default"',
                     "-e", "end run", title, msg])
+
+
+ROUTINE = re.compile(r"(daily|weekdays|(?:mon|tue|wed|thu|fri|sat|sun)(?:,(?:mon|tue|wed|thu|fri|sat|sun))*)\s+(\d{1,2})\s+"
+                     r"(task|scout|library):\s*(.+)", re.I)
+
+
+def routines():
+    """Settings' Routines box, one per line: "fri 17 task: summarize what I finished this week". Bad lines are skipped."""
+    out = []
+    for line in config().get("routines", "").splitlines():
+        m = ROUTINE.fullmatch(line.strip())
+        if m and int(m[2]) < 24:
+            out.append({"line": line.strip(), "days": m[1].lower(), "hour": int(m[2]), "pet": m[3].lower(), "prompt": m[4]})
+    return out
+
+
+def run_routine(r):
+    """Argo answers the routine's prompt from that pet's data; the answer comes back as the pet's speech bubble."""
+    now = datetime.now()
+    if r["pet"] == "task":
+        with lock:
+            todos = load()
+        week = (now - timedelta(days=7)).isoformat(timespec="minutes")
+        todos = [t for t in todos if not t["done"] or t.get("done_at", "") >= week][:80]
+        ctx = "\n".join(f"- {t['title']} | {'done ' + t.get('done_at', '') if t['done'] else 'open'} | due {t['due'] or 'none'} | "
+                        f"added {t['added']} | {', '.join(t.get('labels', []))}" for t in todos)
+        what = "my open tasks and those I finished in the last 7 days"
+    elif r["pet"] == "scout":
+        with feed_lock:
+            items = load_feed()["items"]
+        items = sorted((x for x in items if x["added"] >= (now - timedelta(days=7)).isoformat()), key=lambda x: -(x["score"] or 0))[:60]
+        ctx = "\n".join(f"- [{x['src']}] {x['title']} | score {x['score']} | {x['why']}" + (" | saved" if x["saved"] else "") for x in items)
+        what = "papers, videos and repos my Scout found in the last 7 days, scored 0-10 for me"
+    else:
+        with lib_lock:
+            items = load_lib()["items"]
+        ctx = "\n".join(f"- {x['name']} | {x['path']} | {x['group']} | opened {x.get('opened', 'never')} | {x['summary']}" for x in items[:150])
+        what = "my library of local projects, files and docs"
+    text = argo(f"It's {now:%A %Y-%m-%d %H:%M}. Below are {what}. {r['prompt']}\n"
+                "Answer briefly (under 80 words), plain text, no preamble.\n\n" + ctx, 600, timeout=90,
+                tag="lib:routine" if r["pet"] == "library" else "scout" if r["pet"] == "scout" else "routine")
+    say(r["pet"], r["prompt"][:60], (text or "Argo is unavailable right now (down, or off VPN).").replace("**", "").strip())
+
+
+def due_routines(now=None):
+    """Routines whose day and hour have come and that haven't run today; marks them as run."""
+    now, ran = now or datetime.now(), json.loads(RAN.read_text()) if RAN.exists() else {}
+    today, day = now.strftime("%Y-%m-%d"), now.strftime("%a").lower()
+    out = [r for r in routines() if ran.get(r["line"]) != today and now.hour >= r["hour"]
+           and (r["days"] == "daily" or r["days"] == "weekdays" and now.weekday() < 5 or day in r["days"].split(","))]
+    if out:
+        RAN.write_text(json.dumps({**ran, **{r["line"]: today for r in out}}))
+    return out
 
 
 def watcher():
@@ -348,6 +434,8 @@ def watcher():
             if changed:
                 save(todos)
         briefing()
+        for r in due_routines():
+            threading.Thread(target=run_routine, args=(r,), daemon=True).start()
         mins = config().get("retry_minutes", 10)  # 0 = automatic retry off (the header's Retry button still works)
         if mins and time.time() - last_retry > mins * 60:  # and right after launch
             last_retry = time.time()
@@ -677,7 +765,7 @@ def run_scout():
                         picks += score >= 8
                 save_feed(f)
         if picks:
-            notify("Scout", f"{picks} new pick{'s' * (picks > 1)} for you")
+            say("scout", "Scout", f"{picks} new pick{'s' * (picks > 1)} for you")
     finally:
         scout_busy.release()
 
@@ -796,7 +884,7 @@ def lib_enrich(item_id):
                  f"- group: the best fit of {json.dumps(lib['groups'])}, or \"\" if none fits.\n"
                  f"- labels: up to 3 short labels (1-2 words, Title Case). Existing labels: {json.dumps(known)}. Reuse one "
                  "whenever it fits; invent a new one only if none does.\n\n"
-                 f"Path: {x['path']}\n\n{x['peek']}", 600, tag=item_id)
+                 f"Path: {x['path']}\n\n{x['peek']}", 600, tag="lib:" + item_id)
     with lib_lock:
         lib = load_lib()
         cur = next((y for y in lib["items"] if y["id"] == item_id), None)
@@ -855,7 +943,29 @@ def lib_ask(q):
                       f"{x['summary']}\n{x['note']}\n{x['peek'][:1200]}" for x in hits)
     return argo("Answer my question using only the items from my library of local projects, files and docs below. "
                 "Be brief and plain text; name the item(s) by their [name] and give the path. "
-                f"If they don't contain the answer, say so.\n\nQuestion: {q}\n\n{ctx}", 2000, timeout=90, tag="ask")
+                f"If they don't contain the answer, say so.\n\nQuestion: {q}\n\n{ctx}", 2000, timeout=90, tag="lib:ask")
+
+
+def pets(after=0):
+    """Everything the Mac app's three pets show: badges, who's working, review queue, new bubbles."""
+    global pets_seen
+    pets_seen = time.time()
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M")
+    with lock:
+        todos = load()
+    with feed_lock:
+        items = load_feed()["items"]
+    with busy_lock:
+        tags = [k for k, n in busy.items() if n > 0 and k != "check"]
+        said = [b for b in bubbles if b["id"] > after]
+    return {"overdue": sum(1 for t in todos if not t["done"] and t["due"] and t["due"] <= now),
+            "picks": sum(1 for x in items if not x["read"] and x["vote"] >= 0 and (x["score"] or 0) >= 7),
+            "review": [{"id": t["id"], "title": t["title"], "labels": t["review"].get("labels", []), "due": t["review"].get("due", ""),
+                        "renamed": "was" in t["review"], "actions": len(t["review"].get("actions", []))} for t in todos if t.get("review") and not t["done"]],
+            "busy": {"task": any(not k.startswith(("lib", "scout")) for k in tags),
+                     "scout": scout_busy.locked() or "scout" in tags, "library": any(k.startswith("lib") for k in tags)},
+            "bubbles": said,
+            "routines": [{"line": r["line"], "pet": r["pet"]} for r in routines()]}
 
 
 class H(BaseHTTPRequestHandler):
@@ -881,6 +991,9 @@ class H(BaseHTTPRequestHandler):
                                         "retry_minutes": config().get("retry_minutes", 10),
                                         "rev": DB.stat().st_mtime if DB.exists() else 0,
                                         "lib_rev": LIB.stat().st_mtime if LIB.exists() else 0}).encode())
+        elif self.path.startswith("/api/pets"):  # /api/pets?after=<last bubble id seen>
+            after = int(parse_qs(urlparse(self.path).query).get("after", ["0"])[0] or 0)
+            self.reply(200, json.dumps(pets(after)).encode())
         elif self.path == "/feed":
             self.reply(200, FEED_PAGE.encode(), "text/html; charset=utf-8")
         elif self.path == "/api/scout/settings":
@@ -921,6 +1034,13 @@ class H(BaseHTTPRequestHandler):
             if err:
                 return self.reply(400, json.dumps({"error": err}).encode())
             threading.Thread(target=run_scout, daemon=True).start()  # check right away with the new searches
+            return self.reply(200)
+        if u.path == "/api/routines/run":  # {"line": ...}: the pet's "Run now"
+            line = json.loads(raw or b"{}").get("line")
+            r = next((r for r in routines() if r["line"] == line), None)
+            if not r:
+                return self.reply(404)
+            threading.Thread(target=run_routine, args=(r,), daemon=True).start()
             return self.reply(200)
         if u.path == "/api/feed/refresh":
             threading.Thread(target=run_scout, daemon=True).start()
@@ -1053,7 +1173,10 @@ class H(BaseHTTPRequestHandler):
         with lock:
             todos = load()
             if u.path == "/api/drop":
-                todos.insert(0, make_todo(raw, parse_qs(u.query).get("name", [""])[0]))
+                t = make_todo(raw, parse_qs(u.query).get("name", [""])[0])
+                todos.insert(0, t)
+                save(todos)
+                return self.reply(200, json.dumps({"title": t["title"]}).encode())
             elif len(parts) == 4 and parts[1] == "todo":
                 t = next((x for x in todos if x["id"] == parts[2]), None)
                 if not t:
@@ -1063,6 +1186,9 @@ class H(BaseHTTPRequestHandler):
                     for k in ("title", "due", "done", "note", "actions"):
                         if k in patch:
                             t[k] = patch[k]
+                    if patch.get("done"):
+                        t["done_at"] = datetime.now().isoformat(timespec="minutes")  # for "what did I finish" routines
+                    t.pop("review", None)  # touched it: Argo's fill-in no longer needs reviewing
                     if "labels" in patch:
                         t["labels"] = sorted({str(x).strip() for x in patch["labels"] if str(x).strip()})
                     if "due" in patch:
@@ -1073,6 +1199,8 @@ class H(BaseHTTPRequestHandler):
                     if title:
                         todos.insert(0, {**t, **blank(), "title": title, "actions": [], "due": t["due"], "retry": "",
                                          "mail": t.get("mail", t["id"])})
+                elif parts[3] in ("keep", "undo"):  # the pet's review queue
+                    undo_review(t) if parts[3] == "undo" else t.pop("review", None)
                 elif parts[3] == "delete":
                     todos.remove(t)
                     mid = t.get("mail", t["id"])
@@ -1675,8 +1803,9 @@ h2{font-size:13px;font-weight:600;margin:16px 0 6px}h2:first-child{margin-top:0}
 .group{background:var(--card);border:1px solid var(--line);border-radius:10px}
 .r{display:flex;align-items:center;gap:12px;padding:8px 12px;min-height:38px}.r+.r{border-top:1px solid var(--line)}
 .r>label{flex:1}.r small{display:block;color:var(--muted);font-size:11.5px}
-input,select{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 7px;width:220px;-webkit-user-select:text}
-input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
+input,select,textarea{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 7px;width:220px;-webkit-user-select:text}
+textarea{width:100%;margin-top:6px;resize:vertical;font:12px/1.4 ui-monospace,Menlo,monospace}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
 button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:6px;padding:3px 12px}
 .ok{color:var(--green)}.bad{color:var(--red)}#res{font-size:12px}
 .foot{color:var(--muted);font-size:11.5px;margin-top:12px;display:flex;justify-content:space-between}
@@ -1691,6 +1820,12 @@ button{font:inherit;border:1px solid var(--line);background:var(--card);color:va
 <h2>Notifications</h2>
 <div class=group>
   <div class=r><label for=briefing_hour>Morning briefing<small>What's overdue and due today, once a day</small></label><select id=briefing_hour></select></div>
+</div>
+<h2>Routines</h2>
+<div class=group>
+  <div class=r style="display:block"><label for=routines>One per line: <b>days hour pet: what to do</b>. The pet answers in a speech bubble.
+  <small>Days: daily, weekdays, or mon,wed,fri. Pet: task, scout or library. Right-click a pet to run one now.</small></label>
+  <textarea id=routines rows=4 spellcheck=false placeholder="fri 17 task: summarize what I finished this week&#10;mon 9 scout: the 3 must-reads from last week&#10;weekdays 18 library: which projects haven't I opened in a while?"></textarea></div>
 </div>
 <h2>Library &amp; Scout</h2>
 <div class=group>
@@ -1717,7 +1852,7 @@ async function save(b){  // macOS style: every change is saved as soon as it's m
   if(b.github_token)$('github_token').value='';
   load();
 }
-for(const e of document.querySelectorAll('input,select'))e.onchange=()=>save({[e.id]:e.value});
+for(const e of document.querySelectorAll('input,select,textarea'))e.onchange=()=>save({[e.id]:e.value});
 $('test').onclick=async()=>{
   const res=$('res');res.className='';res.textContent='Checking…';
   await pending;  // a just-edited username saves (on blur) before the check

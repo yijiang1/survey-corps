@@ -9,7 +9,60 @@ let base = URL(string: "http://127.0.0.1:8765")!
 let feedURL = base.appendingPathComponent("feed")
 let libURL = base.appendingPathComponent("library")
 let settingsURL = base.appendingPathComponent("settings")
-let petSize: CGFloat = 96  // pet icon size in points
+let petSize: CGFloat = 112  // pet panel size in points: a 96 pt pet plus room to hop and lean
+
+// POST to app.py; done runs on the main thread with the body and status (0 = server unreachable).
+func post(_ path: String, _ body: Any? = nil, raw: Data? = nil, query: [URLQueryItem] = [],
+          done: @escaping (Data?, Int) -> Void = { _, _ in }) {
+    var c = URLComponents(url: base.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
+    if !query.isEmpty { c.queryItems = query }
+    var req = URLRequest(url: c.url!)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 150  // Argo answers can take a minute or two
+    req.httpBody = raw ?? body.flatMap { try? JSONSerialization.data(withJSONObject: $0) }
+    URLSession.shared.dataTask(with: req) { data, resp, _ in
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        DispatchQueue.main.async { done(data, code) }
+    }.resume()
+}
+func json(_ d: Data?) -> [String: Any] { d.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:] }
+
+// Dropped files: real file URLs, or Outlook's file promises (written to a temp folder first).
+func receiveFiles(_ pb: NSPasteboard, each: @escaping (URL) -> Void) {
+    if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+        urls.forEach(each)
+    } else if let promises = pb.readObjects(forClasses: [NSFilePromiseReceiver.self]) as? [NSFilePromiseReceiver] {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for p in promises {
+            p.receivePromisedFiles(atDestination: dir, options: [:], operationQueue: .main) { url, err in
+                if err == nil { each(url) }
+            }
+        }
+    }
+}
+
+// An email (or any file) becomes a task; done gets its title, nil on failure.
+func uploadEmail(_ file: URL, done: @escaping (String?) -> Void = { _ in }) {
+    guard let data = try? Data(contentsOf: file) else { return done(nil) }
+    post("api/drop", raw: data, query: [URLQueryItem(name: "name", value: file.lastPathComponent)]) { d, code in
+        done(code == 200 ? json(d)["title"] as? String ?? file.lastPathComponent : nil)
+    }
+}
+
+// One-line text box in an alert. nil when cancelled or left blank.
+func textPrompt(_ title: String, info: String = "", text: String = "", placeholder: String = "") -> String? {
+    NSApp.activate(ignoringOtherApps: true)  // pets don't activate the app; the alert needs it
+    let a = NSAlert(); a.messageText = title; a.informativeText = info
+    a.addButton(withTitle: "OK"); a.addButton(withTitle: "Cancel")
+    let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+    tf.stringValue = text; tf.placeholderString = placeholder
+    a.accessoryView = tf
+    a.window.initialFirstResponder = tf
+    guard a.runModal() == .alertFirstButtonReturn else { return nil }
+    let v = tf.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    return v.isEmpty ? nil : v
+}
 
 class DropWebView: WKWebView {
     var library = false  // Library window: Finder drops add the paths themselves, not the files' contents
@@ -37,38 +90,14 @@ class DropWebView: WKWebView {
         let pb = s.draggingPasteboard
         if library {
             let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
-            var req = URLRequest(url: base.appendingPathComponent("api/library/add"))
-            req.httpMethod = "POST"
-            req.httpBody = try? JSONSerialization.data(withJSONObject: ["paths": urls.map(\.path)])
-            URLSession.shared.dataTask(with: req) { data, _, _ in
+            post("api/library/add", ["paths": urls.map(\.path)]) { data, _ in
                 let json = data.flatMap { String(data: $0, encoding: .utf8) } ?? "{\"added\":[],\"skipped\":[]}"
-                DispatchQueue.main.async { self.evaluateJavaScript("dropped(\(json))") }
-            }.resume()
+                self.evaluateJavaScript("dropped(\(json))")
+            }
             return true
         }
-        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
-            urls.forEach(upload)
-        } else if let promises = pb.readObjects(forClasses: [NSFilePromiseReceiver.self]) as? [NSFilePromiseReceiver] {
-            let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            for p in promises {
-                p.receivePromisedFiles(atDestination: dir, options: [:], operationQueue: .main) { url, err in
-                    if err == nil { self.upload(url) }
-                }
-            }
-        }
+        receiveFiles(pb) { uploadEmail($0) { _ in self.evaluateJavaScript("drop.classList.remove('over');load()") } }
         return true
-    }
-
-    func upload(_ file: URL) {
-        guard let data = try? Data(contentsOf: file) else { return }
-        var c = URLComponents(url: base.appendingPathComponent("api/drop"), resolvingAgainstBaseURL: false)!
-        c.queryItems = [URLQueryItem(name: "name", value: file.lastPathComponent)]
-        var req = URLRequest(url: c.url!)
-        req.httpMethod = "POST"
-        URLSession.shared.uploadTask(with: req, from: data) { _, _, _ in
-            DispatchQueue.main.async { self.evaluateJavaScript("drop.classList.remove('over');load()") }
-        }.resume()
     }
 }
 
@@ -295,16 +324,83 @@ func drawPet(_ b: NSRect, scout: Bool = false, librarian: Bool = false) {
     }
 }
 
-// Floating pet that stays on every desktop. Click: show/hide Survey Corps. Drag: move it.
+// Menu item that runs a closure.
+class Item: NSMenuItem {
+    var run: () -> Void = {}
+    convenience init(_ title: String, enabled: Bool = true, _ run: @escaping () -> Void = {}) {
+        self.init(title: title, action: #selector(fire), keyEquivalent: "")
+        self.run = run; target = self; isEnabled = enabled
+    }
+    @objc func fire() { run() }
+}
+
+// Floating pet that stays on every desktop. Click: show/hide its window. Drag: move it. Drop things on it.
+// Right-click: its menu. A "…" thought bubble while Argo works for it.
 class PetView: NSView {
     var onClick: () -> Void = {}
+    var onDrop: (NSPasteboard) -> Bool = { _ in false }
+    var makeMenu: () -> NSMenu = { NSMenu() }
     var scout = false, librarian = false, frameName = "pet", badgeColor = NSColor.systemRed
     var grab = NSPoint.zero, moved = false
     var overdue = 0 { didSet { if overdue != oldValue { needsDisplay = true } } }  // badge count
+    var review = 0 { didSet { if review != oldValue { needsDisplay = true } } }    // Argo fill-ins to Keep / Undo
+    var hover = false { didSet { if hover != oldValue { needsDisplay = true } } }  // something dragged over it
+    var busy = false { didSet { if busy != oldValue { animate() } } }
+    enum Anim { case hop, shake }  // hop: a drop worked or the pet speaks; shake: it didn't
+    var anim: Anim?, animStart = Date(), ticker: Timer?
+    func play(_ a: Anim) { anim = a; animStart = Date(); animate() }
+    func animate() {  // redraw at 30 fps while something moves, stop when nothing does
+        needsDisplay = true
+        guard ticker == nil, busy || anim != nil else { return }
+        ticker = Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) { [weak self] t in
+            guard let self else { return t.invalidate() }
+            self.needsDisplay = true
+            if !self.busy && self.anim == nil { t.invalidate(); self.ticker = nil }
+        }
+    }
+    var reviewRect: NSRect { NSRect(x: bounds.maxX - 30, y: 2, width: 28, height: 22) }
     override func draw(_ r: NSRect) {
         // Fully transparent pixels let clicks fall through; a near-invisible fill makes the whole square clickable.
         NSColor.black.withAlphaComponent(0.01).setFill(); bounds.fill()
-        NSGraphicsContext.saveGraphicsState(); drawPet(bounds, scout: scout, librarian: librarian); NSGraphicsContext.restoreGraphicsState()
+        // pose: lean in while something is dragged over, hop / shake once, sway while busy
+        let now = Date().timeIntervalSinceReferenceDate, t = Date().timeIntervalSince(animStart)
+        var dx: CGFloat = 0, dy: CGFloat = 0, turn: CGFloat = 0, grow: CGFloat = hover ? 1.08 : 1
+        if let a = anim {
+            if t > 0.5 { anim = nil }
+            else if a == .hop { dy = 9 * sin(t / 0.5 * .pi) }
+            else { dx = 5 * sin(t * 45) * (1 - t / 0.5) }
+        }
+        if busy { turn = 4 * sin(now * 3.5) }
+        let pet = NSRect(x: (bounds.width - 96) / 2, y: 3, width: 96, height: 96)
+        NSGraphicsContext.saveGraphicsState()
+        let cg = NSGraphicsContext.current!.cgContext
+        cg.translateBy(x: pet.midX + dx, y: pet.minY + dy)  // pivot at the feet
+        cg.rotate(by: turn * .pi / 180); cg.scaleBy(x: grow, y: grow)
+        cg.translateBy(x: -48, y: 0)
+        drawPet(NSRect(x: 0, y: 0, width: 96, height: 96), scout: scout, librarian: librarian)
+        NSGraphicsContext.restoreGraphicsState()
+        let phase = Int(now / 0.35)
+        if hover {
+            let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2), xRadius: 20, yRadius: 20)
+            NSColor.controlAccentColor.setStroke(); ring.lineWidth = 3; ring.stroke()
+        }
+        if busy {
+            let t = NSRect(x: 3, y: bounds.maxY - 25, width: 34, height: 20)
+            let b = NSBezierPath(roundedRect: t, xRadius: 10, yRadius: 10)
+            b.appendOval(in: NSRect(x: t.minX + 15, y: t.minY - 6, width: 5, height: 5))  // little thought puff below
+            NSColor.white.withAlphaComponent(0.95).setFill(); b.fill(); NSColor.gray.setStroke(); b.lineWidth = 1; b.stroke()
+            for i in 0..<3 {
+                (phase % 3 == i ? NSColor.darkGray : NSColor(white: 0.78, alpha: 1)).setFill()
+                NSBezierPath(ovalIn: NSRect(x: t.minX + 7 + CGFloat(i) * 8, y: t.midY - 2.5, width: 5, height: 5)).fill()
+            }
+        }
+        if review > 0 {
+            let pill = NSBezierPath(roundedRect: reviewRect, xRadius: 11, yRadius: 11)
+            NSColor.systemOrange.setFill(); pill.fill(); NSColor.white.setStroke(); pill.lineWidth = 2; pill.stroke()
+            let s = NSAttributedString(string: "✓\(review > 9 ? "9+" : "\(review)")", attributes: [
+                .font: NSFont.boldSystemFont(ofSize: 11), .foregroundColor: NSColor.white])
+            s.draw(at: NSPoint(x: reviewRect.midX - s.size().width / 2, y: reviewRect.midY - s.size().height / 2))
+        }
         guard overdue > 0 else { return }
         let text = NSAttributedString(string: overdue > 99 ? "99+" : "\(overdue)", attributes: [
             .font: NSFont.boldSystemFont(ofSize: 15), .foregroundColor: NSColor.white])
@@ -314,20 +410,87 @@ class PetView: NSView {
         text.draw(at: NSPoint(x: r.midX - text.size().width / 2, y: r.midY - text.size().height / 2))
     }
     override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
-    override func mouseDown(with e: NSEvent) { grab = e.locationInWindow; moved = false }
+    override func rightMouseDown(with e: NSEvent) { NSMenu.popUpContextMenu(makeMenu(), with: e, for: self) }
+    override func mouseDown(with e: NSEvent) {
+        grab = e.locationInWindow; moved = false
+        if e.modifierFlags.contains(.control) { moved = true; rightMouseDown(with: e) }  // ctrl-click = right-click
+    }
     override func mouseDragged(with e: NSEvent) {
         moved = true
         let p = NSEvent.mouseLocation
         window?.setFrameOrigin(NSPoint(x: p.x - grab.x, y: p.y - grab.y))
     }
     override func mouseUp(with e: NSEvent) {
-        if moved { window?.saveFrame(usingName: frameName) } else { onClick() }
+        if moved { window?.saveFrame(usingName: frameName) }
+        else if review > 0 && reviewRect.contains(convert(e.locationInWindow, from: nil)) { rightMouseDown(with: e) }
+        else { onClick() }
     }
+    static let dragTypes = DropWebView.promiseTypes + [.fileURL, .URL, .string]
+    override func draggingEntered(_ s: NSDraggingInfo) -> NSDragOperation { hover = true; return .copy }
+    override func draggingExited(_ s: NSDraggingInfo?) { hover = false }
+    override func performDragOperation(_ s: NSDraggingInfo) -> Bool { hover = false; return onDrop(s.draggingPasteboard) }
+}
+
+// Speech bubble above a pet: briefings, Scout picks, answers, routine results. Click: open the pet's window.
+class Bubble: NSPanel {
+    var onClick: () -> Void = {}
+    var hideTimer: Timer?
+    let label = NSTextField(wrappingLabelWithString: "")
+    let view = BubbleView()
+    init() {
+        super.init(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        level = .floating
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        backgroundColor = .clear; isOpaque = false; hasShadow = true
+        view.bubble = self
+        view.addSubview(label)
+        contentView = view
+    }
+    func show(_ title: String, _ text: String, over pet: NSWindow) {
+        let t = NSMutableAttributedString(string: title.isEmpty ? "" : title + "\n",
+                                          attributes: [.font: NSFont.boldSystemFont(ofSize: 12.5), .foregroundColor: NSColor.labelColor])
+        t.append(NSAttributedString(string: String(text.prefix(700)) + (text.count > 700 ? "…" : ""),
+                                    attributes: [.font: NSFont.systemFont(ofSize: 12.5), .foregroundColor: NSColor.labelColor]))
+        label.attributedStringValue = t
+        let s = label.sizeThatFits(NSSize(width: 280, height: 2000)), tail = BubbleView.tail
+        label.frame = NSRect(x: 12, y: tail + 9, width: s.width, height: s.height)
+        let w = s.width + 24, h = s.height + 18 + tail
+        let screen = (pet.screen ?? NSScreen.main!).visibleFrame
+        let x = min(max(pet.frame.midX - w / 2, screen.minX + 4), screen.maxX - w - 4)
+        let y = min(pet.frame.maxY - 8, screen.maxY - h)
+        view.tailX = min(max(pet.frame.midX - x, 18), w - 18)
+        setFrame(NSRect(x: x, y: y, width: w, height: h), display: true)
+        view.needsDisplay = true
+        orderFrontRegardless()
+        hideTimer?.invalidate()
+        hideTimer = Timer.scheduledTimer(withTimeInterval: min(45, 6 + Double(t.length) * 0.05), repeats: false) { [weak self] _ in
+            self?.orderOut(nil)
+        }
+    }
+}
+
+class BubbleView: NSView {
+    static let tail: CGFloat = 10
+    weak var bubble: Bubble?
+    var tailX: CGFloat = 40
+    override func draw(_ r: NSRect) {
+        let t = Self.tail, body = NSRect(x: 0.5, y: t + 0.5, width: bounds.width - 1, height: bounds.height - t - 1)
+        let p = NSBezierPath(roundedRect: body, xRadius: 12, yRadius: 12)
+        p.move(to: NSPoint(x: tailX - 8, y: t + 1)); p.line(to: NSPoint(x: tailX, y: 0.5)); p.line(to: NSPoint(x: tailX + 8, y: t + 1))
+        NSColor.windowBackgroundColor.setFill(); p.fill()
+        NSColor.separatorColor.setStroke(); p.lineWidth = 1; p.stroke()
+        NSColor.windowBackgroundColor.setFill(); NSRect(x: tailX - 7, y: t, width: 14, height: 2).fill()  // seam between body and tail
+    }
+    override func hitTest(_ p: NSPoint) -> NSView? { frame.contains(p) ? self : nil }
+    override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
+    override func mouseUp(with e: NSEvent) { bubble?.orderOut(nil); bubble?.onClick() }
 }
 
 class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     var window: NSWindow!, feedWindow: NSWindow!, libWindow: NSWindow!, settingsWindow: NSWindow!
-    var pet: NSPanel!, scoutPet: NSPanel!, libPet: NSPanel!
+    var pets: [String: (panel: NSPanel, view: PetView, window: NSWindow)] = [:]  // "task", "scout", "library"
+    var bubbles: [String: Bubble] = [:], lastBubble = 0
+    var review: [[String: Any]] = [], routines: [[String: String]] = []
     var feedWeb: WKWebView!, libWeb: DropWebView!, settingsWeb: WKWebView!
     let server = Process()
 
@@ -403,43 +566,162 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         libWindow.isReleasedWhenClosed = false
         libWeb.load(URLRequest(url: libURL))
 
-        let view = PetView()
-        view.toolTip = "Task Manager: click to show/hide, drag to move"
-        view.onClick = { [unowned self] in self.toggle(self.window) }
-        pet = makePet(view, offset: 26)
-        let scoutView = PetView()
-        scoutView.scout = true; scoutView.frameName = "scoutPet"; scoutView.badgeColor = .systemBlue
-        scoutView.toolTip = "Scout: new papers, videos and repos. Click to show/hide, drag to move"
-        scoutView.onClick = { [unowned self] in self.toggle(self.feedWindow) }
-        scoutPet = makePet(scoutView, offset: 26 + petSize + 8)
-        let libView = PetView()
-        libView.librarian = true; libView.frameName = "libPet"
-        libView.toolTip = "Library: your projects, files and docs. Click to show/hide, drag to move"
-        libView.onClick = { [unowned self] in self.toggle(self.libWindow) }
-        libPet = makePet(libView, offset: 26 + 2 * (petSize + 8))
+        for (i, (kind, w, tip)) in [("task", window!, "Task Manager"), ("scout", feedWindow!, "Scout: new papers, videos and repos"),
+                                    ("library", libWindow!, "Library: your projects, files and docs")].enumerated() {
+            let v = PetView()
+            v.scout = kind == "scout"; v.librarian = kind == "library"
+            v.frameName = ["task": "pet", "scout": "scoutPet", "library": "libPet"][kind]!
+            if kind == "scout" { v.badgeColor = .systemBlue }
+            v.toolTip = tip + ". Click to show/hide, drag to move, drop things on it, right-click for more"
+            v.onClick = { [unowned self] in self.toggle(w) }
+            v.onDrop = { [unowned self] in self.drop(kind, $0) }
+            v.makeMenu = { [unowned self] in self.menu(kind) }
+            pets[kind] = (makePet(v, offset: 26 + CGFloat(i) * (petSize + 4)), v, w)
+        }
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [unowned self] _ in self.poll() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.poll() }
+    }
 
-        // red badge on the pet: open, not-done tasks whose due time has passed
-        let refresh = { [weak view] in
-            URLSession.shared.dataTask(with: base.appendingPathComponent("api/todos")) { data, _, _ in
-                guard let data, let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return }
-                let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd'T'HH:mm"
-                let now = f.string(from: Date())
-                let n = list.filter { ($0["done"] as? Bool) != true && !((($0["due"] as? String) ?? "").isEmpty) && ($0["due"] as! String) <= now }.count
-                DispatchQueue.main.async { view?.overdue = n }
-            }.resume()
+    // Everything the pets show comes from one call: badges, who's busy, review queue, new speech bubbles.
+    func poll() {
+        URLSession.shared.dataTask(with: URL(string: "\(base)/api/pets?after=\(lastBubble)")!) { data, _, _ in
+            let s = json(data)
+            guard !s.isEmpty else { return }
+            DispatchQueue.main.async {
+                let busy = s["busy"] as? [String: Bool] ?? [:]
+                self.review = s["review"] as? [[String: Any]] ?? []
+                self.routines = s["routines"] as? [[String: String]] ?? []
+                for (k, p) in self.pets { p.view.busy = busy[k] ?? false }
+                self.pets["task"]?.view.overdue = s["overdue"] as? Int ?? 0  // red: open tasks past their due time
+                self.pets["task"]?.view.review = self.review.count           // orange: Argo fill-ins to Keep / Undo
+                self.pets["scout"]?.view.overdue = s["picks"] as? Int ?? 0   // blue: unread picks (score 7+, not thumbed down)
+                for b in s["bubbles"] as? [[String: Any]] ?? [] {
+                    self.lastBubble = max(self.lastBubble, b["id"] as? Int ?? 0)
+                    self.say(b["pet"] as? String ?? "task", b["title"] as? String ?? "", b["text"] as? String ?? "")
+                }
+            }
+        }.resume()
+    }
+
+    func say(_ kind: String, _ title: String, _ text: String, ok: Bool = true) {
+        guard let p = pets[kind] else { return }
+        let b = bubbles[kind] ?? Bubble()
+        bubbles[kind] = b
+        b.onClick = { NSApp.activate(ignoringOtherApps: true); p.window.makeKeyAndOrderFront(nil) }
+        b.show(title, text, over: p.panel)
+        p.view.play(ok ? .hop : .shake)
+    }
+
+    // Drop onto a pet: emails/text -> a task, a link -> Scout's Saved, files/folders -> the Library.
+    func drop(_ kind: String, _ pb: NSPasteboard) -> Bool {
+        let files = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        let text = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        switch kind {
+        case "library":
+            guard !files.isEmpty else { say(kind, "", "Drop files or folders from Finder on me", ok: false); return false }
+            addToLibrary(files.map(\.path))
+        case "scout":
+            let link = (pb.readObjects(forClasses: [NSURL.self]) as? [URL])?.first { !$0.isFileURL }?.absoluteString ?? text
+            guard link.hasPrefix("http") else { say(kind, "", "Drop a link on me: arXiv, YouTube, GitHub or any page", ok: false); return false }
+            saveLink(link)
+        default:
+            if !files.isEmpty || pb.types?.contains(where: DropWebView.promiseTypes.contains) == true {
+                receiveFiles(pb) { uploadEmail($0) { t in self.say("task", "", t.map { "Added: \($0)" } ?? "Couldn't read that file", ok: t != nil) } }
+            } else if !text.isEmpty {
+                addTask(text)
+            } else { return false }
         }
-        // blue badge on the scout pet: unread picks (score 7+, not thumbed down)
-        let refreshScout = { [weak scoutView] in
-            URLSession.shared.dataTask(with: base.appendingPathComponent("api/feed")) { data, _, _ in
-                guard let data, let f = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let items = f["items"] as? [[String: Any]] else { return }
-                let n = items.filter { ($0["read"] as? Bool) != true && (($0["vote"] as? Int) ?? 0) >= 0
-                                       && (($0["score"] as? Double) ?? 0) >= 7 }.count
-                DispatchQueue.main.async { scoutView?.overdue = n }
-            }.resume()
+        return true
+    }
+
+    func addTask(_ text: String) {
+        post("api/drop", raw: Data(text.utf8)) { d, code in
+            self.say("task", "", code == 200 ? "Added: \(json(d)["title"] as? String ?? text)" : "Couldn't add that task", ok: code == 200)
         }
-        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in refresh(); refreshScout() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { refresh(); refreshScout() }
+    }
+
+    func saveLink(_ link: String) {
+        post("api/feed/add", ["url": link]) { d, code in
+            let r = json(d), title = r["title"] as? String ?? link
+            self.say("scout", "", code == 200 ? (r["existing"] as? Bool == true ? "Already had it; saved: " : "Saved: ") + title
+                                              : r["error"] as? String ?? "Couldn't save that link", ok: code == 200)
+        }
+    }
+
+    func addToLibrary(_ paths: [String]) {
+        post("api/library/add", ["paths": paths]) { d, code in
+            let r = json(d), added = r["added"] as? [String] ?? [], skipped = r["skipped"] as? [String] ?? []
+            let msg = (added.isEmpty ? [] : ["Added: " + added.joined(separator: ", ")]) + skipped
+            self.say("library", "", code == 200 ? msg.joined(separator: "\n") : "Couldn't add that", ok: code == 200 && !added.isEmpty)
+        }
+    }
+
+    // Question -> Argo -> the pet's speech bubble. The pet shows "…" while Argo thinks (the poll keeps it in sync).
+    func ask(_ kind: String, _ path: String, _ title: String, _ example: String) {
+        guard let q = textPrompt(title, placeholder: example) else { return }
+        pets[kind]?.view.busy = true
+        post(path, ["q": q]) { d, code in
+            self.pets[kind]?.view.busy = false
+            self.say(kind, q, code == 200 ? json(d)["answer"] as? String ?? "" : "Argo is unavailable right now (down, or off VPN).", ok: code == 200)
+        }
+    }
+
+    func reviewItem(_ r: [String: Any]) -> NSMenuItem {
+        let id = r["id"] as? String ?? "", labels = r["labels"] as? [String] ?? [], due = r["due"] as? String ?? ""
+        var what = labels.isEmpty ? [] : ["labels " + labels.joined(separator: ", ")]
+        if !due.isEmpty { what.append("due " + due.replacingOccurrences(of: "T", with: " ")) }
+        if r["renamed"] as? Bool == true { what.append("renamed") }
+        if let n = r["actions"] as? Int, n > 0 { what.append("\(n) action items") }
+        let title = r["title"] as? String ?? ""
+        let item = NSMenuItem(title: (title.count > 44 ? title.prefix(43) + "…" : title) + "  —  " + what.joined(separator: "; "),
+                              action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.addItem(Item("Keep") { post("api/todo/\(id)/keep") { _, _ in self.poll() } })
+        sub.addItem(Item("Undo Argo's Changes") { post("api/todo/\(id)/undo") { _, _ in self.poll() } })
+        item.submenu = sub
+        return item
+    }
+
+    func menu(_ kind: String) -> NSMenu {
+        let m = NSMenu(), p = pets[kind]!
+        m.autoenablesItems = false
+        m.addItem(Item((p.window.isVisible ? "Hide " : "Show ") + p.window.title) { self.toggle(p.window) })
+        m.addItem(.separator())
+        switch kind {
+        case "task":
+            m.addItem(Item("Quick Add Task…") {
+                if let v = textPrompt("New task", info: "With Argo, plain language works.", placeholder: "review Bob's draft by Fri 3pm") { self.addTask(v) }
+            })
+            m.addItem(Item("Ask About My Tasks…") { self.ask(kind, "api/ask", "Ask about your tasks and emails", "what did Bob ask me about the beamtime?") })
+            if !review.isEmpty {
+                m.addItem(.separator())
+                m.addItem(Item("Argo filled in:", enabled: false))
+                review.forEach { m.addItem(reviewItem($0)) }
+                m.addItem(Item("Keep All") { for r in self.review { post("api/todo/\(r["id"] as? String ?? "")/keep") { _, _ in self.poll() } } })
+            }
+        case "scout":
+            m.addItem(Item("Check for New Now") { post("api/feed/refresh") { _, _ in self.poll() } })
+            m.addItem(Item("Save a Link…") { if let v = textPrompt("Save a link to Scout", placeholder: "https://arxiv.org/abs/…") { self.saveLink(v) } })
+            m.addItem(Item("Mark All Read") { post("api/feed/update", ["all_read": true]) { _, _ in self.poll() } })
+        default:
+            m.addItem(Item("Find in Library…") { self.ask(kind, "api/library/ask", "Ask about your library", "where's my beamtime analysis?") })
+            m.addItem(Item("Add Files or Folders…") {
+                NSApp.activate(ignoringOtherApps: true)
+                let o = NSOpenPanel()
+                o.canChooseFiles = true; o.canChooseDirectories = true; o.allowsMultipleSelection = true
+                if o.runModal() == .OK { self.addToLibrary(o.urls.map(\.path)) }
+            })
+        }
+        m.addItem(.separator())
+        let mine = routines.filter { $0["pet"] == kind }
+        if !mine.isEmpty {
+            let run = NSMenuItem(title: "Run Routine Now", action: nil, keyEquivalent: ""), sub = NSMenu()
+            for r in mine { sub.addItem(Item(r["line"] ?? "") { post("api/routines/run", ["line": r["line"] ?? ""]) { _, _ in self.poll() } }) }
+            run.submenu = sub
+            m.addItem(run)
+        }
+        m.addItem(Item("Edit Routines…") { self.openSettings() })
+        return m
     }
 
     func makePet(_ view: PetView, offset: CGFloat) -> NSPanel {
@@ -451,6 +733,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         p.isOpaque = false
         p.hasShadow = false
         p.contentView = view
+        view.registerForDraggedTypes(PetView.dragTypes)
         if !p.setFrameUsingName(view.frameName), let f = NSScreen.main?.visibleFrame {
             p.setFrameOrigin(NSPoint(x: f.maxX - petSize - offset, y: f.minY + 20))  // bottom-right corner
         }
@@ -510,13 +793,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
 
     func webView(_ w: WKWebView, runJavaScriptTextInputPanelWithPrompt p: String, defaultText d: String?,
                  initiatedByFrame f: WKFrameInfo, completionHandler done: @escaping (String?) -> Void) {
-        let a = NSAlert(); a.messageText = p
-        a.addButton(withTitle: "OK"); a.addButton(withTitle: "Cancel")
-        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        tf.stringValue = d ?? ""
-        a.accessoryView = tf
-        a.window.initialFirstResponder = tf
-        done(a.runModal() == .alertFirstButtonReturn ? tf.stringValue : nil)
+        done(textPrompt(p, text: d ?? ""))
     }
 }
 

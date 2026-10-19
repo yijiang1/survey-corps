@@ -48,6 +48,14 @@ A small local task manager for macOS that turns Outlook emails into to-dos.
 - Native app with a Dock icon, light and dark mode.
 - A floating pet (an original chibi character holding a letter) sits on every desktop: click it to show/hide the app, drag it to move it.
 
+**Pets** (all three)
+- **Drop things on a pet**: an email or text on the Task pet makes a task, a link on Scout saves it, files or folders on the Librarian add them to the Library. The pet leans in while you drag, hops when it worked and shakes when it didn't.
+- **Busy**: a pet sways with a "…" thought bubble while Argo works for it.
+- **Speech bubbles**: the morning briefing, Scout's new picks, answers and routine results appear above the pet (click to open its window). Without the Mac app they fall back to macOS notifications.
+- **Right-click** (or ctrl-click) a pet: Task pet: Quick Add, Ask; Scout: Check Now, Save a Link, Mark All Read; Librarian: Find, Add Files. Answers come back as a bubble.
+- **Review Argo's fill-ins**: the orange ✓ badge on the Task pet counts tasks where Argo set labels, a due date, a cleaner title or action items. Click it to Keep or Undo each one (Undo leaves alone anything you changed since). Editing the task also clears it.
+- **Routines** (Settings → Routines), one per line, `days hour pet: what to do`, e.g. `fri 17 task: summarize what I finished this week`. Days: `daily`, `weekdays` or `mon,wed,fri`. The pet answers in a bubble once that day; right-click it to run one now.
+
 **Privacy**
 - Everything stays on the Mac. Data lives in `data/` next to `app.py` (ignored by git); nothing is sent to any cloud service.
 - The server only listens on `127.0.0.1` and rejects requests from other websites.
