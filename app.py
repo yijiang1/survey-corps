@@ -316,7 +316,8 @@ def watcher():
             if changed:
                 save(todos)
         briefing()
-        if time.time() - last_retry > 600:  # every 10 min, and right after launch
+        mins = config().get("retry_minutes", 10)  # 0 = automatic retry off (the header's Retry button still works)
+        if mins and time.time() - last_retry > mins * 60:  # and right after launch
             last_retry = time.time()
             threading.Thread(target=retry_argo, daemon=True).start()
         time.sleep(20)
@@ -843,6 +844,7 @@ class H(BaseHTTPRequestHandler):
             with busy_lock:
                 working = sorted(k for k, n in busy.items() if n > 0)
             self.reply(200, json.dumps({"configured": argo_on(), "argo": argo_ok, "checked": argo_at, "busy": working,
+                                        "retry_minutes": config().get("retry_minutes", 10),
                                         "rev": DB.stat().st_mtime if DB.exists() else 0,
                                         "lib_rev": LIB.stat().st_mtime if LIB.exists() else 0}).encode())
         elif self.path == "/feed":
@@ -908,6 +910,22 @@ class H(BaseHTTPRequestHandler):
             return self.reply(200)
         if u.path == "/api/argo/check":
             check_argo()
+            if argo_ok:
+                threading.Thread(target=retry_argo, daemon=True).start()  # clicking the pill also clears the waiting queue
+            return self.reply(200)
+        if u.path == "/api/argo/retry":  # manual retry: ping first so a dead Argo fails fast, then redo the waiting work
+            check_argo()
+            if argo_ok:
+                retry_argo()
+            return self.reply(200)
+        if u.path == "/api/argo/auto":
+            m = max(0, min(1440, int(json.loads(raw or b"{}").get("minutes", 10))))
+            with config_lock:
+                cfg = config()
+                cfg["retry_minutes"] = m
+                tmp = CONFIG.with_suffix(".tmp")
+                tmp.write_text(json.dumps(cfg, indent=1, ensure_ascii=False))
+                tmp.replace(CONFIG)
             return self.reply(200)
         if u.path == "/api/ask":
             answer = (ask(json.loads(raw or b"{}").get("q", "")) or "").replace("**", "")  # plain-text box
@@ -1079,7 +1097,7 @@ h2 span{font-weight:400;margin-left:4px}h2.late{color:var(--red)}
 .chips{display:contents}.chip{border-radius:10px;padding:1px 8px;cursor:pointer;background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 65% var(--chipL));font-weight:500}
 .chip b{display:inline-block;vertical-align:bottom;max-width:0;overflow:hidden;font-weight:400;opacity:0}.chip:hover b{max-width:1em;margin-left:3px;opacity:.7}.chip b:hover{opacity:1}
 .addl{border:0;background:none;width:0;padding:1px 0;color:var(--muted);outline:none;opacity:0}
-.t:hover .addl,.addl:focus{opacity:1;width:58px;padding:1px 2px}.addl:focus{width:180px;color:var(--text)}
+.t:hover .addl,.addl:focus{opacity:1;width:58px;padding:1px 2px}.t .addl:focus,.c .addl:focus{width:180px;color:var(--text)}
 details summary{display:inline-block;font-size:12px;color:var(--muted);cursor:pointer;margin-top:4px;list-style:none;user-select:none}
 details summary::-webkit-details-marker{display:none}
 details summary::before{content:"›";display:inline-block;margin-right:5px;transition:transform .15s}
@@ -1122,7 +1140,7 @@ textarea:focus{border-color:var(--accent)}
 #ans button{position:absolute;top:6px;right:6px;border:0;background:none;cursor:pointer;color:var(--muted)}
 #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:10;background:var(--text);color:var(--bg);
   border-radius:8px;padding:8px 14px;font-size:12.5px;opacity:0;transition:opacity .2s;pointer-events:none}#toast.on{opacity:.92}
-.pill{margin-left:auto;align-self:center;display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);
+.pill[hidden]{display:none}.pill+.pill{margin-left:6px}.pill{margin-left:auto;align-self:center;display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);
   border-radius:12px;padding:2px 10px;font-size:12px;color:var(--muted);cursor:pointer}.pill:hover{border-color:var(--accent)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}.pill.ok .dot{background:#34c759}.pill.down{color:var(--red)}.pill.down .dot{background:var(--red)}
 .pill.busy{color:var(--accent)}.pill.busy .dot{background:none;border:2px solid var(--accent);border-right-color:transparent;animation:spin .8s linear infinite}
@@ -1137,7 +1155,9 @@ textarea:focus{border-color:var(--accent)}
 </style>
 <div id=drop>Drop email to add a task</div><div id=toast></div>
 <header>
-  <div class=top><h1>Task Manager</h1><span id=stats></span><button id=argo class=pill></button></div>
+  <div class=top><h1>Task Manager</h1><span id=stats></span><button id=argo class=pill></button>
+    <button id=rt class=pill hidden title="Retry the work Argo missed, now">Retry now</button>
+    <select id=ar class=pill title="Automatic retry"></select></div>
   <div class=bar>
     <input id=new placeholder="Add a task (&quot;review Bob's draft by Fri 3pm&quot;) or drag in emails from Outlook">
     <input id=q type=search placeholder="Search, or ask a question ending in ?  ( / )">
@@ -1319,8 +1339,11 @@ function pill(){  // Argo status in the header: off / reachable / unavailable / 
   const dot=document.createElement('span');dot.className='dot';
   argo.replaceChildren(dot,!st.configured?'Argo off':work.length?`Argo working${work.length>1?` on ${work.length}`:''}…`
     :checking?'Checking Argo…':st.argo===false?'Argo unavailable'+(waiting?` · ${waiting} waiting`:''):'Argo');
+  rt.hidden=!st.configured||!waiting;
+  if(!ar.options.length&&st.configured){for(const [v,l] of [[0,'Auto-retry: off'],[5,'Retry every 5 min'],[10,'Retry every 10 min'],[30,'Retry every 30 min'],[60,'Retry every hour']])ar.add(new Option(l,v));ar.value=st.retry_minutes}
+  ar.hidden=!st.configured;
   argo.title=!st.configured?'LLM features are off. Set "argo_user" in data/config.json to turn them on.'
-    :(st.argo===false?'Argo is down, or you are off VPN. Waiting work retries every 10 min.':st.argo?'Argo is reachable.':'Not checked yet.')
+    :(st.argo===false?'Argo is down, or you are off VPN. Waiting work retries '+(st.retry_minutes?'every '+st.retry_minutes+' min':'only when you press Retry now')+'.':st.argo?'Argo is reachable.':'Not checked yet.')
     +(ago!=null?` Last contact ${ago<1?'just now':ago<60?ago+' min ago':Math.round(ago/60)+' h ago'}.`:'')+' Click to check now.';
 }
 async function tick(){
@@ -1331,6 +1354,8 @@ async function tick(){
   if(st.rev!==rev&&document.activeElement===document.body&&!document.querySelector('.t details[open]'))load();
 }
 argo.onclick=()=>{fetch('/api/argo/check',{method:'POST'}).then(tick);setTimeout(tick,150)};
+rt.onclick=()=>{rt.disabled=true;fetch('/api/argo/retry',{method:'POST'}).then(()=>{rt.disabled=false;tick();load()});setTimeout(tick,150)};
+ar.onchange=()=>fetch('/api/argo/auto',{method:'POST',body:JSON.stringify({minutes:+ar.value})});
 setInterval(tick,2000);
 q.oninput=lf.onchange=render;
 vl.onclick=()=>{view='list';localStorage.view=view;render()};vc.onclick=()=>{view='cal';localStorage.view=view;render()};
@@ -1642,7 +1667,7 @@ main{flex:1;min-width:0;padding:6px 20px 40px 6px}
 .chips{display:contents}.chip{border-radius:10px;padding:1px 8px;cursor:pointer;background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 65% var(--chipL));font-weight:500}
 .chip b{display:inline-block;vertical-align:bottom;max-width:0;overflow:hidden;font-weight:400;opacity:0}.chip:hover b{max-width:1em;margin-left:3px;opacity:.7}.chip b:hover{opacity:1}
 .addl{border:0;background:none;width:0;padding:1px 0;color:var(--muted);outline:none;opacity:0}
-.c:hover .addl,.addl:focus{opacity:1;width:58px;padding:1px 2px}.addl:focus{width:180px;color:var(--text)}
+.c:hover .addl,.addl:focus{opacity:1;width:58px;padding:1px 2px}.t .addl:focus,.c .addl:focus{width:180px;color:var(--text)}
 .why{margin-top:4px;font-style:italic;color:var(--muted)}.warn{color:var(--red);margin-top:4px;font-size:12px}
 details summary{display:inline-block;font-size:12px;color:var(--muted);cursor:pointer;margin-top:4px;list-style:none;user-select:none}
 details summary::-webkit-details-marker{display:none}
@@ -1663,7 +1688,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 ui-monospace,Menlo
 #ans button{position:absolute;top:6px;right:6px;border:0;background:none;cursor:pointer;color:var(--muted)}
 #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:10;background:var(--text);color:var(--bg);
   border-radius:8px;padding:8px 14px;font-size:12.5px;opacity:0;transition:opacity .2s;pointer-events:none}#toast.on{opacity:.92}
-.pill{margin-left:auto;align-self:center;display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);
+.pill[hidden]{display:none}.pill+.pill{margin-left:6px}.pill{margin-left:auto;align-self:center;display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);
   border-radius:12px;padding:2px 10px;font-size:12px;color:var(--muted);cursor:pointer}.pill:hover{border-color:var(--accent)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}.pill.ok .dot{background:#34c759}.pill.down{color:var(--red)}.pill.down .dot{background:var(--red)}
 .pill.busy{color:var(--accent)}.pill.busy .dot{background:none;border:2px solid var(--accent);border-right-color:transparent;animation:spin .8s linear infinite}
