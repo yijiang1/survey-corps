@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Survey Corps: local todo list fed by emails dragged from Outlook. Run: python3 app.py"""
 from collections import Counter
-import html, json, os, re, socket, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
+import html, json, os, re, socket, sqlite3, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email import message_from_bytes, policy
@@ -371,10 +371,10 @@ cc_ended = set()  # sessions that sent SessionEnd: their transcript may still be
 CLAUDE = Path.home() / ".claude" / "projects"
 transcripts = {}  # path -> (mtime, transcript_info), so a poll re-reads only transcripts that changed
 CC_STATE = {"SessionStart": "idle", "UserPromptSubmit": "working", "Notification": "waiting", "Stop": "idle"}
-CODEX = Path.home() / ".codex" / "sessions"
-codex_meta = {}  # rollout path -> (cwd, thread id), or None for Codex's own subagent threads
+CODEX = Path.home() / ".codex"  # state_<n>.sqlite: the Codex app's thread list
+WINDOW = 12 * 3600  # sessions active this recently are listed
 DESKTOP = Path.home() / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
-desktop_ids = {}  # Claude Code session id -> the desktop app's local_… id
+desktop, desktop_at = {}, 0.0  # Claude Code session id -> {"id": local_…, "title": sidebar title}; when last read
 
 
 def agent_event(e, tool="cc", pid=0):
@@ -406,9 +406,10 @@ def agent_event(e, tool="cc", pid=0):
 
 
 def transcript_info(transcript):
-    """{"cwd", "title", "entry", "cached_until"} from the tail of a Claude Code transcript. cached_until: when its prompt
-    cache runs out = last API call + the TTL that call wrote (1 h or 5 min, from usage.cache_creation); 0 if unknown."""
-    out = {"cwd": "", "title": "", "entry": "", "cached_until": 0}
+    """{"cwd", "title", "entry", "last", "cached_until"} from the tail of a Claude Code transcript. last: the newest
+    timestamped entry (the desktop app also rewrites a file's metadata when you only open it, so mtime isn't activity).
+    cached_until: when its prompt cache runs out = last API call + the TTL that call wrote (1 h or 5 min); 0 if unknown."""
+    out = {"cwd": "", "title": "", "entry": "", "last": 0, "cached_until": 0}
     try:
         with transcript.open("rb") as f:
             f.seek(max(0, f.seek(0, 2) - 300_000))  # the tail is enough: the title and cwd repeat, the last call is last
@@ -420,6 +421,8 @@ def transcript_info(transcript):
             d = json.loads(line)
             out["title"] = out["title"] or (d.get("customTitle") or "")
             out["cwd"], out["entry"] = out["cwd"] or d.get("cwd") or "", out["entry"] or d.get("entrypoint") or ""
+            if not out["last"] and d.get("timestamp"):
+                out["last"] = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
             if not out["cached_until"] and d.get("type") == "assistant" and d["message"].get("usage"):
                 made = d["message"]["usage"].get("cache_creation") or {}
                 ttl = 300 if made.get("ephemeral_5m_input_tokens") and not made.get("ephemeral_1h_input_tokens") else 3600
@@ -449,16 +452,38 @@ def app_of(pid):
     return ""
 
 
-def desktop_link(cli_id):
-    """claude:// link that opens a Claude desktop session, from the desktop app's own session files."""
-    if cli_id not in desktop_ids:  # ponytail: rescans on every miss; fine for ~100 small files
+def desktop_session(cli_id):
+    """{"id", "title"} of a Claude desktop session, from the desktop app's own session files (re-read each minute,
+    so sidebar renames show). Its title is the sidebar's; the transcript's can be stale, e.g. a fork keeps the parent's."""
+    global desktop, desktop_at
+    if time.time() - desktop_at > 60:
+        found = {}
         for f in DESKTOP.glob("*/*/local_*.json"):
             try:
                 d = json.loads(f.read_text())
-                desktop_ids[d["cliSessionId"]] = d["sessionId"]
+                found[d["cliSessionId"]] = {"id": d["sessionId"], "title": d.get("title") or ""}
             except (OSError, ValueError, KeyError, TypeError):
                 pass
-    return f"claude://claude.ai/epitaxy/{desktop_ids[cli_id]}" if cli_id in desktop_ids else ""
+        desktop, desktop_at = found, time.time()
+    return desktop.get(cli_id, {})
+
+
+def codex_threads(since):
+    """[(id, title, rollout path, last active ms)]: your unarchived Codex threads active since `since`
+    (not Codex's own Guardian-review subthreads). [] if Codex isn't installed or its schema changed."""
+    dbs = sorted(CODEX.glob("state_*.sqlite"), key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
+    if not dbs:
+        return []
+    try:
+        db = sqlite3.connect(f"file:{dbs[-1]}?mode=ro", uri=True)
+        try:
+            return db.execute("select id, coalesce(nullif(name, ''), nullif(title, ''), cwd), rollout_path,"
+                              " max(updated_at_ms, recency_at_ms) as ms from threads"
+                              " where thread_source = 'user' and archived = 0 and ms > ?", (since * 1000,)).fetchall()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return []
 
 
 def alive(pid):
@@ -474,7 +499,7 @@ def alive(pid):
 def agents(now=None):
     """[{"tool", "where", "state", "mins", "cache"?}] (cache: minutes left on an idle session's prompt cache).
     Claude Code sessions with hooks are exact; other Claude sessions (the desktop app's, or ones started before the
-    hooks) and Codex threads come from their logs: active in the last hour, working = written in the last minute."""
+    hooks) and Codex threads come from their logs: active within WINDOW, working = written in the last minute."""
     now = now or time.time()
     for sid in [s for s, a in cc.items() if a["pid"] and not alive(a["pid"])]:
         cc.pop(sid, None)  # closed without SessionEnd (killed terminal, crash)
@@ -483,40 +508,34 @@ def agents(now=None):
             **({"cache": max(0, int(a["cached_until"] - now) // 60), "id": sid, "until": a["cached_until"]}
                if a.get("cached_until") and a["state"] != "working" else {})}
            for sid, a in cc.items()]
-    for p in CLAUDE.glob("*/*.jsonl"):  # every Claude Code session, desktop app included, active in the last hour
+    for p in CLAUDE.glob("*/*.jsonl"):  # every Claude Code session, desktop app included
         try:
             mtime = p.stat().st_mtime
         except OSError:
             continue
-        if now - mtime > 3600 or p.stem in cc or p.stem in cc_ended:
+        if now - mtime > WINDOW or p.stem in cc or p.stem in cc_ended:
             continue  # stale, tracked more precisely by hooks, or closed
         if transcripts.get(p, (0,))[0] != mtime:
             transcripts[p] = (mtime, transcript_info(p))
-        t, age = transcripts[p][1], now - mtime
-        if t["entry"].startswith("sdk"):
-            continue  # `claude -p` and scripted runs: one-shot, nothing to come back to
+        t = transcripts[p][1]
+        age = now - (t["last"] or mtime)
+        if t["entry"].startswith("sdk") or age > WINDOW:
+            continue  # `claude -p` and scripted runs (one-shot, nothing to come back to), or only opened, not used
+        dk = desktop_session(p.stem) if t["entry"] == "claude-desktop" else {}
         out.append({"tool": "Claude app" if t["entry"] == "claude-desktop" else "Claude Code",
-                    "where": t["title"] or Path(t["cwd"]).name or p.parent.name, "state": "working" if age < 60 else "idle",
-                    "open": desktop_link(p.stem) if t["entry"] == "claude-desktop" else "",
+                    "where": dk.get("title") or t["title"] or Path(t["cwd"]).name or p.parent.name,
+                    "state": "working" if age < 60 else "idle",
+                    "open": f"claude://claude.ai/epitaxy/{dk['id']}" if dk else "",
                     "mins": int(age) // 60,
                     **({"cache": max(0, int(t["cached_until"] - now) // 60), "id": p.stem, "until": t["cached_until"]}
                        if t["cached_until"] and age >= 60 else {})})
-    for day in {datetime.fromtimestamp(now), datetime.fromtimestamp(now) - timedelta(days=1)}:
-        for p in (CODEX / f"{day:%Y/%m/%d}").glob("rollout-*.jsonl"):
-            age = now - p.stat().st_mtime
-            if age > 3600:
-                continue
-            if p not in codex_meta:
-                try:
-                    m = json.loads(p.open().readline())["payload"]
-                    codex_meta[p] = None if isinstance(m.get("source"), dict) else (m.get("cwd") or "?", m.get("id") or "")
-                except (OSError, ValueError, KeyError):
-                    continue
-            if codex_meta[p]:
-                cwd, thread = codex_meta[p]
-                out.append({"tool": "Codex", "where": Path(cwd).name, "state": "working" if age < 60 else "idle",
-                            "open": f"codex://threads/{thread}" if thread else "",
-                            "mins": int(age) // 60})
+    for tid, name, rollout, ms in codex_threads(now - WINDOW):
+        try:
+            last = max(ms / 1000, Path(rollout).stat().st_mtime)  # the log moves while a turn runs
+        except (OSError, TypeError):
+            last = ms / 1000
+        out.append({"tool": "Codex", "where": name, "state": "working" if now - last < 60 else "idle",
+                    "open": f"codex://threads/{tid}", "mins": int(now - last) // 60})
     order = {"waiting": 0, "working": 1}
     return sorted(out, key=lambda a: (order.get(a["state"], 2), a["mins"]))
 

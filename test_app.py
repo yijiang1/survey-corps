@@ -175,7 +175,7 @@ assert app.feed_to_lib(x) and not app.feed_to_lib(x)
 assert (y["path"], y["name"], y["labels"], y["group"]) == (x["url"], "P", ["Mine"], "Papers"), y
 print("ok")
 
-# coding agents: Claude Code hook events -> states; dead pids dropped; Codex threads from their session logs
+# coding agents: Claude Code hook events -> states; dead pids dropped; Codex threads from the Codex app's thread list
 import os, time as _t
 said = []
 app.say = lambda pet, title, text: said.append((title, text))
@@ -185,11 +185,18 @@ ev = lambda name, sid="s1", **kw: app.agent_event({"session_id": sid, "cwd": "/x
 ev("SessionStart"); ev("UserPromptSubmit")
 app.agent_event({"session_id": "dead", "cwd": "/x/gone", "hook_event_name": "UserPromptSubmit"}, "cc", 999999)
 app.CODEX = Path(tempfile.mkdtemp())
-day = app.CODEX / _t.strftime("%Y/%m/%d"); day.mkdir(parents=True)
-(day / "rollout-a.jsonl").write_text(json.dumps({"payload": {"cwd": "/y/cdx", "source": "vscode", "id": "t1"}}) + "\n")
-(day / "rollout-b.jsonl").write_text(json.dumps({"payload": {"cwd": "/y/sub", "source": {"subagent": "guardian"}}}) + "\n")
+import sqlite3
+db = sqlite3.connect(app.CODEX / "state_5.sqlite")
+db.execute("create table threads (id, name, title, cwd, rollout_path, updated_at_ms, recency_at_ms, thread_source, archived)")
+ms = int(_t.time() * 1000)
+db.executemany("insert into threads values (?,?,?,?,?,?,?,?,?)", [
+    ("t1", "", "Plan the house", "/y/cdx", "/nope.jsonl", ms, ms - 5, "user", 0),
+    ("t2", "", "Guardian review", "/y/cdx", "", ms, ms, "guardian_review", 0),       # Codex's own subthread
+    ("t3", "", "Old idea", "/y/cdx", "", ms, ms, "user", 1),                           # archived
+    ("t4", "", "Last week", "/y/cdx", "", ms - 86400_000 * 7, 0, "user", 0)])          # outside the window
+db.commit(); db.close()
 assert app.agents() == [{"tool": "Claude Code", "where": "proj", "state": "working", "mins": 0, "open": app.app_of(os.getpid())},
-                        {"tool": "Codex", "where": "cdx", "state": "working", "mins": 0, "open": "codex://threads/t1"}], app.agents()
+                        {"tool": "Codex", "where": "Plan the house", "state": "working", "mins": 0, "open": "codex://threads/t1"}], app.agents()
 assert app.app_of(os.getpid()).startswith("file:///") and app.app_of(os.getpid()).endswith(".app") and app.app_of(1) == ""
 ev("Notification", notification_type="idle_prompt", message="Claude is waiting for your input")
 ev("Notification", message="Claude needs your permission to use Bash")
@@ -201,7 +208,7 @@ app.agent_event({"type": "agent-turn-complete", "cwd": "/y/cdx", "last-assistant
 assert said[-1] == ("Codex", "Finished in cdx: Done.")
 ev("SessionEnd")
 assert "s1" not in app.cc and [a["tool"] for a in app.agents()] == ["Codex"]
-assert app.agents(now=_t.time() + 120)[0]["state"] == "idle" and app.agents(now=_t.time() + 7200) == []
+assert app.agents(now=_t.time() + 120)[0]["state"] == "idle" and app.agents(now=_t.time() + 13 * 3600) == []
 print("ok")
 
 # prompt cache: last API call + the TTL it wrote (1 h or 5 min); shown on idle sessions only
@@ -228,9 +235,13 @@ d = app.CLAUDE / "proj"; d.mkdir()
                               + json.dumps({"type": "custom-title", "customTitle": "My chat"}) + "\n")
 (d / "oneshot.jsonl").write_text(json.dumps({"type": "user", "cwd": "/x/p", "entrypoint": "sdk-cli"}) + "\n")
 (d / "gone.jsonl").write_text(json.dumps({"type": "user", "cwd": "/x/old", "entrypoint": "cli"}) + "\n")
+iso = lambda secs_ago: datetime.utcfromtimestamp(_t.time() - secs_ago).isoformat() + "Z"
+(d / "opened.jsonl").write_text(json.dumps({"type": "user", "timestamp": iso(3 * 86400), "cwd": "/x/o", "entrypoint": "claude-desktop"}) + "\n"
+                                + json.dumps({"type": "cost-state"}) + "\n")  # only opened today: fresh mtime, old activity
+(d / "ten.jsonl").write_text(json.dumps({"type": "user", "timestamp": iso(600), "cwd": "/x/ten", "entrypoint": "claude-desktop"}) + "\n")
 app.cc.clear(); app.cc_ended.add("gone")
-assert [(a["tool"], a["where"], a["state"]) for a in app.agents() if a["tool"] != "Codex"] == [("Claude app", "My chat", "working")]
-assert [a["state"] for a in app.agents(now=_t.time() + 120) if a["tool"] == "Claude app"] == ["idle"]
+assert [(a["where"], a["state"], a["mins"]) for a in app.agents() if a["tool"] != "Codex"] == [("My chat", "working", 0), ("ten", "idle", 10)]
+assert [a["state"] for a in app.agents(now=_t.time() + 120) if a["tool"] == "Claude app"] == ["idle", "idle"]
 print("ok")
 
 # cache warning: once per cache period, only in the last 5 minutes
@@ -244,7 +255,9 @@ print("ok")
 
 # desktop sessions open by their local_… id, looked up from the desktop app's session files
 app.DESKTOP = Path(tempfile.mkdtemp()); (app.DESKTOP / "u" / "o").mkdir(parents=True)
-(app.DESKTOP / "u" / "o" / "local_abc.json").write_text(json.dumps({"sessionId": "local_abc", "cliSessionId": "desk"}))
-assert app.desktop_link("desk") == "claude://claude.ai/epitaxy/local_abc" and app.desktop_link("nope") == ""
-assert [a["open"] for a in app.agents() if a["tool"] == "Claude app"] == ["claude://claude.ai/epitaxy/local_abc"]
+(app.DESKTOP / "u" / "o" / "local_abc.json").write_text(json.dumps({"sessionId": "local_abc", "cliSessionId": "desk",
+                                                                   "title": "My chat (fork)"}))
+app.desktop_at = 0
+assert app.desktop_session("desk") == {"id": "local_abc", "title": "My chat (fork)"} and app.desktop_session("nope") == {}
+assert [a["open"] for a in app.agents() if a["where"] == "My chat (fork)"] == ["claude://claude.ai/epitaxy/local_abc"]  # sidebar title wins
 print("ok")
