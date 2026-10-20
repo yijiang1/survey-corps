@@ -475,14 +475,18 @@ class PetView: NSView {
         if e.modifierFlags.contains(.control) { moved = true; rightMouseDown(with: e) }  // ctrl-click = right-click
     }
     override func mouseDragged(with e: NSEvent) {
+        let p = NSEvent.mouseLocation, at = convert(e.locationInWindow, from: nil), from = convert(grab, from: nil)
+        if !moved && hypot(at.x - from.x, at.y - from.y) < 4 { return }  // a shaky click is still a click
         moved = true
-        let p = NSEvent.mouseLocation
         window?.setFrameOrigin(NSPoint(x: p.x - grab.x, y: p.y - grab.y))
     }
     override func mouseUp(with e: NSEvent) {
-        if moved { window?.saveFrame(usingName: frameName) }
-        else if review > 0 && reviewRect.contains(convert(e.locationInWindow, from: nil)) { rightMouseDown(with: e) }
-        else { onClick() }
+        if moved { keepOnScreen(); window?.saveFrame(usingName: frameName) } else { onClick() }
+    }
+    func keepOnScreen() {  // all of the pet stays clickable: pull it back inside the screen it is mostly on
+        guard let w = window, let v = (w.screen ?? NSScreen.main)?.visibleFrame else { return }
+        w.setFrameOrigin(NSPoint(x: min(max(w.frame.minX, v.minX), v.maxX - w.frame.width),
+                                 y: min(max(w.frame.minY, v.minY), v.maxY - w.frame.height)))
     }
     static let dragTypes = DropWebView.promiseTypes + [.fileURL, .URL, .string]
     override func draggingEntered(_ s: NSDraggingInfo) -> NSDragOperation { hover = true; return .copy }
@@ -829,12 +833,14 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         p.backgroundColor = .clear
         p.isOpaque = false
         p.hasShadow = false
+        p.ignoresMouseEvents = false  // set explicitly, so clear pixels take clicks too: the whole square is the pet
         p.contentView = view
         view.registerForDraggedTypes(PetView.dragTypes)
         if !p.setFrameUsingName(view.frameName), let f = NSScreen.main?.visibleFrame {
             p.setFrameOrigin(NSPoint(x: f.maxX - petSize - offset, y: f.minY + 20))  // bottom-right corner
         }
         p.setContentSize(NSSize(width: petSize, height: petSize))  // saved frame may hold an old size
+        view.keepOnScreen()
         p.orderFrontRegardless()
         return p
     }
