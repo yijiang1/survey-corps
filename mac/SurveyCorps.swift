@@ -104,7 +104,8 @@ class DropWebView: WKWebView {
 // Original plush-chibi pet: swept-back blond hair, thick brows, square jaw, stern look, holding a letter. 64x64 box.
 // librarian: the third pet (Library window) — Armin-style: blond bob with a fringe, big blue eyes, holding an open book.
 // scout: the second pet (Scout window) — Hange-style researcher: messy brown ponytail, glasses, excited grin, magnifying glass.
-func drawPet(_ b: NSRect, scout: Bool = false, librarian: Bool = false) {
+// levi: the fourth pet (coding agents) — Levi-style: black undercut, centre-parted fringe, narrow steel eyes, holding a laptop.
+func drawPet(_ b: NSRect, scout: Bool = false, librarian: Bool = false, levi: Bool = false) {
     let k = min(b.width, b.height) / 64
     NSGraphicsContext.current?.cgContext.scaleBy(x: k, y: k)
     func rgb(_ r: CGFloat, _ g: CGFloat, _ bl: CGFloat, _ a: CGFloat = 1) -> NSColor {
@@ -113,7 +114,8 @@ func drawPet(_ b: NSRect, scout: Bool = false, librarian: Bool = false) {
     func oval(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) -> NSBezierPath {
         NSBezierPath(ovalIn: NSRect(x: x, y: y, width: w, height: h))
     }
-    let hair = scout ? rgb(128, 84, 52) : rgb(250, 226, 130), hairDark = scout ? rgb(82, 50, 28) : rgb(214, 178, 72), skin = rgb(248, 216, 192), skinEdge = rgb(222, 180, 152)
+    let hair = levi ? rgb(40, 38, 46) : scout ? rgb(128, 84, 52) : rgb(250, 226, 130)
+    let hairDark = levi ? rgb(14, 13, 18) : scout ? rgb(82, 50, 28) : rgb(214, 178, 72), skin = rgb(248, 216, 192), skinEdge = rgb(222, 180, 152)
     let ink = rgb(35, 28, 26)
     let sh = NSShadow(); sh.shadowBlurRadius = 3; sh.shadowOffset = NSSize(width: 0, height: -1)
     sh.shadowColor = NSColor.black.withAlphaComponent(0.35)
@@ -128,7 +130,8 @@ func drawPet(_ b: NSRect, scout: Bool = false, librarian: Bool = false) {
         tail.close(); tail.lineJoinStyle = .round
         hair.setFill(); tail.fill(); hairDark.setStroke(); tail.lineWidth = 0.9; tail.stroke()
     }
-    let back = NSBezierPath(roundedRect: librarian ? NSRect(x: 6, y: 15, width: 52, height: 47) : NSRect(x: 7, y: 20, width: 50, height: 42),
+    let back = NSBezierPath(roundedRect: librarian ? NSRect(x: 6, y: 15, width: 52, height: 47)
+                            : levi ? NSRect(x: 8, y: 30, width: 48, height: 32) : NSRect(x: 7, y: 20, width: 50, height: 42),
                             xRadius: 23, yRadius: 22)
     hair.setFill(); back.fill()
     if scout {  // hair tie at the ponytail's base
@@ -142,11 +145,13 @@ func drawPet(_ b: NSRect, scout: Bool = false, librarian: Bool = false) {
 
     // eyes: large, round, thick upper lash, glossy blue iris
     for (cx, dir): (CGFloat, CGFloat) in [(23.5, -1), (40.5, 1)] {
-        let eye = NSBezierPath(roundedRect: NSRect(x: cx - 5, y: 25.5, width: 10, height: 10), xRadius: 4.8, yRadius: 4.8)
+        let eye = NSBezierPath(roundedRect: NSRect(x: cx - 5, y: levi ? 26.5 : 25.5, width: 10, height: levi ? 6.5 : 10),
+                               xRadius: levi ? 3 : 4.8, yRadius: levi ? 3 : 4.8)
         NSColor.white.setFill(); eye.fill()
         NSGraphicsContext.saveGraphicsState(); eye.addClip()
         let iris = oval(cx - 4.3, 25.5, 8.6, 9.6)
-        NSGradient(starting: scout ? rgb(72, 40, 22) : rgb(15, 70, 160), ending: scout ? rgb(186, 120, 62) : rgb(80, 185, 245))!
+        NSGradient(starting: levi ? rgb(55, 62, 76) : scout ? rgb(72, 40, 22) : rgb(15, 70, 160),
+                   ending: levi ? rgb(150, 162, 178) : scout ? rgb(186, 120, 62) : rgb(80, 185, 245))!
             .draw(in: iris, angle: -90)
         (scout ? rgb(60, 32, 18) : rgb(10, 45, 110)).setStroke(); iris.lineWidth = 0.7; iris.stroke()
         (scout ? rgb(45, 22, 12, 0.85) : rgb(15, 40, 95, 0.8)).setFill(); oval(cx - 2, 28.5, 4, 4.4).fill()
@@ -154,6 +159,11 @@ func drawPet(_ b: NSRect, scout: Bool = false, librarian: Bool = false) {
         NSColor.white.withAlphaComponent(0.9).setFill(); oval(cx + dir * 1.6 - 0.7, 27.0, 1.4, 1.4).fill()
         NSGraphicsContext.restoreGraphicsState()
         let lash = NSBezierPath(); lash.lineWidth = 1.9; lash.lineCapStyle = .round; lash.lineJoinStyle = .round
+        if levi {  // flat lid, lower at the inner corner: the unimpressed look
+            lash.move(to: NSPoint(x: cx - dir * 5, y: 32)); lash.line(to: NSPoint(x: cx + dir * 5.6, y: 33.6))
+            lash.lineWidth = 2.2; ink.setStroke(); lash.stroke()
+            continue
+        }
         lash.move(to: NSPoint(x: cx - dir * 4.6, y: 33.3))
         lash.curve(to: NSPoint(x: cx + dir * 5.4, y: 33.6), controlPoint1: NSPoint(x: cx - dir * 2.5, y: 36.2),
                    controlPoint2: NSPoint(x: cx + dir * 3, y: 36.4))
@@ -211,6 +221,28 @@ func drawPet(_ b: NSRect, scout: Bool = false, librarian: Bool = false) {
     ink.setStroke(); grin.lineWidth = 0.8; grin.lineJoinStyle = .round; grin.stroke()
     rgb(250, 130, 130, 0.35).setFill(); oval(13.5, 21, 6, 3.4).fill(); oval(44.5, 21, 6, 3.4).fill()
 
+    } else if levi {
+        // shaved sides showing under the cut, then a centre-parted fringe that falls in curtains to the eyes
+        for x: CGFloat in [9.5, 50.5] {
+            rgb(92, 88, 98).setFill(); NSBezierPath(roundedRect: NSRect(x: x, y: 27, width: 4, height: 12), xRadius: 2, yRadius: 2).fill()
+        }
+        let top = NSBezierPath(); top.move(to: NSPoint(x: 9, y: 41))
+        top.curve(to: NSPoint(x: 32, y: 62), controlPoint1: NSPoint(x: 8, y: 56), controlPoint2: NSPoint(x: 18, y: 62))
+        top.curve(to: NSPoint(x: 55, y: 41), controlPoint1: NSPoint(x: 46, y: 62), controlPoint2: NSPoint(x: 56, y: 56))
+        for (x, y): (CGFloat, CGFloat) in [(52.5, 33), (48, 39.5), (44.5, 34.5), (40, 41), (34, 45), (30, 45), (24, 41),
+                                           (19.5, 34.5), (16, 39.5), (11.5, 33)] {
+            top.line(to: NSPoint(x: x, y: y))
+        }
+        top.close(); top.lineJoinStyle = .round
+        hair.setFill(); top.fill(); hairDark.setStroke(); top.lineWidth = 0.9; top.stroke()
+        for (x0, y0, x1, y1): (CGFloat, CGFloat, CGFloat, CGFloat) in [(32, 61, 32, 45.5), (28, 58, 20, 36), (36, 58, 44, 36),
+                                                                       (24, 58, 13, 35), (40, 58, 51, 35)] {
+            let st = NSBezierPath(); st.move(to: NSPoint(x: x0, y: y0)); st.line(to: NSPoint(x: x1, y: y1))
+            NSColor.black.withAlphaComponent(0.5).setStroke(); st.lineWidth = 0.7; st.lineCapStyle = .round; st.stroke()
+        }
+        let shine = NSBezierPath(); shine.move(to: NSPoint(x: 19, y: 55.5))
+        shine.curve(to: NSPoint(x: 28, y: 59.5), controlPoint1: NSPoint(x: 21.5, y: 58), controlPoint2: NSPoint(x: 25, y: 59.5))
+        NSColor.white.withAlphaComponent(0.35).setStroke(); shine.lineWidth = 1.4; shine.lineCapStyle = .round; shine.stroke()
     } else if librarian {
         // bob: rounded crown, a fringe of soft points down to the brows, side locks to the jaw
         let bob = NSBezierPath(); bob.move(to: NSPoint(x: 8, y: 36))
@@ -290,6 +322,21 @@ func drawPet(_ b: NSRect, scout: Bool = false, librarian: Bool = false) {
         return
     }
 
+    if levi {  // a little laptop, screen out, a prompt waiting
+        NSGraphicsContext.saveGraphicsState(); sh.set()
+        let lid = NSBezierPath(roundedRect: NSRect(x: 15, y: 2, width: 34, height: 17), xRadius: 2.5, yRadius: 2.5)
+        rgb(170, 175, 185).setFill(); lid.fill()
+        NSGraphicsContext.restoreGraphicsState()
+        rgb(30, 34, 42).setFill(); NSBezierPath(roundedRect: NSRect(x: 17, y: 4, width: 30, height: 13), xRadius: 1.5, yRadius: 1.5).fill()
+        let p = NSAttributedString(string: ">_", attributes: [.font: NSFont.monospacedSystemFont(ofSize: 7, weight: .bold),
+                                                              .foregroundColor: rgb(90, 230, 120)])
+        p.draw(at: NSPoint(x: 19, y: 7.5))
+        for x: CGFloat in [11.5, 45.5] {
+            let hand = oval(x, 4, 7, 7); skin.setFill(); hand.fill(); skinEdge.setStroke(); hand.lineWidth = 0.9; hand.stroke()
+        }
+        return
+    }
+
     if librarian {  // an open book, held with two little hands
         NSGraphicsContext.saveGraphicsState(); sh.set()
         let book = NSBezierPath(); book.move(to: NSPoint(x: 13, y: 4)); book.line(to: NSPoint(x: 32, y: 1.5)); book.line(to: NSPoint(x: 51, y: 4))
@@ -340,10 +387,12 @@ class PetView: NSView {
     var onClick: () -> Void = {}
     var onDrop: (NSPasteboard) -> Bool = { _ in false }
     var makeMenu: () -> NSMenu = { NSMenu() }
-    var scout = false, librarian = false, frameName = "pet", badgeColor = NSColor.systemRed
+    var scout = false, librarian = false, levi = false, frameName = "pet", badgeColor = NSColor.systemRed
     var grab = NSPoint.zero, moved = false
     var overdue = 0 { didSet { if overdue != oldValue { needsDisplay = true } } }  // badge count
     var review = 0 { didSet { if review != oldValue { needsDisplay = true } } }    // Argo fill-ins to Keep / Undo
+    var agents = 0 { didSet { if agents != oldValue { needsDisplay = true } } }    // Claude Code / Codex sessions working
+    var agentsWaiting = false { didSet { if agentsWaiting != oldValue { needsDisplay = true } } }  // one needs you
     var hover = false { didSet { if hover != oldValue { needsDisplay = true } } }  // something dragged over it
     var busy = false { didSet { if busy != oldValue { animate() } } }
     enum Anim { case hop, shake }  // hop: a drop worked or the pet speaks; shake: it didn't
@@ -377,7 +426,7 @@ class PetView: NSView {
         cg.translateBy(x: pet.midX + dx, y: pet.minY + dy)  // pivot at the feet
         cg.rotate(by: turn * .pi / 180); cg.scaleBy(x: grow, y: grow)
         cg.translateBy(x: -48, y: 0)
-        drawPet(NSRect(x: 0, y: 0, width: 96, height: 96), scout: scout, librarian: librarian)
+        drawPet(NSRect(x: 0, y: 0, width: 96, height: 96), scout: scout, librarian: librarian, levi: levi)
         NSGraphicsContext.restoreGraphicsState()
         let phase = Int(now / 0.35)
         if hover {
@@ -400,6 +449,15 @@ class PetView: NSView {
             let s = NSAttributedString(string: "✓\(review > 9 ? "9+" : "\(review)")", attributes: [
                 .font: NSFont.boldSystemFont(ofSize: 11), .foregroundColor: NSColor.white])
             s.draw(at: NSPoint(x: reviewRect.midX - s.size().width / 2, y: reviewRect.midY - s.size().height / 2))
+        }
+        if agents > 0 {  // bottom-left: green while agents work, purple when one is waiting for you
+            let s = NSAttributedString(string: "▸\(agents > 9 ? "9+" : "\(agents)")", attributes: [
+                .font: NSFont.boldSystemFont(ofSize: 11), .foregroundColor: NSColor.white])
+            let r = NSRect(x: 2, y: 2, width: max(28, s.size().width + 12), height: 22)
+            let pill = NSBezierPath(roundedRect: r, xRadius: 11, yRadius: 11)
+            (agentsWaiting ? NSColor.systemPurple : NSColor.systemGreen).setFill(); pill.fill()
+            NSColor.white.setStroke(); pill.lineWidth = 2; pill.stroke()
+            s.draw(at: NSPoint(x: r.midX - s.size().width / 2, y: r.midY - s.size().height / 2))
         }
         guard overdue > 0 else { return }
         let text = NSAttributedString(string: overdue > 99 ? "99+" : "\(overdue)", attributes: [
@@ -488,9 +546,9 @@ class BubbleView: NSView {
 
 class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     var window: NSWindow!, feedWindow: NSWindow!, libWindow: NSWindow!, settingsWindow: NSWindow!
-    var pets: [String: (panel: NSPanel, view: PetView, window: NSWindow)] = [:]  // "task", "scout", "library"
+    var pets: [String: (panel: NSPanel, view: PetView, window: NSWindow?)] = [:]  // "task", "scout", "library", "levi"
     var bubbles: [String: Bubble] = [:], lastBubble = 0
-    var review: [[String: Any]] = [], routines: [[String: String]] = []
+    var review: [[String: Any]] = [], routines: [[String: String]] = [], agents: [[String: Any]] = []
     var feedWeb: WKWebView!, libWeb: DropWebView!, settingsWeb: WKWebView!
     let server = Process()
 
@@ -566,15 +624,22 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         libWindow.isReleasedWhenClosed = false
         libWeb.load(URLRequest(url: libURL))
 
-        for (i, (kind, w, tip)) in [("task", window!, "Task Manager"), ("scout", feedWindow!, "Scout: new papers, videos and repos"),
-                                    ("library", libWindow!, "Library: your projects, files and docs")].enumerated() {
+        let all: [(String, NSWindow?, String)] = [("task", window, "Task Manager"), ("scout", feedWindow, "Scout: new papers, videos and repos"),
+                                                  ("library", libWindow, "Library: your projects, files and docs"),
+                                                  ("levi", nil, "Levi: your Claude Code and Codex sessions")]
+        for (i, (kind, w, tip)) in all.enumerated() {
             let v = PetView()
-            v.scout = kind == "scout"; v.librarian = kind == "library"
-            v.frameName = ["task": "pet", "scout": "scoutPet", "library": "libPet"][kind]!
+            v.scout = kind == "scout"; v.librarian = kind == "library"; v.levi = kind == "levi"
+            v.frameName = ["task": "pet", "scout": "scoutPet", "library": "libPet", "levi": "leviPet"][kind]!
             if kind == "scout" { v.badgeColor = .systemBlue }
-            v.toolTip = tip + ". Click to show/hide, drag to move, drop things on it, right-click for more"
-            v.onClick = { [unowned self] in self.toggle(w) }
-            v.onDrop = { [unowned self] in self.drop(kind, $0) }
+            if let w {
+                v.toolTip = tip + ". Click to show/hide, drag to move, drop things on it, right-click for more"
+                v.onClick = { [unowned self] in self.toggle(w) }
+                v.onDrop = { [unowned self] in self.drop(kind, $0) }
+            } else {
+                v.toolTip = tip + ". Click for the list, drag to move"
+                v.onClick = { [unowned self, unowned v] in self.menu(kind).popUp(positioning: nil, at: NSPoint(x: v.bounds.maxX + 4, y: v.bounds.maxY), in: v) }  // beside him, not over him
+            }
             v.makeMenu = { [unowned self] in self.menu(kind) }
             pets[kind] = (makePet(v, offset: 26 + CGFloat(i) * (petSize + 4)), v, w)
         }
@@ -591,6 +656,10 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
                 let busy = s["busy"] as? [String: Bool] ?? [:]
                 self.review = s["review"] as? [[String: Any]] ?? []
                 self.routines = s["routines"] as? [[String: String]] ?? []
+                self.agents = s["agents"] as? [[String: Any]] ?? []
+                let active = self.agents.filter { $0["state"] as? String != "idle" }
+                self.pets["levi"]?.view.agents = active.count
+                self.pets["levi"]?.view.agentsWaiting = active.contains { $0["state"] as? String == "waiting" }
                 for (k, p) in self.pets { p.view.busy = busy[k] ?? false }
                 self.pets["task"]?.view.overdue = s["overdue"] as? Int ?? 0  // red: open tasks past their due time
                 self.pets["task"]?.view.review = self.review.count           // orange: Argo fill-ins to Keep / Undo
@@ -607,12 +676,12 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         guard let p = pets[kind] else { return }
         let b = bubbles[kind] ?? Bubble()
         bubbles[kind] = b
-        b.onClick = { NSApp.activate(ignoringOtherApps: true); p.window.makeKeyAndOrderFront(nil) }
+        b.onClick = { NSApp.activate(ignoringOtherApps: true); p.window?.makeKeyAndOrderFront(nil) }
         b.show(title, text, over: p.panel)
         p.view.play(ok ? .hop : .shake)
     }
 
-    // Drop onto a pet: emails/text -> a task, a link -> Scout's Saved, files/folders -> the Library.
+    // Drop onto a pet: emails/text -> a task, a link -> Scout and the Library, files/folders -> the Library.
     func drop(_ kind: String, _ pb: NSPasteboard) -> Bool {
         let files = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
         let text = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -644,7 +713,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
     func saveLink(_ link: String) {
         post("api/feed/add", ["url": link]) { d, code in
             let r = json(d), title = r["title"] as? String ?? link
-            self.say("scout", "", code == 200 ? (r["existing"] as? Bool == true ? "Already had it; saved: " : "Saved: ") + title
+            self.say("scout", "", code == 200 ? (r["existing"] as? Bool == true ? "Already in the Library: " : "Added to the Library: ") + title
                                               : r["error"] as? String ?? "Couldn't save that link", ok: code == 200)
         }
     }
@@ -686,8 +755,10 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
     func menu(_ kind: String) -> NSMenu {
         let m = NSMenu(), p = pets[kind]!
         m.autoenablesItems = false
-        m.addItem(Item((p.window.isVisible ? "Hide " : "Show ") + p.window.title) { self.toggle(p.window) })
-        m.addItem(.separator())
+        if let w = p.window {
+            m.addItem(Item((w.isVisible ? "Hide " : "Show ") + w.title) { self.toggle(w) })
+            m.addItem(.separator())
+        }
         switch kind {
         case "task":
             m.addItem(Item("Quick Add Task…") {
@@ -700,9 +771,19 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
                 review.forEach { m.addItem(reviewItem($0)) }
                 m.addItem(Item("Keep All") { for r in self.review { post("api/todo/\(r["id"] as? String ?? "")/keep") { _, _ in self.poll() } } })
             }
+        case "levi":  // Claude Code and Codex sessions on this Mac (hooks/ in the repo)
+            m.addItem(Item(agents.isEmpty ? "No coding agents running" : "Coding agents:", enabled: false))
+            for a in agents {
+                let mins = a["mins"] as? Int ?? 0, ago = mins < 1 ? "just now" : mins < 60 ? "\(mins)m" : "\(mins / 60)h"
+                let cache = (a["cache"] as? Int).map { $0 > 0 ? "  ·  cache \($0)m left" : "  ·  cache expired" } ?? ""
+                let open = URL(string: a["open"] as? String ?? "")  // claude:// or codex:// session link, or the terminal's app
+                m.addItem(Item("\(a["tool"] as? String ?? "")  ·  \(a["where"] as? String ?? "")  —  \(a["state"] as? String ?? "") \(ago)" + cache,
+                               enabled: open != nil) { if let open { NSWorkspace.shared.open(open) } })
+            }
+            return m
         case "scout":
             m.addItem(Item("Check for New Now") { post("api/feed/refresh") { _, _ in self.poll() } })
-            m.addItem(Item("Save a Link…") { if let v = textPrompt("Save a link to Scout", placeholder: "https://arxiv.org/abs/…") { self.saveLink(v) } })
+            m.addItem(Item("Save a Link…") { if let v = textPrompt("Add a link to Scout and the Library", placeholder: "https://arxiv.org/abs/…") { self.saveLink(v) } })
             m.addItem(Item("Mark All Read") { post("api/feed/update", ["all_read": true]) { _, _ in self.poll() } })
         default:
             m.addItem(Item("Find in Library…") { self.ask(kind, "api/library/ask", "Ask about your library", "where's my beamtime analysis?") })

@@ -165,3 +165,86 @@ assert f["relabeled"] and len(seen) == 1 and "0. [arXiv] a" in seen[0] and "\n1.
 app.relabel_scout()
 assert len(seen) == 1  # done once
 print("ok")
+
+# 📚 on a Scout card: into the Library with its labels, once
+app.LIB = Path(tempfile.mkdtemp()) / "library.json"
+app.lib_enrich = lambda i: None
+x = {"id": "arxiv:1", "src": "arXiv", "title": "P", "url": "https://arxiv.org/abs/1", "by": "A", "date": "2026-01-01", "text": "abs", "labels": ["Mine"]}
+assert app.feed_to_lib(x) and not app.feed_to_lib(x)
+[y] = app.load_lib()["items"]
+assert (y["path"], y["name"], y["labels"], y["group"]) == (x["url"], "P", ["Mine"], "Papers"), y
+print("ok")
+
+# coding agents: Claude Code hook events -> states; dead pids dropped; Codex threads from their session logs
+import os, time as _t
+said = []
+app.say = lambda pet, title, text: said.append((title, text))
+app.cc.clear()
+app.CLAUDE = Path(tempfile.mkdtemp())  # no real transcripts
+ev = lambda name, sid="s1", **kw: app.agent_event({"session_id": sid, "cwd": "/x/proj", "hook_event_name": name, **kw}, "cc", os.getpid())
+ev("SessionStart"); ev("UserPromptSubmit")
+app.agent_event({"session_id": "dead", "cwd": "/x/gone", "hook_event_name": "UserPromptSubmit"}, "cc", 999999)
+app.CODEX = Path(tempfile.mkdtemp())
+day = app.CODEX / _t.strftime("%Y/%m/%d"); day.mkdir(parents=True)
+(day / "rollout-a.jsonl").write_text(json.dumps({"payload": {"cwd": "/y/cdx", "source": "vscode", "id": "t1"}}) + "\n")
+(day / "rollout-b.jsonl").write_text(json.dumps({"payload": {"cwd": "/y/sub", "source": {"subagent": "guardian"}}}) + "\n")
+assert app.agents() == [{"tool": "Claude Code", "where": "proj", "state": "working", "mins": 0, "open": app.app_of(os.getpid())},
+                        {"tool": "Codex", "where": "cdx", "state": "working", "mins": 0, "open": "codex://threads/t1"}], app.agents()
+assert app.app_of(os.getpid()).startswith("file:///") and app.app_of(os.getpid()).endswith(".app") and app.app_of(1) == ""
+ev("Notification", notification_type="idle_prompt", message="Claude is waiting for your input")
+ev("Notification", message="Claude needs your permission to use Bash")
+ev("Stop")
+_t.sleep(0.2)  # bubbles are said from a thread
+assert app.cc["s1"]["state"] == "idle" and said == [("Claude Code", "Needs you in proj: Claude needs your permission to use Bash"),
+                                                    ("Claude Code", "Finished in proj")], said
+app.agent_event({"type": "agent-turn-complete", "cwd": "/y/cdx", "last-assistant-message": "Done."}, "codex"); _t.sleep(0.2)
+assert said[-1] == ("Codex", "Finished in cdx: Done.")
+ev("SessionEnd")
+assert "s1" not in app.cc and [a["tool"] for a in app.agents()] == ["Codex"]
+assert app.agents(now=_t.time() + 120)[0]["state"] == "idle" and app.agents(now=_t.time() + 7200) == []
+print("ok")
+
+# prompt cache: last API call + the TTL it wrote (1 h or 5 min); shown on idle sessions only
+tr = Path(tempfile.mkdtemp()) / "s.jsonl"
+call = lambda ts, m5, h1: json.dumps({"type": "assistant", "timestamp": ts, "message": {"usage": {
+    "cache_creation": {"ephemeral_5m_input_tokens": m5, "ephemeral_1h_input_tokens": h1}}}})
+tr.write_text(call("2026-10-20T04:00:00.000Z", 0, 900) + "\n" + json.dumps({"type": "user"}) + "\n")
+t0 = datetime.fromisoformat("2026-10-20T04:00:00+00:00").timestamp()
+assert app.cache_expiry(tr) == t0 + 3600
+tr.write_text(call("2026-10-20T04:00:00.000Z", 0, 900) + "\n" + call("2026-10-20T04:10:00.000Z", 50, 0) + "\n")
+assert app.cache_expiry(tr) == t0 + 600 + 300 and app.cache_expiry(tr.with_name("none.jsonl")) == 0
+app.cc.clear()
+app.agent_event({"session_id": "c", "cwd": "/x/p", "hook_event_name": "Stop", "transcript_path": str(tr)}, "cc", os.getpid())
+_t.sleep(0.2)
+mine = lambda **kw: next(a for a in app.agents(**kw) if a["tool"] == "Claude Code")
+assert mine(now=t0 + 600 + 60)["cache"] == 4 and mine(now=t0 + 2000)["cache"] == 0
+app.agent_event({"session_id": "c", "hook_event_name": "UserPromptSubmit"}, "cc", os.getpid())
+assert "cache" not in mine()  # working: warm by definition
+print("ok")
+
+# Claude sessions without hooks (the desktop app's) come from their transcripts; closed ones and hooked ones don't repeat
+d = app.CLAUDE / "proj"; d.mkdir()
+(d / "desk.jsonl").write_text(json.dumps({"type": "user", "cwd": "/x/proj", "entrypoint": "claude-desktop"}) + "\n"
+                              + json.dumps({"type": "custom-title", "customTitle": "My chat"}) + "\n")
+(d / "oneshot.jsonl").write_text(json.dumps({"type": "user", "cwd": "/x/p", "entrypoint": "sdk-cli"}) + "\n")
+(d / "gone.jsonl").write_text(json.dumps({"type": "user", "cwd": "/x/old", "entrypoint": "cli"}) + "\n")
+app.cc.clear(); app.cc_ended.add("gone")
+assert [(a["tool"], a["where"], a["state"]) for a in app.agents() if a["tool"] != "Codex"] == [("Claude app", "My chat", "working")]
+assert [a["state"] for a in app.agents(now=_t.time() + 120) if a["tool"] == "Claude app"] == ["idle"]
+print("ok")
+
+# cache warning: once per cache period, only in the last 5 minutes
+said.clear(); app.cc.clear(); app.warned.clear()
+app.agent_event({"session_id": "w", "cwd": "/x/p", "hook_event_name": "Stop", "transcript_path": str(tr)}, "cc", os.getpid())
+_t.sleep(0.2); said.clear()
+exp = app.cc["w"]["cached_until"]
+app.warn_caches(now=exp - 600); app.warn_caches(now=exp - 240); app.warn_caches(now=exp - 120); app.warn_caches(now=exp + 10)
+assert said == [("Claude Code", "p: cache expires in 4 min")], said
+print("ok")
+
+# desktop sessions open by their local_… id, looked up from the desktop app's session files
+app.DESKTOP = Path(tempfile.mkdtemp()); (app.DESKTOP / "u" / "o").mkdir(parents=True)
+(app.DESKTOP / "u" / "o" / "local_abc.json").write_text(json.dumps({"sessionId": "local_abc", "cliSessionId": "desk"}))
+assert app.desktop_link("desk") == "claude://claude.ai/epitaxy/local_abc" and app.desktop_link("nope") == ""
+assert [a["open"] for a in app.agents() if a["tool"] == "Claude app"] == ["claude://claude.ai/epitaxy/local_abc"]
+print("ok")

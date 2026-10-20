@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Survey Corps: local todo list fed by emails dragged from Outlook. Run: python3 app.py"""
 from collections import Counter
-import html, json, re, socket, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
+import html, json, os, re, socket, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email import message_from_bytes, policy
@@ -362,6 +362,185 @@ def say(pet, title, text):
     with busy_lock:
         bubbles.append({"id": (bubbles[-1]["id"] + 1) if bubbles else 1, "pet": pet, "title": title, "text": text})
         del bubbles[:-20]
+
+
+# ---- Coding agents on this Mac: Claude Code reports through hooks, Codex is read from its session logs ----
+# ponytail: in memory, so a restart forgets idle Claude sessions until their next prompt
+cc = {}  # {session_id: {"cwd", "state", "since", "pid"}}
+cc_ended = set()  # sessions that sent SessionEnd: their transcript may still be fresh, but they're gone
+CLAUDE = Path.home() / ".claude" / "projects"
+transcripts = {}  # path -> (mtime, transcript_info), so a poll re-reads only transcripts that changed
+CC_STATE = {"SessionStart": "idle", "UserPromptSubmit": "working", "Notification": "waiting", "Stop": "idle"}
+CODEX = Path.home() / ".codex" / "sessions"
+codex_meta = {}  # rollout path -> (cwd, thread id), or None for Codex's own subagent threads
+DESKTOP = Path.home() / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
+desktop_ids = {}  # Claude Code session id -> the desktop app's local_… id
+
+
+def agent_event(e, tool="cc", pid=0):
+    """A Claude Code hook payload (tool "cc") or a Codex notify payload; a bubble when one finishes or needs you."""
+    where = Path(e.get("cwd") or "?").name
+    if tool == "codex":
+        if e.get("type") == "agent-turn-complete":
+            msg = flat(str(e.get("last-assistant-message") or ""), 90)
+            threading.Thread(target=say, args=("levi", "Codex", f"Finished in {where}" + (f": {msg}" if msg else "")), daemon=True).start()
+        return
+    sid, ev = e.get("session_id"), e.get("hook_event_name")
+    if ev == "SessionEnd":
+        cc_ended.add(sid)
+        return cc.pop(sid, None)
+    if ev == "Notification" and (e.get("notification_type") == "idle_prompt" or "waiting for your input" in str(e.get("message"))):
+        return  # the 60 s "still idle" reminder after Stop, not a question
+    if not sid or ev not in CC_STATE:
+        return
+    if sid not in cc:
+        cc[sid] = {"cwd": e.get("cwd") or "", "state": "", "since": 0, "pid": pid, "open": app_of(pid)}
+    a = cc[sid]
+    if a["state"] != CC_STATE[ev]:
+        a["state"], a["since"] = CC_STATE[ev], time.time()
+    if ev in ("Stop", "Notification") and e.get("transcript_path"):
+        a["cached_until"] = cache_expiry(Path(e["transcript_path"])) or a.get("cached_until", 0)
+    if ev in ("Stop", "Notification"):
+        text = f"Finished in {where}" if ev == "Stop" else f"Needs you in {where}: {flat(str(e.get('message') or ''), 90)}"
+        threading.Thread(target=say, args=("levi", "Claude Code", text), daemon=True).start()
+
+
+def transcript_info(transcript):
+    """{"cwd", "title", "entry", "cached_until"} from the tail of a Claude Code transcript. cached_until: when its prompt
+    cache runs out = last API call + the TTL that call wrote (1 h or 5 min, from usage.cache_creation); 0 if unknown."""
+    out = {"cwd": "", "title": "", "entry": "", "cached_until": 0}
+    try:
+        with transcript.open("rb") as f:
+            f.seek(max(0, f.seek(0, 2) - 300_000))  # the tail is enough: the title and cwd repeat, the last call is last
+            lines = f.read().decode(errors="ignore").splitlines()
+    except OSError:
+        return out
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+            out["title"] = out["title"] or (d.get("customTitle") or "")
+            out["cwd"], out["entry"] = out["cwd"] or d.get("cwd") or "", out["entry"] or d.get("entrypoint") or ""
+            if not out["cached_until"] and d.get("type") == "assistant" and d["message"].get("usage"):
+                made = d["message"]["usage"].get("cache_creation") or {}
+                ttl = 300 if made.get("ephemeral_5m_input_tokens") and not made.get("ephemeral_1h_input_tokens") else 3600
+                out["cached_until"] = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp() + ttl
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+        if all(out.values()):
+            break
+    return out
+
+
+def cache_expiry(transcript):
+    return transcript_info(transcript)["cached_until"]
+
+
+def app_of(pid):
+    """file:// URL of the app a process runs under (Terminal, iTerm, VS Code…), found by walking up its parents."""
+    for _ in range(15):
+        if pid <= 1:
+            return ""
+        out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True).stdout.split(None, 1)
+        if len(out) < 2:
+            return ""
+        if ".app/" in out[1]:
+            return Path(out[1][:out[1].index(".app/") + 4]).as_uri()
+        pid = int(out[0])
+    return ""
+
+
+def desktop_link(cli_id):
+    """claude:// link that opens a Claude desktop session, from the desktop app's own session files."""
+    if cli_id not in desktop_ids:  # ponytail: rescans on every miss; fine for ~100 small files
+        for f in DESKTOP.glob("*/*/local_*.json"):
+            try:
+                d = json.loads(f.read_text())
+                desktop_ids[d["cliSessionId"]] = d["sessionId"]
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+    return f"claude://claude.ai/epitaxy/{desktop_ids[cli_id]}" if cli_id in desktop_ids else ""
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        pass
+    return True
+
+
+def agents(now=None):
+    """[{"tool", "where", "state", "mins", "cache"?}] (cache: minutes left on an idle session's prompt cache).
+    Claude Code sessions with hooks are exact; other Claude sessions (the desktop app's, or ones started before the
+    hooks) and Codex threads come from their logs: active in the last hour, working = written in the last minute."""
+    now = now or time.time()
+    for sid in [s for s, a in cc.items() if a["pid"] and not alive(a["pid"])]:
+        cc.pop(sid, None)  # closed without SessionEnd (killed terminal, crash)
+    out = [{"tool": "Claude Code", "where": Path(a["cwd"]).name, "state": a["state"], "mins": int(now - a["since"]) // 60,
+            "open": a.get("open", ""),
+            **({"cache": max(0, int(a["cached_until"] - now) // 60), "id": sid, "until": a["cached_until"]}
+               if a.get("cached_until") and a["state"] != "working" else {})}
+           for sid, a in cc.items()]
+    for p in CLAUDE.glob("*/*.jsonl"):  # every Claude Code session, desktop app included, active in the last hour
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        if now - mtime > 3600 or p.stem in cc or p.stem in cc_ended:
+            continue  # stale, tracked more precisely by hooks, or closed
+        if transcripts.get(p, (0,))[0] != mtime:
+            transcripts[p] = (mtime, transcript_info(p))
+        t, age = transcripts[p][1], now - mtime
+        if t["entry"].startswith("sdk"):
+            continue  # `claude -p` and scripted runs: one-shot, nothing to come back to
+        out.append({"tool": "Claude app" if t["entry"] == "claude-desktop" else "Claude Code",
+                    "where": t["title"] or Path(t["cwd"]).name or p.parent.name, "state": "working" if age < 60 else "idle",
+                    "open": desktop_link(p.stem) if t["entry"] == "claude-desktop" else "",
+                    "mins": int(age) // 60,
+                    **({"cache": max(0, int(t["cached_until"] - now) // 60), "id": p.stem, "until": t["cached_until"]}
+                       if t["cached_until"] and age >= 60 else {})})
+    for day in {datetime.fromtimestamp(now), datetime.fromtimestamp(now) - timedelta(days=1)}:
+        for p in (CODEX / f"{day:%Y/%m/%d}").glob("rollout-*.jsonl"):
+            age = now - p.stat().st_mtime
+            if age > 3600:
+                continue
+            if p not in codex_meta:
+                try:
+                    m = json.loads(p.open().readline())["payload"]
+                    codex_meta[p] = None if isinstance(m.get("source"), dict) else (m.get("cwd") or "?", m.get("id") or "")
+                except (OSError, ValueError, KeyError):
+                    continue
+            if codex_meta[p]:
+                cwd, thread = codex_meta[p]
+                out.append({"tool": "Codex", "where": Path(cwd).name, "state": "working" if age < 60 else "idle",
+                            "open": f"codex://threads/{thread}" if thread else "",
+                            "mins": int(age) // 60})
+    order = {"waiting": 0, "working": 1}
+    return sorted(out, key=lambda a: (order.get(a["state"], 2), a["mins"]))
+
+
+warned = set()  # (session id, cache expiry) already warned about
+
+
+def warn_caches(now=None):
+    """Levi speaks once per cache period when an idle session's prompt cache has 5 minutes or less left."""
+    now = now or time.time()
+    for a in agents(now):
+        left = a.get("until", 0) - now
+        if 0 < left <= 300 and (a["id"], a["until"]) not in warned:
+            warned.add((a["id"], a["until"]))
+            say("levi", a["tool"], f"{a['where']}: cache expires in {max(1, round(left / 60))} min")
+
+
+def agents_loop():
+    while True:
+        try:
+            warn_caches()
+        except Exception as e:  # a bad transcript must not stop the warnings for good
+            print("agents:", e)
+        time.sleep(30)
 
 
 def notify(title, msg):
@@ -971,6 +1150,19 @@ def lib_add(paths, split=False, group=""):
     return new, skipped
 
 
+def feed_to_lib(x):
+    """Put a Scout item in the Library (its labels too). False if that link is already there."""
+    with lib_lock:
+        lib = load_lib()
+        if any(y["path"] == x["url"] for y in lib["items"]):
+            return False
+        item = {**lib_item("", link=x), "labels": list(x.get("labels") or [])}
+        lib["items"].insert(0, item)
+        save_lib(lib)
+    threading.Thread(target=lib_enrich, args=(item["id"],), daemon=True).start()
+    return True
+
+
 def clean_lib_suggestion(text):
     """{"summary", "labels"} from the model's reply."""
     m = re.search(r"\{.*\}", text or "", re.S)
@@ -1064,13 +1256,11 @@ KIND = {"arXiv": "paper", "YouTube": "video", "GitHub": "repo"}
 
 
 def corpus():
-    """Everything the app knows, as {ref, kind, title, sub, text, labels}: Library items, tasks/emails and Scout items."""
+    """Everything the app knows, as {ref, kind, title, sub, text, labels}: Library items and tasks/emails (Scout keeps to its own window)."""
     with lib_lock:
         lib = load_lib()["items"]
     with lock:
         todos = load()
-    with feed_lock:
-        feed = load_feed()["items"]
     return ([{"ref": "lib:" + x["id"], "kind": KIND.get(x["src"], "link") if x.get("src") else "folder" if x["folder"] else "file", "title": x["name"], "sub": x["path"],
               "text": "\n".join(filter(None, [x["path"], x["group"], x["summary"], x["note"], x["peek"]])), "labels": x["labels"]}
              for x in lib]
@@ -1078,11 +1268,7 @@ def corpus():
                 "sub": " · ".join(filter(None, [t["sender"], t["date"] or t["added"][:10], t["due"] and "due " + t["due"].replace("T", " "),
                                                 t["done"] and "done"])),
                 "text": f"{t['body']}\n{t['note']}", "labels": t.get("labels", []), "id": t["id"], "eml": bool(t.get("eml"))}
-               for t in todos]
-            + [{"ref": "feed:" + x["id"], "kind": KIND.get(x["src"], "link"), "title": x["title"],
-                "sub": " · ".join(filter(None, [x["src"], x["by"], x["date"]])), "text": f"{x['why']}\n{x['text']}",
-                "labels": x.get("labels", []), "id": x["id"], "url": x["url"]}
-               for x in feed if x.get("labels") or x["saved"] or x.get("task") or (x["score"] or 0) >= 5])
+               for t in todos])
 
 
 HOME = Path.home()
@@ -1113,8 +1299,8 @@ def lib_ask(q, steps=6):
         last = i == steps - 1
         reply = argo(
             f"Today is {datetime.now():%A %Y-%m-%d}. You are finding things for me on my Mac and in my notes app, to answer: {q}\n"
-            "My app holds Library items (local folders, files, docs), tasks and saved emails, and Scout papers, videos, repos "
-            f"and links. Labels in use: {json.dumps(all_labels())}.\nEach turn reply with ONLY one JSON object, one of:\n"
+            "My app holds Library items (local folders, files, docs), tasks and saved emails. "
+            f"Labels in use: {json.dumps(all_labels())}.\nEach turn reply with ONLY one JSON object, one of:\n"
             '{"search": "keywords"}  search the app\'s items (names, paths, notes, summaries, email text, labels)\n'
             '{"label": "Label"}  list everything with that label\n'
             '{"spotlight": "keywords"}  Spotlight search of file names and contents in my home folder\n'
@@ -1167,7 +1353,7 @@ def lib_ask(q, steps=6):
 
 
 def pets(after=0):
-    """Everything the Mac app's three pets show: badges, who's working, review queue, new bubbles."""
+    """Everything the Mac app's four pets show: badges, who's working, review queue, new bubbles."""
     global pets_seen
     pets_seen = time.time()
     now = datetime.now().strftime("%Y-%m-%dT%H:%M")
@@ -1178,14 +1364,17 @@ def pets(after=0):
     with busy_lock:
         tags = [k for k, n in busy.items() if n > 0 and k != "check"]
         said = [b for b in bubbles if b["id"] > after]
+    ag = agents()
     return {"overdue": sum(1 for t in todos if not t["done"] and t["due"] and t["due"] <= now),
             "picks": sum(1 for x in items if not x["read"] and x["vote"] >= 0 and (x["score"] or 0) >= 7),
             "review": [{"id": t["id"], "title": t["title"], "labels": t["review"].get("labels", []), "due": t["review"].get("due", ""),
                         "renamed": "was" in t["review"], "actions": len(t["review"].get("actions", []))} for t in todos if t.get("review") and not t["done"]],
             "busy": {"task": any(not k.startswith(("lib", "scout")) for k in tags),
-                     "scout": scout_busy.locked() or "scout" in tags, "library": any(k.startswith("lib") for k in tags)},
+                     "scout": scout_busy.locked() or "scout" in tags, "library": any(k.startswith("lib") for k in tags),
+                     "levi": any(a["state"] == "working" for a in ag)},
             "bubbles": said,
-            "routines": [{"line": r["line"], "pet": r["pet"]} for r in routines()]}
+            "routines": [{"line": r["line"], "pet": r["pet"]} for r in routines()],
+            "agents": ag}
 
 
 class H(BaseHTTPRequestHandler):
@@ -1233,7 +1422,7 @@ class H(BaseHTTPRequestHandler):
             with lib_lock:
                 hues = {k: v for k, v in load_lib()["labels"].items() if v is not None}
             self.reply(200, json.dumps({"all": all_labels(), "hues": hues}).encode())
-        elif self.path == "/api/labeled":  # tasks and Scout items for the Library's label view
+        elif self.path == "/api/labeled":  # tasks for the Library's label view
             self.reply(200, json.dumps([{k: v for k, v in x.items() if k != "text"}
                                         for x in corpus() if x["labels"] and not x["ref"].startswith("lib:")]).encode())
         elif self.path == "/api/feed":
@@ -1250,6 +1439,13 @@ class H(BaseHTTPRequestHandler):
             return self.reply(403)
         u = urlparse(self.path)
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if u.path == "/api/agent":  # hooks/: ?tool=cc&pid=<claude pid> with the hook's JSON, or ?tool=codex with notify's
+            q = parse_qs(u.query)
+            try:
+                agent_event(json.loads(raw or b"{}"), q.get("tool", ["cc"])[0], int(q.get("pid", ["0"])[0] or 0))
+            except (ValueError, AttributeError):  # not JSON / not an object / bad pid
+                return self.reply(400)
+            return self.reply(200)
         if u.path == "/api/scout/channel":  # {"q": "@handle" | link | id} -> {"line": "UC... name"}
             try:
                 return self.reply(200, json.dumps({"line": channel(json.loads(raw or b"{}").get("q") or "")}).encode())
@@ -1322,7 +1518,16 @@ class H(BaseHTTPRequestHandler):
                 return self.reply(404)
             text = draft_reply(t, str(json.loads(raw or b"{}").get("how") or "").strip())
             return self.reply(200, json.dumps({"draft": text}).encode()) if text else self.reply(503)
-        if u.path == "/api/feed/add":  # {"url": ...} -> fetched, saved to the Saved list, then scored in the background
+        if u.path == "/api/feed/library":  # {"id": ...} -> that Scout item moves to the Library ("saved": hidden from
+            # Scout but kept, so it still steers ranking and its id is never fetched again)
+            with feed_lock:
+                f = load_feed()
+                x = next((x for x in f["items"] if x["id"] == json.loads(raw or b"{}").get("id")), None)
+                if x:
+                    x.update(saved=True, read=True)
+                    save_feed(f)
+            return self.reply(200, json.dumps({"added": feed_to_lib(x)}).encode()) if x else self.reply(404)
+        if u.path == "/api/feed/add":  # {"url": ...} -> fetched, put in Scout and the Library, then scored in the background
             try:
                 item = link_item(json.loads(raw or b"{}").get("url") or "")
             except urllib.error.HTTPError as e:
@@ -1336,13 +1541,14 @@ class H(BaseHTTPRequestHandler):
                 x = next((x for x in f["items"] if x["id"] == item["id"]), None)
                 existed = x is not None
                 if x:
-                    x["saved"] = True
+                    x.update(saved=True, read=True)
                 else:
                     x = {**item, "added": datetime.now().isoformat(timespec="minutes"), "score": None, "why": "",
-                         "vote": 0, "saved": True, "read": False, "manual": True}
+                         "vote": 0, "saved": True, "read": True, "manual": True}
                     f["items"].insert(0, x)
                     f["seen"] = sorted(set(f["seen"]) | {x["id"]})
                 save_feed(f)
+            existed = not feed_to_lib(x)
             if x["score"] is None:
                 threading.Thread(target=score_one, args=(x["id"],), daemon=True).start()
             return self.reply(200, json.dumps({"title": x["title"], "existing": existed}).encode())
@@ -1406,7 +1612,7 @@ class H(BaseHTTPRequestHandler):
                     return self.reply(404)
                 save_lib(lib)
             return self.reply(200)
-        if u.path == "/api/feed/update":  # {"id": ..., "vote"/"saved"/"read": ...}, or {"all_read": true}
+        if u.path == "/api/feed/update":  # {"id": ..., "vote"/"saved"/"read"/"hidden": ...}, or {"all_read": true}
             patch = json.loads(raw or b"{}")
             with feed_lock:
                 f = load_feed()
@@ -1414,7 +1620,7 @@ class H(BaseHTTPRequestHandler):
                     if patch.get("all_read"):
                         x["read"] = True
                     elif x["id"] == patch.get("id"):
-                        x.update({k: patch[k] for k in ("vote", "saved", "read") if k in patch})
+                        x.update({k: patch[k] for k in ("vote", "saved", "read", "hidden") if k in patch})
                         if "labels" in patch:
                             x["labels"] = sorted({str(l).strip()[:40] for l in patch["labels"] if str(l).strip()})
                 save_feed(f)
@@ -1946,14 +2152,14 @@ dialog#adddlg{width:min(580px,calc(100vw - 32px))}
     <button type=button class=btn id=p_cancel>Cancel</button><button class="btn primary" id=p_save>Save</button></div>
 </form></dialog>
 <dialog id=adddlg class=sheet><form id=aform>
-  <div class=ph><h3>Save a link</h3><p>An arXiv paper, YouTube video, GitHub repo, or any web page. It goes straight to Saved.</p></div>
+  <div class=ph><h3>Save a link</h3><p>An arXiv paper, YouTube video, GitHub repo, or any web page. It goes straight to your Library.</p></div>
   <div class=pb><div class=sec style="margin-top:10px"><textarea id=a_urls rows=3
     placeholder="Paste a link and press Enter (several links: one per line)"></textarea><div id=a_log></div></div></div>
   <div class=pf><span class=msg></span><button type=button class=btn id=a_cancel>Close</button><button class="btn primary" id=a_save>Save</button></div>
 </form></dialog>
 <script>
-const SRCS=['All','arXiv','YouTube','GitHub','Saved'];
-let feed={items:[]}, src=localStorage.src||'All', LB={all:[],hues:{}};  // labels shared with Task Manager and the Library
+const SRCS=['All','arXiv','YouTube','GitHub'];
+let feed={items:[]}, src=SRCS.includes(localStorage.src)?localStorage.src:'All', LB={all:[],hues:{}};  // labels shared with Task Manager and the Library
 const hue=s=>LB.hues[s]??[...s].reduce((h,c)=>(h*31+c.charCodeAt(0))%360,7);
 const post=b=>fetch('/api/feed/update',{method:'POST',body:JSON.stringify(b)}).then(load);
 function ago(s){if(!s)return 'never';const m=Math.round((Date.now()-new Date(s))/6e4);
@@ -1963,7 +2169,7 @@ function card(x){
   d.innerHTML=`<div class=score></div><div class=body><a class=title target=_blank></a>
     <div class=meta><span class=src></span> · <span class=by></span><span class=chips></span><input class=addl list=labels placeholder="+ label" title="Labels are shared with Task Manager and the Library"></div><div class=why></div>
     <details><summary>Details</summary><p></p></details></div>
-    <div class=acts><button title="More like this">👍</button><button title="Less like this">👎</button><button title="Save">☆</button><button title="Add to Task Manager as a reading task">📌</button></div>`;
+    <div class=acts><button title="More like this">👍</button><button title="Less like this">👎</button><button title="Move to the Library">📚</button><button title="Hide (doesn't affect ranking)">✕</button><button title="Add to Task Manager as a reading task">📌</button></div>`;
   const $=s=>d.querySelector(s);
   const sc=$('.score');sc.textContent=x.score==null?'·':Math.round(x.score);
   sc.title=x.score==null?'Not ranked yet (Argo unreachable?)':'Score '+x.score;
@@ -1978,21 +2184,21 @@ function card(x){
     c.append(r);$('.chips').append(c)}
   const al=$('.addl');al.onchange=()=>{const v=al.value.trim();if(v)post({id:x.id,labels:[...ls,v]})};
   if(x.text)$('details p').textContent=x.text;else $('details').remove();
-  const [up,down,save,task]=d.querySelectorAll('.acts button');
+  const [up,down,save,hide,task]=d.querySelectorAll('.acts button');
+  hide.onclick=()=>post({id:x.id,hidden:true,read:true});  // hidden, but not sent to Argo as a dislike
   task.classList.toggle('on',!!x.task);if(x.task)task.title='Added to Task Manager';
   task.onclick=()=>x.task||fetch('/api/feed/task',{method:'POST',body:JSON.stringify({id:x.id})}).then(load);
-  up.classList.toggle('on',x.vote>0);down.classList.toggle('on',x.vote<0);save.classList.toggle('on',x.saved);
-  if(x.saved)save.textContent='★';
+  up.classList.toggle('on',x.vote>0);down.classList.toggle('on',x.vote<0);
   up.onclick=()=>post({id:x.id,vote:x.vote>0?0:1});down.onclick=()=>post({id:x.id,vote:x.vote<0?0:-1,read:true});
-  save.onclick=()=>post({id:x.id,saved:!x.saved});
+  save.onclick=()=>fetch('/api/feed/library',{method:'POST',body:JSON.stringify({id:x.id})}).then(load);
   return d;
 }
 function render(){
   srcs.replaceChildren(...SRCS.map(s=>{const b=document.createElement('button');b.textContent=s;b.className=s===src?'on':'';
     b.onclick=()=>{src=s;localStorage.src=s;render()};return b}));
   const words=q.value.toLowerCase().split(/\s+/).filter(Boolean);
-  const shown=feed.items.filter(x=>(src==='All'||(src==='Saved'?x.saved:x.src===src))
-    &&(src==='Saved'||(x.vote>=0&&(low.checked||x.score==null||x.score>=5)))
+  const shown=feed.items.filter(x=>!x.saved&&!x.hidden&&(src==='All'||x.src===src)
+    &&x.vote>=0&&(low.checked||x.score==null||x.score>=5)
     &&words.every(w=>[x.title,x.by,x.text,x.why,...(x.labels||[])].join(' ').toLowerCase().includes(w)))
     .sort((a,b)=>((b.score??4.5)-(a.score??4.5))||b.date.localeCompare(a.date));
   list.replaceChildren(...shown.slice(0,300).map(card));
@@ -2078,11 +2284,11 @@ aform.onsubmit=async e=>{
   for(const u of urls){
     const row=document.createElement('div');row.className='alog';row.textContent=`Reading ${u}…`;a_log.append(row);
     const r=await fetch('/api/feed/add',{method:'POST',body:JSON.stringify({url:u})}),j=await r.json();
-    if(r.ok)row.textContent=(j.existing?'★ Already in Scout, now saved: ':'★ Saved: ')+j.title;
+    if(r.ok)row.textContent=(j.existing?'📚 Already in the Library: ':'📚 Added to the Library: ')+j.title;
     else{row.textContent=`⚠︎ ${u}: ${j.error}`;row.classList.add('bad');bad.push(u)}
   }
   a_save.disabled=false;a_urls.value=bad.join('\n');
-  src='Saved';localStorage.src=src;load();setTimeout(load,10000);  // Argo's score lands a few seconds later
+  src='All';localStorage.src=src;load();setTimeout(load,10000);  // Argo's score lands a few seconds later
   if(!bad.length)setTimeout(()=>adddlg.close(),1200);
 };
 p_cancel.onclick=()=>discard()&&prefs.close();
@@ -2320,7 +2526,7 @@ const I={folder:SVG('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0
   copy:SVG('<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>'),
   x:SVG('<path d="M6 6l12 12M18 6 6 18"/>')};
 const SORTS={recent:'Recent',name:'Name',added:'Added'};
-let lib={groups:[],labels:{},items:[]}, st={busy:[]}, rev=0, trev=0, dragId=null, others=[];  // others: labeled tasks + Scout items
+let lib={groups:[],labels:{},items:[]}, st={busy:[]}, rev=0, trev=0, dragId=null, others=[];  // others: labeled tasks
 let sel=localStorage.libsel||'all', ty=localStorage.libty||'', sort=localStorage.libsort||'recent';
 if(sel.startsWith('g:')){ty=sel.slice(2);sel='all'}  // from before groups became types
 const hue=s=>[...s].reduce((h,c)=>(h*31+c.charCodeAt(0))%360,7);  // same colours as Task Manager labels
@@ -2336,13 +2542,13 @@ const meta=b=>api('/api/library/meta',b);
 const allLabels=()=>[...new Set([...Object.keys(lib.labels),...lib.items.flatMap(x=>x.labels),...others.flatMap(x=>x.labels)])].sort((a,b)=>a.localeCompare(b));
 const KIND={arXiv:'paper',YouTube:'video',GitHub:'repo',Link:'link'};
 const KICON={email:'✉︎',task:'✓',paper:'📄',video:'▶︎',repo:'⑂',link:'🔗',path:'📁'},KHUE={email:212,task:140,paper:28,video:0,repo:270,link:180,path:212};
-function mini(x){  // a task, email, Scout item or found file, in the Library's label view and search answers
+function mini(x){  // a task, email or found file, in the Library's label view and search answers
   const d=el('div','c mini'+(x.sub.endsWith('· done')?' done':''));
   const ico=el('div','ico',KICON[x.kind]||'•');ico.style.setProperty('--h',KHUE[x.kind]??212);
   const b=el('div','body'),t=el(x.url?'a':'div','title',x.title);t.title=x.title;if(x.url){t.href=x.url;t.target='_blank'}
   const m=el('div','meta');m.append(el('span','kind',x.kind==='path'?'On disk':x.kind));
   const sub=el('span',x.kind==='path'?'path':'sub',x.kind==='path'?'\u200e'+x.sub.replace(/^\/Users\/[^/]+/,'~')+'\u200e':x.sub);sub.title=x.sub;
-  const up=labels=>api(x.ref.startsWith('task:')?`/api/todo/${x.id}/update`:'/api/feed/update',x.ref.startsWith('task:')?{labels}:{id:x.id,labels});
+  const up=labels=>api(`/api/todo/${x.id}/update`,{labels});
   for(const l of x.labels){const c=el('span','chip',l);c.style.setProperty('--h',lhue(l));c.title='Show everything with this label';c.onclick=()=>go('l:'+l);
     const r=el('b',0,'×');r.title='Remove label';r.onclick=e=>{e.stopPropagation();up(x.labels.filter(y=>y!==l))};c.append(r);m.append(c)}
   if(x.kind!=='path'){const al=el('input','addl');al.setAttribute('list','labels');al.placeholder='+ label';al.onchange=()=>al.value.trim()&&up([...x.labels,al.value.trim()]);m.append(al)}
@@ -2355,7 +2561,7 @@ function mini(x){  // a task, email, Scout item or found file, in the Library's 
   d.append(ico,b,side);return d;
 }
 // Two filters that combine: sel (all items / a label / missing) and ty (a type, '' = any)
-const OTYPE={email:'Emails',task:'Tasks',paper:'Papers',video:'Videos',repo:'Code',link:'Websites'};  // tasks and Scout items as types
+const OTYPE={email:'Emails',task:'Tasks',paper:'Papers',video:'Videos',repo:'Code',link:'Websites'};  // tasks, and what Argo's search finds, as types
 const typeOf=x=>x.ref?OTYPE[x.kind]:x.group||'No type';
 const inScope=x=>sel==='all'||(sel==='missing'?x.missing:x.labels.includes(sel.slice(2)));
 const matches=x=>inScope(x)&&(!ty||typeOf(x)===ty);
@@ -2384,7 +2590,7 @@ function renderNav(){
   const scope=[...it,...sel.startsWith('l:')?others:[]].filter(inScope),tn=t=>scope.filter(x=>typeOf(x)===t).length;
   section(out,'Types',[...lib.groups,'Emails','Tasks','No type'].filter(t=>tn(t)||t===ty).map(t=>navBtn('t:'+t,t,tn(t)||'')));
   const ls=allLabels();
-  const n=l=>[...it,...others].filter(x=>x.labels.includes(l)).length||'';  // a label view shows tasks and Scout items too
+  const n=l=>[...it,...others].filter(x=>x.labels.includes(l)).length||'';  // a label view shows tasks too
   if(ls.length)section(out,'Labels',ls.map(l=>navBtn('l:'+l,l,n(l),lhue(l))));
   const miss=it.filter(x=>x.missing).length;if(miss)section(out,'Needs attention',[navBtn('missing','Missing on disk',miss)]);
   const e=el('button','linkbtn','Edit types & labels…');e.onclick=openManage;out.push(el('div'),e);
@@ -2445,9 +2651,9 @@ function render(){
     .sort((a,b)=>{const p=key(a),r=key(b);return p<r?-1:p>r?1:0});
   const lab=sel.startsWith('l:')&&sel.slice(2);
   const more=lab?others.filter(x=>matches(x)&&words.every(w=>[x.title,x.sub,...x.labels].join(' ').toLowerCase().includes(w))):[];
-  const files=shown,tasks=more.filter(x=>x.ref.startsWith('task:')),scout=more.filter(x=>x.ref.startsWith('feed:'));
+  const files=shown,tasks=more;
   list.replaceChildren(...(more.length&&files.length?[el('h3',0,'In the Library')]:[]),...files.slice(0,400).map(card),
-    ...(tasks.length?[el('h3',0,'Tasks & emails'),...tasks.map(mini)]:[]),...(scout.length?[el('h3',0,'From Scout'),...scout.map(mini)]:[]));
+    ...(tasks.length?[el('h3',0,'Tasks & emails'),...tasks.map(mini)]:[]));
   if(!shown.length&&!more.length){const e=el('div','empty');
     e.innerHTML=lib.items.length?(st.configured?'Nothing matches. Press <b>Enter</b> to have Argo look for it.':'Nothing matches.'):'Your Library is empty.<br>Click <b>+ Add</b> to choose folders, files or docs, or drag them in from Finder.';list.append(e)}
   stats.textContent=`${lib.items.length} item${lib.items.length===1?'':'s'}`+(shown.length+more.length!==lib.items.length?` · ${shown.length+more.length} shown`:'');
@@ -2540,7 +2746,7 @@ q.onkeydown=async e=>{
   if(e.key==='Enter'&&v&&(wordy(v)||!list.querySelector('.c'))){
     if(!st.configured)return v.endsWith('?')&&answer('Argo is off. Set your Argo username in Settings to ask questions.');
     asking?.abort();asking=new AbortController();
-    answer('✨ Argo is searching your Library, tasks, Scout and Spotlight…  (Esc cancels)');
+    answer('✨ Argo is searching your Library, tasks and Spotlight…  (Esc cancels)');
     const r=await fetch('/api/library/ask',{method:'POST',body:JSON.stringify({q:v}),signal:asking.signal}).catch(()=>null);
     if(!r)return;  // cancelled
     if(!r.ok)return answer('Argo is unavailable right now (down, or not on VPN). The list below is a plain text search.');
@@ -2556,6 +2762,7 @@ if __name__ == "__main__":
         d.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=watcher, daemon=True).start()
     threading.Thread(target=scout_loop, daemon=True).start()
+    threading.Thread(target=agents_loop, daemon=True).start()
     print(f"Survey Corps on {ORIGIN}  (data in {DATA}, Finder fallback inbox: {INBOX})")
     if "--no-browser" not in sys.argv:  # the Mac app passes this and shows its own window
         subprocess.run(["open", "-a", "Safari", ORIGIN])  # Chromium browsers drop Outlook drags
