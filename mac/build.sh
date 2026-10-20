@@ -6,6 +6,7 @@ B=build; APP="$B/Survey Corps.app"
 rm -rf "$B"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$B/AppIcon.iconset"
 
 swiftc -O "$PWD/SurveyCorps.swift" -o "$APP/Contents/MacOS/SurveyCorps"
+cp blade.wav "$APP/Contents/Resources/"  # Levi's sound, made by blade.py
 
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

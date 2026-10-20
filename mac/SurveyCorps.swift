@@ -781,6 +781,9 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         b.onClick = { NSApp.activate(ignoringOtherApps: true); p.window?.makeKeyAndOrderFront(nil) }
         b.show(title, text, over: p.panel)
         p.view.play(ok ? .hop : .shake)
+        if !pref("petsMute") {  // each pet has its own voice; a low thud when something failed
+            NSSound(named: ok ? ["task": "Glass", "scout": "Pop", "library": "Bottle", "levi": "blade"][kind] ?? "Tink" : "Funk")?.play()
+        }
     }
 
     // Drop onto a pet: emails/text -> a task, a link -> Scout and the Library, files/folders -> the Library.
@@ -899,6 +902,9 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         let all = NSMenuItem(title: "All Pets", action: nil, keyEquivalent: ""), sub = NSMenu()
         sub.autoenablesItems = false
         sub.addItem(Item("Line Up Here") { self.lineUp(near: kind) })
+        let sound = Item("Sounds") { self.flip("petsMute") }
+        sound.state = pref("petsMute") ? .off : .on
+        sub.addItem(sound)
         for (title, key) in [("Keep Lined Up", "petsLinedUp"), ("Tuck Into the Edge When the Mouse Is Away", "petsTuck")] {
             let i = Item(title) {
                 self.flip(key)
