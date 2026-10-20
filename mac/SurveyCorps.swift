@@ -9,6 +9,7 @@ let base = URL(string: "http://127.0.0.1:8765")!
 let feedURL = base.appendingPathComponent("feed")
 let libURL = base.appendingPathComponent("library")
 let settingsURL = base.appendingPathComponent("settings")
+let leviURL = base.appendingPathComponent("levi")
 let petSize: CGFloat = 112  // pet panel size in points: a 96 pt pet plus room to hop and lean
 
 // POST to app.py; done runs on the main thread with the body and status (0 = server unreachable).
@@ -545,11 +546,11 @@ class BubbleView: NSView {
 }
 
 class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
-    var window: NSWindow!, feedWindow: NSWindow!, libWindow: NSWindow!, settingsWindow: NSWindow!
+    var window: NSWindow!, feedWindow: NSWindow!, libWindow: NSWindow!, settingsWindow: NSWindow!, leviWindow: NSWindow!
     var pets: [String: (panel: NSPanel, view: PetView, window: NSWindow?)] = [:]  // "task", "scout", "library", "levi"
     var bubbles: [String: Bubble] = [:], lastBubble = 0
     var review: [[String: Any]] = [], routines: [[String: String]] = [], agents: [[String: Any]] = []
-    var feedWeb: WKWebView!, libWeb: DropWebView!, settingsWeb: WKWebView!
+    var feedWeb: WKWebView!, libWeb: DropWebView!, settingsWeb: WKWebView!, leviWeb: WKWebView!
     let server = Process()
 
     @objc func openSettings() {  // Survey Corps > Settings… (⌘,): its own window, like any Mac app
@@ -624,21 +625,33 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         libWindow.isReleasedWhenClosed = false
         libWeb.load(URLRequest(url: libURL))
 
+        // Levi window: starts hidden, shown by Levi; session links (claude://, codex://, vscode://) open via createWebViewWith
+        leviWeb = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        leviWeb.navigationDelegate = self
+        leviWeb.uiDelegate = self
+        leviWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 640),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        leviWindow.title = "Coding Sessions"
+        leviWindow.minSize = NSSize(width: 520, height: 320)
+        leviWindow.contentView = leviWeb
+        leviWindow.center()
+        leviWindow.setFrameAutosaveName("levi")
+        leviWindow.isReleasedWhenClosed = false
+        leviWeb.load(URLRequest(url: leviURL))
+
         let all: [(String, NSWindow?, String)] = [("task", window, "Task Manager"), ("scout", feedWindow, "Scout: new papers, videos and repos"),
                                                   ("library", libWindow, "Library: your projects, files and docs"),
-                                                  ("levi", nil, "Levi: your Claude Code and Codex sessions")]
+                                                  ("levi", leviWindow, "Levi: your Claude Code and Codex sessions")]
         for (i, (kind, w, tip)) in all.enumerated() {
             let v = PetView()
             v.scout = kind == "scout"; v.librarian = kind == "library"; v.levi = kind == "levi"
             v.frameName = ["task": "pet", "scout": "scoutPet", "library": "libPet", "levi": "leviPet"][kind]!
             if kind == "scout" { v.badgeColor = .systemBlue }
             if let w {
-                v.toolTip = tip + ". Click to show/hide, drag to move, drop things on it, right-click for more"
+                v.toolTip = tip + (kind == "levi" ? ". Click to show/hide, drag to move, right-click for the active ones"
+                                                  : ". Click to show/hide, drag to move, drop things on it, right-click for more")
                 v.onClick = { [unowned self] in self.toggle(w) }
-                v.onDrop = { [unowned self] in self.drop(kind, $0) }
-            } else {
-                v.toolTip = tip + ". Click for the list, drag to move"
-                v.onClick = { [unowned self, unowned v] in self.menu(kind).popUp(positioning: nil, at: NSPoint(x: v.bounds.maxX + 4, y: v.bounds.maxY), in: v) }  // beside him, not over him
+                if kind != "levi" { v.onDrop = { [unowned self] in self.drop(kind, $0) } }
             }
             v.makeMenu = { [unowned self] in self.menu(kind) }
             pets[kind] = (makePet(v, offset: 26 + CGFloat(i) * (petSize + 4)), v, w)
@@ -771,9 +784,11 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
                 review.forEach { m.addItem(reviewItem($0)) }
                 m.addItem(Item("Keep All") { for r in self.review { post("api/todo/\(r["id"] as? String ?? "")/keep") { _, _ in self.poll() } } })
             }
-        case "levi":  // Claude Code and Codex sessions on this Mac (hooks/ in the repo)
-            m.addItem(Item(agents.isEmpty ? "No coding agents running" : "Coding agents:", enabled: false))
-            for a in agents {
+        case "levi":  // the active sessions (working, waiting, still cached); the window has them all
+            let now = Date().timeIntervalSince1970
+            let live = agents.filter { $0["state"] as? String != "idle" || ($0["until"] as? Double ?? 0) > now }
+            m.addItem(Item(live.isEmpty ? "No active sessions" : "Active sessions:", enabled: false))
+            for a in live {
                 let mins = a["mins"] as? Int ?? 0, ago = mins < 1 ? "just now" : mins < 60 ? "\(mins)m" : "\(mins / 60)h"
                 let cache = (a["cache"] as? Int).map { $0 > 0 ? "  ·  cache \($0)m left" : "  ·  cache expired" } ?? ""
                 let open = URL(string: a["open"] as? String ?? "")  // claude:// or codex:// session link, or the terminal's app
@@ -847,7 +862,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
 
     // server takes a moment to start; keep retrying
     func webView(_ w: WKWebView, didFailProvisionalNavigation n: WKNavigation!, withError e: Error) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.load(URLRequest(url: w === self.feedWeb ? feedURL : w === self.libWeb ? libURL : w === self.settingsWeb ? settingsURL : base)) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.load(URLRequest(url: w === self.feedWeb ? feedURL : w === self.libWeb ? libURL : w === self.settingsWeb ? settingsURL : w === self.leviWeb ? leviURL : base)) }
     }
 
     func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool {

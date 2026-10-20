@@ -396,7 +396,7 @@ def agent_event(e, tool="cc", pid=0, host=""):
         return
     if sid not in cc:
         cwd = e.get("cwd") or ""
-        cc[sid] = {"cwd": cwd, "state": "", "since": 0, "pid": 0 if host else pid,
+        cc[sid] = {"cwd": cwd, "state": "", "since": 0, "pid": 0 if host else pid, "host": host,
                    "tool": remote_tool(host) if host else "Claude Code", "open": remote_open(host, cwd) if host else app_of(pid)}
     a = cc[sid]
     if a["state"] != CC_STATE[ev]:
@@ -509,7 +509,7 @@ def desktop_session(cli_id):
 
 
 def codex_threads(since):
-    """[(id, title, rollout path, last active ms)]: your unarchived Codex threads active since `since`
+    """[(id, title, cwd, rollout path, last active ms)]: your unarchived Codex threads active since `since`
     (not Codex's own Guardian-review subthreads). [] if Codex isn't installed or its schema changed."""
     dbs = sorted(CODEX.glob("state_*.sqlite"), key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
     if not dbs:
@@ -517,7 +517,7 @@ def codex_threads(since):
     try:
         db = sqlite3.connect(f"file:{dbs[-1]}?mode=ro", uri=True)
         try:
-            return db.execute("select id, coalesce(nullif(name, ''), nullif(title, ''), cwd), rollout_path,"
+            return db.execute("select id, coalesce(nullif(name, ''), nullif(title, ''), cwd), cwd, rollout_path,"
                               " max(updated_at_ms, recency_at_ms) as ms from threads"
                               " where thread_source = 'user' and archived = 0 and ms > ?", (since * 1000,)).fetchall()
         finally:
@@ -536,60 +536,59 @@ def alive(pid):
     return True
 
 
+def row(now, tool, where, state, age, open_, host, cwd, sid="", until=0):
+    """One session for Levi. host: "user@host" if remote; until: when its prompt cache runs out (shown when idle)."""
+    return {"tool": tool, "where": where, "state": state, "mins": int(age) // 60, "open": open_,
+            "host": host.split("@")[-1].split(".")[0], "dir": cwd,
+            **({"cache": max(0, int(until - now)) // 60, "id": sid, "until": until}
+               if until and state != "working" else {})}
+
+
 def agents(now=None):
-    """[{"tool", "where", "state", "mins", "cache"?}] (cache: minutes left on an idle session's prompt cache).
-    Claude Code sessions with hooks are exact; other Claude sessions (the desktop app's, or ones started before the
-    hooks) and Codex threads come from their logs: active within WINDOW, working = written in the last minute."""
+    """[row()]: Claude Code sessions with hooks are exact; other Claude sessions (the desktop app's, or ones started
+    before the hooks, or since this server started, on remote hosts) and Codex threads come from their logs:
+    active within WINDOW, working = written in the last minute. Hooked rows still take title and folder from the log."""
     now = now or time.time()
     for sid in [s for s, a in cc.items() if a["pid"] and not alive(a["pid"])]:
         cc.pop(sid, None)  # closed without SessionEnd (killed terminal, crash)
     for sid in [s for s, a in cc.items() if not a["pid"] and a["state"] != "working" and now - a["since"] > WINDOW]:
         cc.pop(sid, None)  # remote: no pid to check, so one quiet for WINDOW is taken as gone
-    out = [{"tool": a.get("tool", "Claude Code"), "where": Path(a["cwd"]).name, "state": a["state"], "mins": int(now - a["since"]) // 60,
-            "open": a.get("open", ""),
-            **({"cache": max(0, int(a["cached_until"] - now) // 60), "id": sid, "until": a["cached_until"]}
-               if a.get("cached_until") and a["state"] != "working" else {})}
-           for sid, a in cc.items()]
+    logs = {}  # session id -> (transcript_info, mtime, "user@host" or "")
     for p in CLAUDE.glob("*/*.jsonl"):  # every Claude Code session, desktop app included
         try:
             mtime = p.stat().st_mtime
         except OSError:
             continue
-        if now - mtime > WINDOW or p.stem in cc or p.stem in cc_ended:
-            continue  # stale, tracked more precisely by hooks, or closed
+        if now - mtime > WINDOW:
+            continue
         if transcripts.get(p, (0,))[0] != mtime:
             transcripts[p] = (mtime, transcript_info(p))
-        t = transcripts[p][1]
-        age = now - (t["last"] or mtime)
-        if t["entry"].startswith("sdk") or age > WINDOW:
-            continue  # `claude -p` and scripted runs (one-shot, nothing to come back to), or only opened, not used
-        dk = desktop_session(p.stem) if t["entry"] == "claude-desktop" else {}
-        out.append({"tool": "Claude app" if t["entry"] == "claude-desktop" else "Claude Code",
-                    "where": dk.get("title") or t["title"] or Path(t["cwd"]).name or p.parent.name,
-                    "state": "working" if age < 60 else "idle",
-                    "open": f"claude://claude.ai/epitaxy/{dk['id']}" if dk else "",
-                    "mins": int(age) // 60,
-                    **({"cache": max(0, int(t["cached_until"] - now) // 60), "id": p.stem, "until": t["cached_until"]}
-                       if t["cached_until"] and age >= 60 else {})})
-    seen = set()  # hosts sharing a home (NFS) list the same transcripts
-    for target, found in remote.items():  # ponytail: shared home -> labelled with the first host, which may not be where it ran
+        logs[p.stem] = (transcripts[p][1], mtime, "")
+    for target, found in remote.items():  # ponytail: hosts sharing a home (NFS) list the same logs; the first host's name wins
         for t in found:
-            age = now - (t["last"] or t["mtime"])
-            if t["id"] in cc or t["id"] in cc_ended or t["id"] in seen or t["entry"].startswith("sdk") or age > WINDOW:
-                continue
-            seen.add(t["id"])
-            out.append({"tool": remote_tool(target), "where": t["title"] or Path(t["cwd"]).name or "?",
-                        "state": "working" if age < 60 else "idle", "open": remote_open(target, t["cwd"]),
-                        "mins": int(age) // 60,
-                        **({"cache": max(0, int(t["cached_until"] - now) // 60), "id": t["id"], "until": t["cached_until"]}
-                           if t["cached_until"] and age >= 60 else {})})
-    for tid, name, rollout, ms in codex_threads(now - WINDOW):
+            logs.setdefault(t["id"], (t, t["mtime"], target))
+    out = []
+    for sid, a in cc.items():
+        t, host = logs.get(sid, ({}, 0, ""))[0], a.get("host", "")
+        cwd = t.get("cwd") or a["cwd"]  # where it started: a session can cd away
+        out.append(row(now, a.get("tool", "Claude Code"), t.get("title") or Path(cwd).name, a["state"], now - a["since"],
+                       remote_open(host, cwd) if host else a.get("open", ""), host, cwd, sid,
+                       a.get("cached_until") or t.get("cached_until", 0)))
+    for sid, (t, mtime, host) in logs.items():
+        age = now - (t["last"] or mtime)
+        if sid in cc or sid in cc_ended or t["entry"].startswith("sdk") or age > WINDOW:
+            continue  # tracked by hooks, closed, `claude -p` and scripted runs, or only opened, not used
+        dk = desktop_session(sid) if t["entry"] == "claude-desktop" else {}
+        out.append(row(now, remote_tool(host) if host else "Claude app" if t["entry"] == "claude-desktop" else "Claude Code",
+                       dk.get("title") or t["title"] or Path(t["cwd"]).name or "?", "working" if age < 60 else "idle", age,
+                       remote_open(host, t["cwd"]) if host else f"claude://claude.ai/epitaxy/{dk['id']}" if dk else "",
+                       host, t["cwd"], sid, t["cached_until"]))
+    for tid, name, cwd, rollout, ms in codex_threads(now - WINDOW):
         try:
             last = max(ms / 1000, Path(rollout).stat().st_mtime)  # the log moves while a turn runs
         except (OSError, TypeError):
             last = ms / 1000
-        out.append({"tool": "Codex", "where": name, "state": "working" if now - last < 60 else "idle",
-                    "open": f"codex://threads/{tid}", "mins": int(now - last) // 60})
+        out.append(row(now, "Codex", name, "working" if now - last < 60 else "idle", now - last, f"codex://threads/{tid}", "", cwd or ""))
     order = {"waiting": 0, "working": 1}
     return sorted(out, key=lambda a: (order.get(a["state"], 2), a["mins"]))
 
@@ -1504,6 +1503,10 @@ class H(BaseHTTPRequestHandler):
             self.reply(200, SETTINGS_PAGE.encode(), "text/html; charset=utf-8")
         elif self.path == "/library":
             self.reply(200, LIB_PAGE.encode(), "text/html; charset=utf-8")
+        elif self.path == "/levi":
+            self.reply(200, LEVI_PAGE.encode(), "text/html; charset=utf-8")
+        elif self.path == "/api/agents":
+            self.reply(200, json.dumps(agents()).encode())
         elif self.path == "/api/library":
             with lib_lock:
                 lib = load_lib()
@@ -2465,6 +2468,97 @@ $('test').onclick=async()=>{
   res.textContent=!st.configured?'No username set':st.argo?'Argo is reachable':'Unreachable: Argo is down, or you are off VPN';
 };
 window.onfocus=load;load();
+</script>"""
+
+
+LEVI_PAGE = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width"><title>Coding Sessions</title>
+<style>
+:root{color-scheme:light dark;--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--muted:#6e6e73;--line:#e2e2e7;--hover:#f0f0f4;
+  --accent:#0a84ff;--green:#1f9d55;--purple:#8e44ef;--red:#d70015}
+@media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2a2a2d;--text:#f2f2f7;--muted:#98989f;--line:#3a3a3d;
+  --hover:#323236;--green:#34c759;--purple:#bf8cff;--red:#ff6961}}
+*{box-sizing:border-box}
+body{font:13.5px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;margin:0;background:var(--bg);color:var(--text)}
+button,input{font:inherit;color:inherit}
+header{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 85%,transparent);backdrop-filter:blur(12px);
+  padding:14px 20px 10px;border-bottom:1px solid var(--line)}
+.top{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}h1{font-size:20px;margin:0}#stats{color:var(--muted)}
+.bar{display:flex;gap:8px;align-items:center}
+.bar input{flex:1;min-width:160px;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 10px;outline:none}
+.bar input:focus{border-color:var(--accent);box-shadow:0 0 0 3px #0a84ff33}
+.seg{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{border:0;background:var(--card);padding:6px 12px;cursor:pointer}.seg .on{background:var(--accent);color:#fff}
+main{padding:4px 20px 40px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:20px 0 4px;font-weight:600}
+h3{font-size:13px;margin:12px 0 2px;font-weight:600;display:flex;gap:8px;align-items:baseline}
+h3 span{font-weight:400;color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl}
+a.c{display:flex;gap:10px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 12px;
+  margin:5px 0;color:inherit;text-decoration:none}
+a.c[href]:hover{background:var(--hover)}a.c:not([href]){cursor:default}
+.dot{flex:none;width:9px;height:9px;border-radius:50%;background:var(--line)}
+.working .dot{background:var(--green);animation:pulse 1.4s infinite}.waiting .dot{background:var(--purple)}
+@keyframes pulse{50%{opacity:.35}}
+.t{flex:1;min-width:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tool{flex:none;font-size:11.5px;color:var(--muted);border:1px solid var(--line);border-radius:10px;padding:0 7px}
+.st{flex:none;width:96px;text-align:right;color:var(--muted);font-size:12px}.working .st{color:var(--green)}.waiting .st{color:var(--purple)}
+.cache{flex:none;width:110px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums;color:var(--muted)}
+.cache.warm{color:var(--green)}.cache.low{color:var(--red);font-weight:600}
+details summary{cursor:pointer;color:var(--muted);font-size:12.5px;margin:12px 0 4px;user-select:none}
+.earlier a.c{opacity:.75}.earlier .t{font-weight:500}
+.empty{text-align:center;color:var(--muted);padding:60px 0;font-size:15px}
+</style>
+<header><div class=top><h1>Coding Sessions</h1><span id=stats></span></div>
+<div class=bar><input id=q placeholder="Search sessions" autocomplete=off>
+<div class=seg><button data-f=active class=on>Active</button><button data-f=all>All</button></div></div></header>
+<main id=list></main>
+<script>
+let rows = [], filter = "active", openEarlier = new Set()
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c])
+const ago = m => m < 1 ? "just now" : m < 60 ? m + "m" : Math.floor(m / 60) + "h"
+// active: doing something, needs you, still cached, or used in the last hour
+const active = a => a.state != "idle" || (a.until || 0) * 1000 > Date.now() || a.mins < 60
+function cache(a) {
+  if (!a.until) return ""
+  const left = a.until * 1000 - Date.now()
+  if (left <= 0) return `<span class=cache>cache expired</span>`
+  const m = Math.floor(left / 60000), s = Math.floor(left / 1000) % 60
+  return `<span class="cache ${left <= 300000 ? "low" : "warm"}">cache ${m}:${String(s).padStart(2, "0")}</span>`
+}
+const card = a => `<a class="c ${a.state}" ${a.open ? `href="${esc(a.open)}" target=_blank` : ""} title="${esc(a.dir)}">
+  <i class=dot></i><span class=t>${esc(a.where)}</span><span class=tool>${esc(a.tool.replace(/ @.*/, ""))}</span>
+  <span class=st>${a.state == "idle" ? "idle " + ago(a.mins) : a.state}</span>${cache(a) || "<span class=cache></span>"}</a>`
+function byFolder(list) {
+  const g = {}
+  for (const a of list) (g[a.dir || "?"] ??= []).push(a)
+  return Object.entries(g).map(([dir, l]) =>
+    `<h3>${esc(dir.split("/").filter(Boolean).pop() || dir)}<span><bdi>${esc(dir)}</bdi></span></h3>${l.map(card).join("")}`).join("")
+}
+function render() {
+  const q = document.getElementById("q").value.toLowerCase()
+  const shown = rows.filter(a => !q || (a.where + " " + a.dir + " " + a.tool).toLowerCase().includes(q))
+  const hosts = {}
+  for (const a of shown) (hosts[a.host || ""] ??= []).push(a)
+  const names = Object.keys(hosts).sort((x, y) => (x != "") - (y != "") || x.localeCompare(y))
+  document.getElementById("list").innerHTML = names.map(h => {
+    const now = hosts[h].filter(active), old = hosts[h].filter(a => !active(a))
+    const earlier = !old.length ? "" : filter == "all" || q ? byFolder(old) :
+      `<details class=earlier data-h="${esc(h)}" ${openEarlier.has(h) ? "open" : ""}><summary>Earlier · ${old.length}</summary>${byFolder(old)}</details>`
+    return `<h2>${esc(h || "This Mac")}</h2>${byFolder(now)}${earlier}`
+  }).join("") || `<div class=empty>${q ? "No sessions match" : "No sessions in the last 12 hours"}</div>`
+  const n = s => rows.filter(a => a.state == s).length
+  document.getElementById("stats").textContent = `${n("working")} working · ${n("waiting")} waiting · ${rows.filter(active).length} active · ${rows.length} today`
+}
+document.getElementById("list").addEventListener("toggle", e => {
+  const h = e.target.dataset.h; if (h == null) return
+  e.target.open ? openEarlier.add(h) : openEarlier.delete(h)
+}, true)
+document.getElementById("q").oninput = render
+document.querySelectorAll(".seg button").forEach(b => b.onclick = () => {
+  filter = b.dataset.f; document.querySelectorAll(".seg button").forEach(x => x.classList.toggle("on", x == b)); render()
+})
+async function load() { try { rows = await (await fetch("/api/agents")).json(); render() } catch (e) {} }
+load(); setInterval(load, 5000)
+setInterval(() => document.querySelector(".cache") && render(), 1000)  // live countdowns
 </script>"""
 
 

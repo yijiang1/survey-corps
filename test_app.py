@@ -195,8 +195,8 @@ db.executemany("insert into threads values (?,?,?,?,?,?,?,?,?)", [
     ("t3", "", "Old idea", "/y/cdx", "", ms, ms, "user", 1),                           # archived
     ("t4", "", "Last week", "/y/cdx", "", ms - 86400_000 * 7, 0, "user", 0)])          # outside the window
 db.commit(); db.close()
-assert app.agents() == [{"tool": "Claude Code", "where": "proj", "state": "working", "mins": 0, "open": app.app_of(os.getpid())},
-                        {"tool": "Codex", "where": "Plan the house", "state": "working", "mins": 0, "open": "codex://threads/t1"}], app.agents()
+assert app.agents() == [{"tool": "Claude Code", "where": "proj", "state": "working", "mins": 0, "open": app.app_of(os.getpid()), "host": "", "dir": "/x/proj"},
+                        {"tool": "Codex", "where": "Plan the house", "state": "working", "mins": 0, "open": "codex://threads/t1", "host": "", "dir": "/y/cdx"}], app.agents()
 assert app.app_of(os.getpid()).startswith("file:///") and app.app_of(os.getpid()).endswith(".app") and app.app_of(1) == ""
 ev("Notification", notification_type="idle_prompt", message="Claude is waiting for your input")
 ev("Notification", message="Claude needs your permission to use Bash")
@@ -232,7 +232,10 @@ assert (info["cwd"], info["title"]) == ("/h/TomoX", "Radiation damage"), info  #
 app.remote = {"me@a.x": [{"id": "rt", "mtime": _t.time(), **info}], "me@b.x": [{"id": "rt", "mtime": _t.time(), **info}]}
 assert [(a["tool"], a["where"], a["state"], a["open"]) for a in app.agents() if "@" in a["tool"]] == [
     ("Claude Code @a", "Radiation damage", "working", "vscode://vscode-remote/ssh-remote+me@a.x/h/TomoX")]
-app.remote = {}
+app.agent_event({"session_id": "rt", "cwd": "/h/talks", "hook_event_name": "Stop"}, "cc", 1, "me@a.x"); _t.sleep(0.2)
+assert [(a["where"], a["host"], a["dir"], a["open"]) for a in app.agents() if "@" in a["tool"]] == [
+    ("Radiation damage", "a", "/h/TomoX", "vscode://vscode-remote/ssh-remote+me@a.x/h/TomoX")]  # hooked: title from the log
+app.remote = {}; app.cc.clear()
 print("ok")
 
 # prompt cache: last API call + the TTL it wrote (1 h or 5 min); shown on idle sessions only
