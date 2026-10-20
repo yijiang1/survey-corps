@@ -176,9 +176,7 @@ def suggest(t, known):
 
 def enrich(t):
     """Background: fill in labels/due on a freshly dropped email, unless the user already set them."""
-    with lock:
-        known = sorted({l for x in load() for l in x.get("labels", [])})
-    s = suggest(t, known)
+    s = suggest(t, all_labels())
     with lock:
         todos = load()
         cur = next((x for x in todos if x["id"] == t["id"]), None)
@@ -672,31 +670,39 @@ def score_one(item_id):
             f = load_feed()
             for y in f["items"]:
                 if y["id"] == item_id:
-                    y["score"], y["why"] = scores[0]
+                    y["score"], y["why"], labels = scores[0]
+                    if labels and not y.get("labels") and y["score"] >= 5:  # never over the user's own labels
+                        y["labels"] = labels
             save_feed(f)
 
 
-def clean_scores(text):
-    """{index: (score 0-10, why)} from the model's JSON array reply. Each {...} is parsed on its own,
+def clean_scores(text, known=()):
+    """{index: (score 0-10, why, labels from `known`)} from the model's JSON array reply. Each {...} is parsed on its own,
     so a reply cut off mid-array still keeps the entries before the cut; malformed ones are dropped."""
     out = {}
     for m in re.finditer(r"\{[^{}]*\}", text or ""):
         try:
             r = json.loads(m.group(0))
-            out[int(r["i"])] = (max(0.0, min(10.0, float(r["score"]))), flat(str(r.get("why", "")), 160))
+            k = {l.lower(): l for l in known}
+            out[int(r["i"])] = (max(0.0, min(10.0, float(r["score"]))), flat(str(r.get("why", "")), 160),
+                                sorted({k[str(l).lower()] for l in r.get("labels") or [] if str(l).lower() in k})[:2])
         except (KeyError, TypeError, ValueError):
             pass
     return out
 
 
 def rank(items, cfg, liked, disliked):
+    known = all_labels()
     lines = "\n".join(f"{i}. [{x['src']}] {x['title']} ({x['by']}): {x['text'][:400]}" for i, x in enumerate(items))
     prompt = (f"My interests: {cfg['scout_profile']}\n"
               + (f"Recently I liked: {'; '.join(liked)}\n" if liked else "")
               + (f"Recently I was NOT interested in: {'; '.join(disliked)}\n" if disliked else "")
               + "Rate how much I'd want to see each item below, 0 (irrelevant) to 10 (must read). Reply with ONLY a JSON "
-              'array: [{"i": <number>, "score": <0-10>, "why": "<why it matters to me, max 15 words>"}]\n\n' + lines)
-    return clean_scores(argo(prompt, 80 * len(items) + 200, tag="scout"))
+              'array: [{"i": <number>, "score": <0-10>, "why": "<why it matters to me, max 15 words>"'
+              + (', "labels": [<0-2 of my labels that clearly fit>]}]\n'
+                 f"My labels: {json.dumps(known)}. Use only these, exactly as written; [] if none clearly fits.\n\n" if known else "}]\n\n")
+              + lines)
+    return clean_scores(argo(prompt, 100 * len(items) + 200, tag="scout"), known)
 
 
 def run_scout():
@@ -767,9 +773,12 @@ def run_scout():
             with feed_lock:
                 f = load_feed()
                 by_id = {x["id"]: x for x in f["items"]}
-                for j, (score, why) in scores.items():
+                for j, (score, why, labels) in scores.items():
                     if 0 <= j < len(batch) and batch[j]["id"] in by_id:
-                        by_id[batch[j]["id"]].update(score=score, why=why)
+                        x = by_id[batch[j]["id"]]
+                        x.update(score=score, why=why)
+                        if labels and not x.get("labels") and score >= 5:  # never over the user's own labels
+                            x["labels"] = labels
                         picks += score >= 8
                 save_feed(f)
         if picks:
@@ -778,7 +787,34 @@ def run_scout():
         scout_busy.release()
 
 
+def relabel_scout():
+    """One-time: labels for items scored (5+) before Scout suggested labels. Keeps their score and why; marks the feed
+    done only once every batch got a reply, so an Argo outage just retries on the next launch."""
+    f = load_feed()
+    if f.get("relabeled") or not all_labels():
+        return
+    todo = [x for x in f["items"] if not x.get("labels") and (x["score"] or 0) >= 5]
+    for i in range(0, len(todo), 25):
+        batch = todo[i:i + 25]
+        scores = rank(batch, {**SCOUT, **config()}, [], [])
+        if not scores:
+            return
+        with feed_lock:
+            f = load_feed()
+            by_id = {x["id"]: x for x in f["items"]}
+            for j, (_, _, labels) in scores.items():
+                x = by_id.get(batch[j]["id"]) if 0 <= j < len(batch) else None
+                if x and labels and not x.get("labels"):
+                    x["labels"] = labels
+            save_feed(f)
+    with feed_lock:
+        f = load_feed()
+        f["relabeled"] = True
+        save_feed(f)
+
+
 def scout_loop():
+    relabel_scout()
     while True:
         hours = {**SCOUT, **config()}["scout_hours"]
         if load_feed()["last"] < (datetime.now() - timedelta(hours=hours)).isoformat(timespec="minutes"):
@@ -786,15 +822,46 @@ def scout_loop():
         time.sleep(600)
 
 
-# ---- Library: local projects, files and docs, with groups and labels; Argo summarizes and files each one ----
-LIB = DATA / "library.json"  # {"groups": [names], "labels": {name: hue}, "items": [...]}
+# ---- Library: local projects, files, docs and links. Type (stored as "group") is what an item is, set automatically;
+# labels are what it's about, shared with tasks and Scout. Argo writes a summary and suggests labels ----
+LIB = DATA / "library.json"  # {"v": 2, "groups": [type names], "labels": {name: hue}, "items": [...]}
+TYPES = ["Folders", "Papers", "Docs", "Slides", "Data", "Code", "Images", "Videos", "Websites", "Other"]
+EXT_TYPE = {e: t for t, es in {
+    "Docs": "doc docx rtf rtfd odt pages txt md markdown rst tex bib",
+    "Slides": "ppt pptx key odp",
+    "Data": "csv tsv xls xlsx numbers h5 hdf5 hdf nxs npy npz mat parquet zarr dat raw",
+    "Code": "py ipynb js ts tsx jsx swift c cc cpp h hpp m r jl sh zsh sql html css json yaml yml toml",
+    "Images": "png jpg jpeg gif tif tiff svg heic bmp webp",
+    "Videos": "mp4 mov m4v avi mkv webm"}.items() for e in es.split()}
+LINK_TYPE = {"arXiv": "Papers", "YouTube": "Videos", "GitHub": "Code", "Link": "Websites"}
+FILES = DATA / "files"  # PDFs added to the Library by link are downloaded here
 lib_lock = threading.Lock()
 TEXT_EXT = set("txt md markdown rst tex bib py ipynb json csv tsv yaml yml toml ini cfg swift js ts tsx jsx html htm css "
                "c h cc cpp hpp m r jl sh zsh sql xml log".split())
 
 
+def auto_type(x):
+    """What a Library item is, from where it points: a link's site, folder vs file, the file's extension."""
+    if x.get("src"):
+        return LINK_TYPE.get(x["src"], "Websites")
+    if x["folder"]:
+        return "Folders"
+    ext = Path(x["path"]).suffix.lower()[1:]
+    if ext == "pdf":  # ponytail: paper vs other PDF by a few telltale words in its first page or two
+        return "Papers" if re.search(r"\babstract\b|\bdoi\b|arxiv|et al\.", x["peek"], re.I) else "Docs"
+    return EXT_TYPE.get(ext, "Other")
+
+
 def load_lib():
-    return json.loads(LIB.read_text()) if LIB.exists() else {"groups": ["Projects", "Papers", "Docs", "Data"], "labels": {}, "items": []}
+    lib = json.loads(LIB.read_text()) if LIB.exists() else {"v": 2, "groups": list(TYPES), "labels": {}, "items": []}
+    if lib.get("v", 1) < 2:  # groups -> automatic types; "Projects" goes (projects are labels now). Kept by the next save
+        old = {"Projects", "Papers", "Docs", "Data", "Code", "Videos", "Websites"}
+        lib["groups"] = TYPES + [g for g in lib["groups"] if g not in old and g not in TYPES]  # the user's own stay
+        for x in lib["items"]:
+            if x["group"] in old or not x["group"]:
+                x["group"] = auto_type(x)
+        lib["v"] = 2
+    return lib
 
 
 def save_lib(lib):
@@ -819,7 +886,13 @@ def peek(p):
         if ext in ("docx", "doc", "rtf", "rtfd", "odt", "webarchive"):
             out = subprocess.run(["textutil", "-convert", "txt", "-stdout", p], capture_output=True, timeout=30).stdout
             return out.decode("utf-8", "replace")[:3000]
-        # ponytail: PDFs and the rest get Spotlight's title/authors only; full text would need PDFKit on the Swift side
+        if ext == "pdf":  # PDFKit through JavaScript for Automation: no compiler or extra package needed
+            out = subprocess.run(["osascript", "-l", "JavaScript", "-e", 'function run(a){ObjC.import("Quartz");'
+                                  'const d=$.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(a[0]));'
+                                  'return d.isNil()?"":d.string.js.slice(0,3000)}', p], capture_output=True, timeout=30).stdout
+            if out.strip():
+                return out.decode("utf-8", "replace").strip()[:3000]
+        # the rest (and scanned PDFs without a text layer): Spotlight's title/authors only
         out = subprocess.run(["mdls", "-name", "kMDItemTitle", "-name", "kMDItemAuthors", "-name", "kMDItemDescription", p],
                              capture_output=True, timeout=10).stdout.decode("utf-8", "replace")
         lines = re.sub(r"\s*kMDItem(\w+) = ", r"\n\1: ", " ".join(out.split())).splitlines()  # "Title: ...", "Authors: ..."
@@ -828,19 +901,50 @@ def peek(p):
         return ""
 
 
-def lib_item(path, group=""):
-    p = Path(path).expanduser().resolve()
-    return {"id": uuid.uuid4().hex[:12], "path": str(p), "name": p.name or str(p), "folder": p.is_dir(),
-            "group": group, "labels": [], "note": "", "summary": "", "peek": peek(p),
-            "added": datetime.now().isoformat(timespec="minutes"), "opened": "",
-            "retry": True}  # cleared once Argo answers, so a quit or crash mid-call still gets retried
+def lib_item(path, group="", link=None):
+    """A Library entry for a path on disk, or (link: a link_item) for a web page, video, paper or repo."""
+    if link:
+        what = {"path": link["url"], "name": link["title"] or link["url"], "folder": False, "src": link["src"],
+                "peek": "\n".join(filter(None, [link["by"], link["date"], link["text"]]))}
+    else:
+        p = Path(path).expanduser().resolve()
+        what = {"path": str(p), "name": p.name or str(p), "folder": p.is_dir(), "peek": peek(p)}
+    x = {"id": uuid.uuid4().hex[:12], **what, "labels": [], "note": "", "summary": "",
+         "added": datetime.now().isoformat(timespec="minutes"), "opened": "",
+         "retry": True}  # cleared once Argo answers, so a quit or crash mid-call still gets retried
+    x["group"] = group or auto_type(x)
+    return x
+
+
+def lib_link(url):
+    """A link_item for a pasted link; a link straight to a PDF is downloaded into data/files and returned as a Path."""
+    url = url if re.match(r"https?://", url) else "https://" + url
+    name = Path(urlparse(url).path).name
+    if name.lower().endswith(".pdf") and "arxiv.org" not in url:  # arXiv PDFs: its abstract page says more
+        data = fetch(url, BROWSER)
+        if not data.startswith(b"%PDF"):
+            raise ValueError("that link didn't return a PDF (sign-in page?)")
+        FILES.mkdir(parents=True, exist_ok=True)
+        p = FILES / name
+        while p.exists() and p.read_bytes() != data:  # same name, different paper
+            p = p.with_name(p.stem + "-1.pdf")
+        p.write_bytes(data)
+        return p
+    return link_item(url)
 
 
 def lib_add(paths, split=False, group=""):
     """Add paths (each subfolder of them instead, with split). Returns (items added, paths skipped with why)."""
     want, skipped = [], []
     for raw in filter(str.strip, paths):
-        p = Path(raw.strip().strip("'\"")).expanduser()  # Finder's "Copy as Pathname" may come quoted
+        r = raw.strip().strip("'\"")  # Finder's "Copy as Pathname" may come quoted
+        if re.match(r"(?:https?://|www\.|youtu\.be/)", r):
+            try:
+                want.append(lib_link(r))
+            except Exception as e:
+                skipped.append(f"{r}: couldn't read that link ({e})")
+            continue
+        p = Path(r).expanduser()
         if not p.exists():
             skipped.append(f"{raw.strip()}: not found")
         elif split and p.is_dir():
@@ -852,10 +956,11 @@ def lib_add(paths, split=False, group=""):
         have = {x["path"] for x in lib["items"]}
         new = []
         for p in want:
-            if str(p.resolve()) in have:
-                skipped.append(f"{p.name}: already in the Library")
+            link = p if isinstance(p, dict) else None
+            if (link["url"] if link else str(p.resolve())) in have:
+                skipped.append(f"{link['title'] if link else p.name}: already in the Library")
             else:
-                new.append(lib_item(p, group))
+                new.append(lib_item(p, group, link))
                 have.add(new[-1]["path"])
         lib["items"] = new + lib["items"]
         if group and group not in lib["groups"]:
@@ -866,33 +971,32 @@ def lib_add(paths, split=False, group=""):
     return new, skipped
 
 
-def clean_lib_suggestion(text, groups):
-    """{"summary", "group", "labels"} from the model's reply; a group it made up is dropped."""
+def clean_lib_suggestion(text):
+    """{"summary", "labels"} from the model's reply."""
     m = re.search(r"\{.*\}", text or "", re.S)
     try:
         d = json.loads(m.group(0)) if m else {}
     except ValueError:
         return {}
     labels = [str(x).strip() for x in d.get("labels") or [] if 0 < len(str(x).strip()) <= 24][:3]
-    group = next((g for g in groups if g.lower() == str(d.get("group") or "").strip().lower()), "")
-    return {"summary": flat(str(d.get("summary") or ""), 300), "group": group, "labels": labels}
+    return {"summary": flat(str(d.get("summary") or ""), 300), "labels": labels}
 
 
 def lib_enrich(item_id):
-    """Background: Argo's one-line summary, group and labels for a new item, never overwriting what the user set."""
+    """Background: Argo's one-line summary and labels for a new item, never overwriting what the user set."""
     with lib_lock:
         lib = load_lib()
         x = next((x for x in lib["items"] if x["id"] == item_id), None)
-        known = sorted({l for y in lib["items"] for l in y["labels"]} | set(lib["labels"]))
+    known = all_labels()
     if not x or not argo_on():
         return
-    reply = argo(f"Below is a local {'folder' if x['folder'] else 'file'} I keep in my library of projects, files and docs. "
-                 'Reply with ONLY a JSON object {"summary": "...", "group": "...", "labels": [...]}.\n'
+    kind = f"{x['src']} link" if x.get("src") else "local folder" if x["folder"] else "local file"
+    reply = argo(f"Below is a {kind} I keep in my library of projects, files and docs. "
+                 'Reply with ONLY a JSON object {"summary": "...", "labels": [...]}.\n'
                  "- summary: one plain line (max 20 words) saying what it is.\n"
-                 f"- group: the best fit of {json.dumps(lib['groups'])}, or \"\" if none fits.\n"
-                 f"- labels: up to 3 short labels (1-2 words, Title Case). Existing labels: {json.dumps(known)}. Reuse one "
+                 f"- labels: up to 3 short labels for the projects or topics it belongs to (1-2 words, Title Case). Existing labels: {json.dumps(known)}. Reuse one "
                  "whenever it fits; invent a new one only if none does.\n\n"
-                 f"Path: {x['path']}\n\n{x['peek']}", 600, tag="lib:" + item_id)
+                 f"{'Link' if x.get('src') else 'Path'}: {x['path']}\nName: {x['name']}\n\n{x['peek']}", 600, tag="lib:" + item_id)
     with lib_lock:
         lib = load_lib()
         cur = next((y for y in lib["items"] if y["id"] == item_id), None)
@@ -902,18 +1006,16 @@ def lib_enrich(item_id):
             cur["retry"] = True
             return save_lib(lib)
         cur.pop("retry", None)
-        s = clean_lib_suggestion(reply, lib["groups"])
+        s = clean_lib_suggestion(reply)
         if s.get("summary") and not cur["summary"]:
             cur["summary"] = s["summary"]
-        if s.get("group") and not cur["group"]:
-            cur["group"] = s["group"]
         if s.get("labels") and not cur["labels"]:
             cur["labels"] = sorted(set(s["labels"]))
         save_lib(lib)
 
 
 def lib_meta(lib, d):
-    """Groups/labels editor: {"op": "add_group"|"rename_group"|"delete_group"|"add_label"|"rename_label"|
+    """Types ("group")/labels editor: {"op": "add_group"|"rename_group"|"delete_group"|"add_label"|"rename_label"|
     "delete_label"|"color_label", "name", "to", "hue"}. Renaming onto an existing name merges the two."""
     op, name, to = d.get("op", ""), str(d.get("name") or "").strip(), " ".join(str(d.get("to") or "").split())[:40]
     if op == "add_group" and name and name not in lib["groups"]:
@@ -935,23 +1037,133 @@ def lib_meta(lib, d):
         hue = lib["labels"].pop(name, None)
         if new:
             lib["labels"][new] = lib["labels"].get(new, hue)
-        for x in lib["items"]:
-            if name in x["labels"]:
-                x["labels"] = sorted({new if l == name else l for l in x["labels"]} - {""})
+        relabel(lib["items"], name, new)
     elif op == "color_label" and name:
         lib["labels"][name] = max(0, min(359, int(d.get("hue") or 0)))
 
 
-def lib_ask(q):
-    """Answer a question ("where's my beamtime analysis?") from the Library's names, notes, summaries and contents."""
+def relabel(items, name, new=""):
+    """Rename (or with new="", remove) a label on every item that has it."""
+    for x in items:
+        if name in x.get("labels", []):
+            x["labels"] = sorted({new if l == name else l for l in x["labels"]} - {""})
+
+
+def all_labels():
+    """One label vocabulary for tasks, Scout and the Library."""
+    with lock:
+        out = {l for t in load() for l in t.get("labels", [])}
+    with feed_lock:
+        out |= {l for x in load_feed()["items"] for l in x.get("labels", [])}
     with lib_lock:
-        items = load_lib()["items"]
-    hits = top_hits(items, q, lambda x: " ".join([x["name"], x["path"], x["group"], x["note"], x["summary"], x["peek"], *x["labels"]]))
-    ctx = "\n\n".join(f"[{x['name']}] {x['path']} | group {x['group'] or '-'} | labels {', '.join(x['labels']) or '-'}\n"
-                      f"{x['summary']}\n{x['note']}\n{x['peek'][:1200]}" for x in hits)
-    return argo("Answer my question using only the items from my library of local projects, files and docs below. "
-                "Be brief and plain text; name the item(s) by their [name] and give the path. "
-                f"If they don't contain the answer, say so.\n\nQuestion: {q}\n\n{ctx}", 2000, timeout=90, tag="lib:ask")
+        lib = load_lib()
+    return sorted(out | set(lib["labels"]) | {l for x in lib["items"] for l in x["labels"]})
+
+
+KIND = {"arXiv": "paper", "YouTube": "video", "GitHub": "repo"}
+
+
+def corpus():
+    """Everything the app knows, as {ref, kind, title, sub, text, labels}: Library items, tasks/emails and Scout items."""
+    with lib_lock:
+        lib = load_lib()["items"]
+    with lock:
+        todos = load()
+    with feed_lock:
+        feed = load_feed()["items"]
+    return ([{"ref": "lib:" + x["id"], "kind": KIND.get(x["src"], "link") if x.get("src") else "folder" if x["folder"] else "file", "title": x["name"], "sub": x["path"],
+              "text": "\n".join(filter(None, [x["path"], x["group"], x["summary"], x["note"], x["peek"]])), "labels": x["labels"]}
+             for x in lib]
+            + [{"ref": "task:" + t["id"], "kind": "email" if t.get("eml") else "task", "title": t["title"],
+                "sub": " · ".join(filter(None, [t["sender"], t["date"] or t["added"][:10], t["due"] and "due " + t["due"].replace("T", " "),
+                                                t["done"] and "done"])),
+                "text": f"{t['body']}\n{t['note']}", "labels": t.get("labels", []), "id": t["id"], "eml": bool(t.get("eml"))}
+               for t in todos]
+            + [{"ref": "feed:" + x["id"], "kind": KIND.get(x["src"], "link"), "title": x["title"],
+                "sub": " · ".join(filter(None, [x["src"], x["by"], x["date"]])), "text": f"{x['why']}\n{x['text']}",
+                "labels": x.get("labels", []), "id": x["id"], "url": x["url"]}
+               for x in feed if x.get("labels") or x["saved"] or x.get("task") or (x["score"] or 0) >= 5])
+
+
+HOME = Path.home()
+
+
+def readable(p):
+    """Home-folder paths the search agent may look at: no dot-folders (~/.ssh ...) and not ~/Library (mail, keychains, app data)."""
+    p = Path(p).expanduser().resolve()
+    if not p.exists() or not p.is_relative_to(HOME) or p == HOME:
+        return None
+    parts = p.relative_to(HOME).parts
+    return None if parts[0] == "Library" or any(x.startswith(".") for x in parts) else p
+
+
+def spotlight(q):
+    out = subprocess.run(["mdfind", "-onlyin", str(HOME), q], capture_output=True, timeout=20).stdout.decode("utf-8", "replace")
+    return [str(p) for p in map(readable, out.splitlines()[:200]) if p][:15]
+
+
+def lib_ask(q, steps=6):
+    """Agentic search: Argo searches the app's items and Spotlight, reads what looks promising, then answers.
+    Returns {"answer", "refs", "steps"}, or None if Argo is unreachable."""
+    items = corpus()
+    by_ref = {x["ref"]: x for x in items}
+    line = lambda x: f"{x['ref']} [{x['kind']}] {x['title']} | {x['sub']}" + (f" | labels {', '.join(x['labels'])}" if x["labels"] else "")
+    log, trail, refs = [], [], []
+    for i in range(steps):
+        last = i == steps - 1
+        reply = argo(
+            f"Today is {datetime.now():%A %Y-%m-%d}. You are finding things for me on my Mac and in my notes app, to answer: {q}\n"
+            "My app holds Library items (local folders, files, docs), tasks and saved emails, and Scout papers, videos, repos "
+            f"and links. Labels in use: {json.dumps(all_labels())}.\nEach turn reply with ONLY one JSON object, one of:\n"
+            '{"search": "keywords"}  search the app\'s items (names, paths, notes, summaries, email text, labels)\n'
+            '{"label": "Label"}  list everything with that label\n'
+            '{"spotlight": "keywords"}  Spotlight search of file names and contents in my home folder\n'
+            '{"read": "<ref or path>"}  read an item or a file (first few KB; a folder gives its file list)\n'
+            '{"answer": "brief plain-text answer", "refs": ["<ref or path>", ...]}  when you know, or when searching '
+            "stops helping. refs: the items or files the answer points to, best first.\n"
+            "Search with different words if a search finds nothing. Never invent refs or paths."
+            + ("\nThis is your last turn: answer now." if last else "")
+            + "\n\nWhat you did so far:\n" + ("\n\n".join(log) or "(nothing yet)"), 700, timeout=60, tag="lib:ask")
+        if reply is None:
+            return None
+        m = re.search(r"\{.*\}", reply, re.S)
+        try:
+            d = json.loads(m.group(0)) if m else {}
+        except ValueError:
+            d = {}
+        if "answer" in d or last or not d:
+            refs = [str(r) for r in d.get("refs") or []] if d else []
+            answer = str(d.get("answer") or "") if d else reply.strip()
+            break
+        if d.get("search"):
+            hits = [x for x in top_hits(items, d["search"], lambda x: " ".join([x["title"], x["sub"], x["text"], *x["labels"]]), 10)
+                    if any(w in " ".join([x["title"], x["sub"], x["text"], *x["labels"]]).lower()
+                           for w in re.findall(r"\w{3,}", d["search"].lower()))]
+            trail.append(f"Searched “{d['search']}”")
+            log.append(f"search {d['search']!r} ->\n" + ("\n".join(map(line, hits)) or "nothing"))
+        elif d.get("label"):
+            hits = [x for x in items if str(d["label"]).lower() in (l.lower() for l in x["labels"])][:30]
+            trail.append(f"Label “{d['label']}”")
+            log.append(f"label {d['label']!r} ->\n" + ("\n".join(map(line, hits)) or "nothing"))
+        elif d.get("spotlight"):
+            paths = spotlight(str(d["spotlight"]))
+            trail.append(f"Spotlight “{d['spotlight']}”")
+            log.append(f"spotlight {d['spotlight']!r} ->\n" + ("\n".join(paths) or "nothing"))
+        elif d.get("read"):
+            r = str(d["read"])
+            x, p = by_ref.get(r), None if r in by_ref else readable(r)
+            trail.append("Read " + (x["title"] if x else Path(r).name))
+            log.append(f"read {r} ->\n" + (f"{line(x)}\n{x['text'][:3000]}" if x else peek(p) if p else "not found (or not allowed)"))
+        else:
+            log.append(f"{json.dumps(d)} -> unknown action")
+    out = []
+    for r in dict.fromkeys(refs):
+        if r in by_ref:
+            out.append({k: v for k, v in by_ref[r].items() if k != "text"})
+        elif readable(r):
+            p = readable(r)
+            out.append({"ref": str(p), "kind": "path", "title": p.name, "sub": str(p), "labels": []})
+    return {"answer": answer.replace("**", "").strip(), "refs": out[:12], "steps": trail}
 
 
 def pets(after=0):
@@ -1014,9 +1226,16 @@ class H(BaseHTTPRequestHandler):
             with lib_lock:
                 lib = load_lib()
             for x in lib["items"]:
-                x["missing"] = not Path(x["path"]).exists()
+                x["missing"] = not x.get("src") and not Path(x["path"]).exists()
             lib["editor"] = config().get("library_editor", "Visual Studio Code")
             self.reply(200, json.dumps(lib).encode())
+        elif self.path == "/api/labels":  # the shared vocabulary + colours picked in the Library
+            with lib_lock:
+                hues = {k: v for k, v in load_lib()["labels"].items() if v is not None}
+            self.reply(200, json.dumps({"all": all_labels(), "hues": hues}).encode())
+        elif self.path == "/api/labeled":  # tasks and Scout items for the Library's label view
+            self.reply(200, json.dumps([{k: v for k, v in x.items() if k != "text"}
+                                        for x in corpus() if x["labels"] and not x["ref"].startswith("lib:")]).encode())
         elif self.path == "/api/feed":
             with feed_lock:
                 f = load_feed()
@@ -1065,7 +1284,7 @@ class H(BaseHTTPRequestHandler):
                 x["task"] = True
                 save_feed(f)
             t = {**blank(), "title": "Read: " + x["title"], "sender": " · ".join(filter(None, [x["src"], x["by"]])),
-                 "date": x["date"], "body": f"{x['url']}\n\n{x['text']}", "eml": False, "labels": ["Reading"]}
+                 "date": x["date"], "body": f"{x['url']}\n\n{x['text']}", "eml": False, "labels": sorted({"Reading", *x.get("labels", [])})}
             with lock:
                 todos = load()
                 todos.insert(0, t)
@@ -1131,11 +1350,25 @@ class H(BaseHTTPRequestHandler):
             d = json.loads(raw or b"{}")
             new, skipped = lib_add(d.get("paths") or [], bool(d.get("split")), str(d.get("group") or "").strip())
             return self.reply(200, json.dumps({"added": [x["name"] for x in new], "skipped": skipped}).encode())
-        if u.path == "/api/library/ask":
-            answer = (lib_ask(json.loads(raw or b"{}").get("q", "")) or "").replace("**", "")
-            return self.reply(200, json.dumps({"answer": answer}).encode()) if answer else self.reply(503)
+        if u.path == "/api/library/ask":  # agentic search across everything
+            res = lib_ask(json.loads(raw or b"{}").get("q", ""))
+            return self.reply(200, json.dumps(res).encode()) if res else self.reply(503)
+        if u.path == "/api/reveal":  # a file the search found, outside the Library
+            p = readable(json.loads(raw or b"{}").get("path") or "")
+            return self.reply(404) if not p or subprocess.run(["open", "-R", str(p)]).returncode else self.reply(200)
         if u.path == "/api/library/meta" or u.path.startswith("/api/library/item/"):  # .../item/<id>/<action>
             d, act = json.loads(raw or b"{}"), u.path.rsplit("/", 1)[1]
+            if d.get("op") in ("rename_label", "delete_label") and str(d.get("name") or "").strip():  # labels are shared
+                new = " ".join(str(d.get("to") or "").split())[:40] if d["op"] == "rename_label" else ""
+                if new or d["op"] == "delete_label":
+                    with lock:
+                        todos = load()
+                        relabel(todos, d["name"].strip(), new)
+                        save(todos)
+                    with feed_lock:
+                        f = load_feed()
+                        relabel(f["items"], d["name"].strip(), new)
+                        save_feed(f)
             with lib_lock:
                 lib = load_lib()
                 if u.path == "/api/library/meta":
@@ -1153,7 +1386,9 @@ class H(BaseHTTPRequestHandler):
                         x["labels"] = sorted({str(l).strip()[:40] for l in d["labels"] if str(l).strip()})
                     if x["group"] and x["group"] not in lib["groups"]:
                         lib["groups"].append(x["group"])
-                    if d.get("path"):  # moved on disk: point it at the new place
+                    if d.get("path") and x.get("src"):  # a link: just the new address
+                        x["path"] = d["path"].strip()
+                    elif d.get("path"):  # moved on disk: point it at the new place
                         x["path"] = str(Path(d["path"].strip()).expanduser().resolve())
                         x["folder"], x["peek"] = Path(x["path"]).is_dir(), peek(x["path"])
                 elif act == "delete":  # only forgets it; the file stays where it is
@@ -1180,6 +1415,8 @@ class H(BaseHTTPRequestHandler):
                         x["read"] = True
                     elif x["id"] == patch.get("id"):
                         x.update({k: patch[k] for k in ("vote", "saved", "read") if k in patch})
+                        if "labels" in patch:
+                            x["labels"] = sorted({str(l).strip()[:40] for l in patch["labels"] if str(l).strip()})
                 save_feed(f)
             return self.reply(200)
         parts = u.path.strip("/").split("/")  # api/drop | api/todo/<id>/<action>
@@ -1328,7 +1565,7 @@ details .askm{border-color:color-mix(in srgb,var(--accent) 35%,transparent)}
 .act:hover{border-color:var(--accent);color:var(--accent)}.act b{font-weight:400;margin-left:4px;opacity:.5}.act b:hover{opacity:1;color:var(--red)}
 .icon.busy{opacity:1;animation:pulse 1s infinite}@keyframes pulse{50%{opacity:.25}}
 #ans{position:relative;background:var(--card);border:1px solid var(--accent);border-radius:10px;padding:10px 32px 10px 12px;margin:12px 0 0;white-space:pre-wrap}
-#ans button{position:absolute;top:6px;right:6px;border:0;background:none;cursor:pointer;color:var(--muted)}
+#ans>button{position:absolute;top:6px;right:6px;border:0;background:none;cursor:pointer;color:var(--muted)}
 #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:10;background:var(--text);color:var(--bg);
   border-radius:8px;padding:8px 14px;font-size:12.5px;opacity:0;transition:opacity .2s;pointer-events:none}#toast.on{opacity:.92}
 .pill[hidden]{display:none}.pill+.pill{margin-left:6px}.pill{margin-left:auto;align-self:center;display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);
@@ -1475,7 +1712,8 @@ function linkify(el,text){
   }
   el.append(text.slice(i));
 }
-const hue=s=>[...s].reduce((h,c)=>(h*31+c.charCodeAt(0))%360,7);
+let LB={all:[],hues:{}};  // shared labels: names from all three windows, colours picked in the Library
+const hue=s=>LB.hues[s]??[...s].reduce((h,c)=>(h*31+c.charCodeAt(0))%360,7);
 let all=[], view=localStorage.view||'list', cm=new Date(), sel='', dragId=null;
 cm.setDate(1);
 const ymd=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
@@ -1518,7 +1756,7 @@ function renderCal(shown){
 let lf='';  // label filter ('' = all), set by the label row under the search bar or by clicking a label
 function render(){
   const names=[...new Set(all.flatMap(t=>t.labels||[]))].sort();
-  labels.replaceChildren(...names.map(n=>new Option(n)));
+  labels.replaceChildren(...[...new Set([...names,...LB.all])].sort().map(n=>new Option(n)));
   if(!names.includes(lf))lf='';
   const lchip=(name,text,n)=>{const c=document.createElement('button');c.className='lb'+(lf===name?' on':'');
     if(name)c.style.setProperty('--h',hue(name));c.textContent=text;if(n){const b=document.createElement('b');b.textContent=n;c.append(b)}
@@ -1552,7 +1790,7 @@ function render(){
 }
 let st={busy:[]}, rev=0;
 async function load(){
-  [all,st]=await Promise.all(['/api/todos','/api/status'].map(u=>fetch(u).then(r=>r.json())));rev=st.rev;render();pill()}
+  [all,st,LB]=await Promise.all(['/api/todos','/api/status','/api/labels'].map(u=>fetch(u).then(r=>r.json())));rev=st.rev;render();pill()}
 function pill(){  // Argo status in the header: off / reachable / unavailable / working
   const work=st.busy.filter(x=>x!=='check'), checking=st.busy.includes('check'), waiting=all.filter(t=>t.retry&&!t.done).length;
   const ago=st.checked?Math.round(Date.now()/6e4-st.checked/60):null;
@@ -1672,7 +1910,13 @@ dialog#adddlg{width:min(580px,calc(100vw - 32px))}
 .pf select{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:4px 6px}
 .linkbtn{border:0;background:none;color:var(--muted);cursor:pointer;padding:6px 4px;font-size:12.5px}.linkbtn:hover{color:var(--text);text-decoration:underline}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}.btn.primary:disabled{opacity:.45;cursor:default}
+:root{--chipL:32%}@media (prefers-color-scheme:dark){:root{--chipL:76%}}
+.chip{border-radius:10px;padding:1px 8px;margin-left:6px;cursor:pointer;background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 65% var(--chipL));font-weight:500}
+.chip b{display:inline-block;vertical-align:bottom;max-width:0;overflow:hidden;font-weight:400;opacity:0}.chip:hover b{max-width:1em;margin-left:3px;opacity:.7}
+.addl{border:1px dashed var(--line);border-radius:10px;background:none;width:62px;padding:0 7px;margin-left:6px;color:var(--muted);outline:none;font-size:12px}
+.addl:hover{border-color:var(--muted)}.addl:focus{width:160px;color:var(--text);border-style:solid;border-color:var(--accent)}
 </style>
+<datalist id=labels></datalist>
 <header>
   <div class=top><h1>Scout</h1><span id=stats></span>
     <button class=btn id=addbtn title="Save a paper, video, repo or page by its link">+ Add</button><button class=btn id=prefsbtn>Interests</button><button class=btn id=allread>Mark all read</button><button class=btn id=refresh>Check now</button></div>
@@ -1709,14 +1953,15 @@ dialog#adddlg{width:min(580px,calc(100vw - 32px))}
 </form></dialog>
 <script>
 const SRCS=['All','arXiv','YouTube','GitHub','Saved'];
-let feed={items:[]}, src=localStorage.src||'All';
+let feed={items:[]}, src=localStorage.src||'All', LB={all:[],hues:{}};  // labels shared with Task Manager and the Library
+const hue=s=>LB.hues[s]??[...s].reduce((h,c)=>(h*31+c.charCodeAt(0))%360,7);
 const post=b=>fetch('/api/feed/update',{method:'POST',body:JSON.stringify(b)}).then(load);
 function ago(s){if(!s)return 'never';const m=Math.round((Date.now()-new Date(s))/6e4);
   return m<1?'just now':m<60?m+' min ago':m<1440?Math.round(m/60)+' h ago':Math.round(m/1440)+' d ago'}
 function card(x){
   const d=document.createElement('div');d.className='c'+(x.read?' read':'');
   d.innerHTML=`<div class=score></div><div class=body><a class=title target=_blank></a>
-    <div class=meta><span class=src></span> · <span class=by></span></div><div class=why></div>
+    <div class=meta><span class=src></span> · <span class=by></span><span class=chips></span><input class=addl list=labels placeholder="+ label" title="Labels are shared with Task Manager and the Library"></div><div class=why></div>
     <details><summary>Details</summary><p></p></details></div>
     <div class=acts><button title="More like this">👍</button><button title="Less like this">👎</button><button title="Save">☆</button><button title="Add to Task Manager as a reading task">📌</button></div>`;
   const $=s=>d.querySelector(s);
@@ -1726,6 +1971,12 @@ function card(x){
   const a=$('.title');a.href=x.url;a.textContent=x.title;a.onclick=()=>{if(!x.read)post({id:x.id,read:true})};
   $('.src').textContent=x.src;$('.by').textContent=[x.by,x.date,x.manual&&'added by you'].filter(Boolean).join(' · ');
   $('.why').textContent=x.why;
+  const ls=x.labels||[];
+  for(const l of ls){const c=document.createElement('span');c.className='chip';c.textContent=l;c.style.setProperty('--h',hue(l));
+    c.title='Show only this label';c.onclick=()=>{q.value=l;render()};
+    const r=document.createElement('b');r.textContent='×';r.title='Remove label';r.onclick=e=>{e.stopPropagation();post({id:x.id,labels:ls.filter(y=>y!==l)})};
+    c.append(r);$('.chips').append(c)}
+  const al=$('.addl');al.onchange=()=>{const v=al.value.trim();if(v)post({id:x.id,labels:[...ls,v]})};
   if(x.text)$('details p').textContent=x.text;else $('details').remove();
   const [up,down,save,task]=d.querySelectorAll('.acts button');
   task.classList.toggle('on',!!x.task);if(x.task)task.title='Added to Task Manager';
@@ -1742,7 +1993,7 @@ function render(){
   const words=q.value.toLowerCase().split(/\s+/).filter(Boolean);
   const shown=feed.items.filter(x=>(src==='All'||(src==='Saved'?x.saved:x.src===src))
     &&(src==='Saved'||(x.vote>=0&&(low.checked||x.score==null||x.score>=5)))
-    &&words.every(w=>[x.title,x.by,x.text,x.why].join(' ').toLowerCase().includes(w)))
+    &&words.every(w=>[x.title,x.by,x.text,x.why,...(x.labels||[])].join(' ').toLowerCase().includes(w)))
     .sort((a,b)=>((b.score??4.5)-(a.score??4.5))||b.date.localeCompare(a.date));
   list.replaceChildren(...shown.slice(0,300).map(card));
   if(!shown.length){const e=document.createElement('div');e.className='empty';
@@ -1752,7 +2003,8 @@ function render(){
   errs.textContent=(feed.errors||[]).map(e=>'⚠︎ '+e).join('  ');
   document.title=picks?`Scout (${picks})`:'Scout';
 }
-async function load(){feed=await (await fetch('/api/feed')).json();render()}
+async function load(){[feed,LB]=await Promise.all(['/api/feed','/api/labels'].map(u=>fetch(u).then(r=>r.json())));
+  labels.replaceChildren(...LB.all.map(n=>new Option(n)));render()}
 q.oninput=low.onchange=render;
 refresh.onclick=()=>fetch('/api/feed/refresh',{method:'POST'}).then(()=>setTimeout(load,500));
 allread.onclick=()=>post({all_read:true});
@@ -1839,7 +2091,7 @@ p_reset.onclick=()=>confirm('Reset interests, search terms and channels to the d
 pform.onsubmit=e=>{e.preventDefault();savePrefs(JSON.parse(state()))};
 addEventListener('keydown',e=>{if(e.key==='/'&&!/INPUT|TEXTAREA/.test(document.activeElement.tagName)){e.preventDefault();q.focus()}});
 q.onkeydown=e=>{if(e.key==='Escape'){q.value='';render();q.blur()}};
-let tick=0;setInterval(()=>{if((feed.busy||++tick%6===0)&&!document.querySelector('details[open]'))load()},5000);
+let tick=0;setInterval(()=>{if((feed.busy||++tick%6===0)&&!document.querySelector('details[open]')&&!document.activeElement.classList.contains('addl'))load()},5000);
 load();
 </script>"""
 
@@ -1937,6 +2189,9 @@ header{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 85
 .wrap{display:flex;align-items:flex-start}
 aside{flex:none;width:200px;position:sticky;top:96px;max-height:calc(100vh - 96px);overflow:auto;padding:14px 8px 30px 14px}
 aside h2{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:16px 8px 4px;font-weight:600}
+h2.fold{cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px}h2.fold:hover{color:var(--text)}
+h2.fold::after{content:"›";font-size:13px;transform:rotate(90deg);transition:transform .15s;opacity:0}aside:hover h2.fold::after{opacity:1}
+h2.fold.shut::after{transform:none;opacity:1}
 .nav{display:flex;align-items:center;gap:6px;width:100%;border:0;background:none;border-radius:7px;padding:5px 8px;cursor:pointer;text-align:left}
 .nav:hover,.nav.over{background:var(--line)}.nav.on{background:var(--accent);color:#fff}.nav.on .n{color:#fff}
 .nav span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nav .n{flex:none;color:var(--muted);font-size:12px}
@@ -1976,7 +2231,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 ui-monospace,Menlo
 .c.thinking{border-color:var(--accent);background:linear-gradient(90deg,var(--card) 30%,color-mix(in srgb,var(--accent) 12%,var(--card)) 50%,var(--card) 70%) 0 0/300% 100%;
   animation:shimmer 1.8s linear infinite}@keyframes shimmer{from{background-position:100% 0}to{background-position:0 0}}
 #ans{position:relative;background:var(--card);border:1px solid var(--accent);border-radius:10px;padding:10px 32px 10px 12px;margin:12px 0 0;white-space:pre-wrap}
-#ans button{position:absolute;top:6px;right:6px;border:0;background:none;cursor:pointer;color:var(--muted)}
+#ans>button{position:absolute;top:6px;right:6px;border:0;background:none;cursor:pointer;color:var(--muted)}
 #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:10;background:var(--text);color:var(--bg);
   border-radius:8px;padding:8px 14px;font-size:12.5px;opacity:0;transition:opacity .2s;pointer-events:none}#toast.on{opacity:.92}
 .pill[hidden]{display:none}.pill+.pill{margin-left:6px}.pill{margin-left:auto;align-self:center;display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);
@@ -2000,7 +2255,14 @@ dialog#adddlg{width:min(580px,calc(100vw - 32px))}
 .opt{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:12.5px;color:var(--muted)}.opt label{display:flex;gap:6px;align-items:center}
 .opt select{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:3px 6px}
 .alog{font-size:12.5px;margin-top:8px;overflow-wrap:anywhere}.alog.bad{color:var(--red)}
-#a_browse{background:var(--accent);border-color:var(--accent);color:#fff;margin-bottom:8px}.hint{color:var(--muted);font-size:12px;margin-left:8px}
+.zone{display:flex;align-items:center;gap:14px;margin-top:14px;padding:14px 16px;border:1.5px dashed var(--line);border-radius:12px;background:var(--bg)}
+.zone[hidden]{display:none}.zone small{display:block;color:var(--muted);font-size:12px;margin-top:6px}
+.zi{flex:none;width:40px;height:40px;border-radius:10px;display:grid;place-content:center;background:#0a84ff1f;color:var(--accent)}
+.zi svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linejoin:round}
+.lbl{display:flex;align-items:baseline;gap:8px;margin:16px 0 0}.lbl b{font-size:13px}.lbl small{color:var(--muted);font-size:12px}
+#adddlg textarea{margin-top:6px;line-height:1.5}
+.opt select{appearance:none;-webkit-appearance:none;padding:3px 24px 3px 8px;cursor:pointer;
+  background:var(--bg) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%238e8e93' stroke-width='1.5'/%3E%3C/svg%3E") no-repeat right 8px center}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:22px}@media (max-width:600px){.two{grid-template-columns:1fr}}
 .row{display:flex;align-items:center;gap:6px;margin:3px 0}
 .row input[type=text]{flex:1;min-width:0;background:var(--bg);border:1px solid transparent;border-radius:7px;padding:5px 8px;outline:none}
@@ -2011,33 +2273,42 @@ dialog#adddlg{width:min(580px,calc(100vw - 32px))}
 .hue::-webkit-slider-thumb{appearance:none;width:14px;height:14px;border-radius:50%;background:hsl(var(--h) 70% 50%);border:2px solid #fff;box-shadow:0 0 0 1px #0004}
 .pf{display:flex;gap:8px;align-items:center;padding:12px 22px;border-top:1px solid var(--line)}
 .pf .msg{flex:1;font-size:12px;color:var(--muted)}
+.mini{padding:8px 12px}.mini .ico{font-size:15px;font-weight:400}
+.mini .title{display:block;color:inherit;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+a.title:hover{color:var(--accent);text-decoration:underline}.mini.done .title{text-decoration:line-through;color:var(--muted)}
+.kind{color:var(--muted);text-transform:capitalize;font-weight:600}.sub{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:420px}
+main h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:18px 2px 4px;font-weight:600}
+#ans .steps{color:var(--muted);font-size:12px;margin-top:6px}#ans .refs{white-space:normal;margin-top:6px}
 </style>
-<div id=drop>Drop files or folders to add them</div><div id=toast></div>
+<div id=drop>Drop files, folders or links to add them</div><div id=toast></div>
 <header>
   <div class=top><h1>Library</h1><span id=stats></span><button id=argo class=pill></button>
     <button class=btn id=addbtn title="Add folders, files or docs">+ Add</button></div>
   <div class=bar>
-    <input id=q type=search placeholder="Search names, paths, labels, notes and contents, or ask a question ending in ?  ( / )">
+    <input id=q type=search placeholder="Search, or ask Argo in plain words and press Enter: “slides from my last beamtime talk”  ( / )">
     <span class=seg id=sorts></span>
   </div>
 </header>
 <datalist id=labels></datalist>
 <div class=wrap><aside id=nav></aside><main><div id=ans hidden></div><div id=list></div></main></div>
 <dialog id=adddlg class=sheet><form id=aform>
-  <div class=ph><h3>Add to Library</h3><p>Folders, files or docs on this Mac: choose them, drag them in from Finder, or paste their paths
-    (⌥⌘C in Finder copies them).</p></div>
-  <div class=pb><div class=sec><button type=button class=btn id=a_browse>Choose in Finder…</button>
-    <span class=hint id=a_hint>Pick several with ⌘-click. New project? Use New Folder in the picker.</span><textarea id=a_paths rows=4 placeholder="~/Research/Projects/survey-corps&#10;~/Documents/beamtime-proposal.docx"></textarea></div>
+  <div class=ph><h3>Add to Library</h3><p>Folders, files, docs and links. Each gets its type automatically; Argo summarizes it and suggests labels.</p></div>
+  <div class=pb>
+    <div class=zone id=a_zone><span class=zi></span>
+      <div><button type=button class="btn primary" id=a_browse>Choose in Finder…</button>
+        <small>or drop files, folders or links anywhere in this window. ⌘-click picks several.</small></div></div>
+    <div class=lbl><b>Or paste paths and links</b><small>one per line · ⌥⌘C in Finder copies a path</small></div>
+    <textarea id=a_paths rows=3 placeholder="~/Research/Projects/ptychography&#10;https://arxiv.org/abs/…  ·  YouTube  ·  GitHub  ·  any page or PDF"></textarea>
     <div class=opt><label><input type=checkbox id=a_split> Add each subfolder as its own item</label>
-      <label>Group <select id=a_grp></select></label></div><div id=a_log></div></div>
-  <div class=pf><span class=msg>Argo writes a one-line summary and picks a group and labels; it never overrides yours.</span>
-    <button type=button class=btn id=a_close>Close</button><button class="btn primary" id=a_save>Add</button></div>
+      <label>Type <select id=a_grp></select></label></div><div id=a_log></div></div>
+  <div class=pf><span class=msg></span><button type=button class=btn id=a_close>Close</button><button class="btn primary" id=a_save>Add</button></div>
 </form></dialog>
 <dialog id=mdlg class=sheet><form id=mform>
-  <div class=ph><h3>Groups &amp; labels</h3><p>Each item sits in one group and can have any number of labels. Renaming onto an existing name merges the two.</p></div>
-  <div class="pb two"><div class=sec><b>Groups</b><div id=m_groups></div><div class=row><input id=m_ng class=new type=text placeholder="+ New group"></div></div>
+  <div class=ph><h3>Types &amp; labels</h3><p><b>Type</b> is what an item is: set automatically, change it any time. <b>Labels</b> are what it's about
+    (projects, topics), shared with Task Manager and Scout. Renaming onto an existing name merges the two.</p></div>
+  <div class="pb two"><div class=sec><b>Types</b><div id=m_groups></div><div class=row><input id=m_ng class=new type=text placeholder="+ New type"></div></div>
     <div class=sec><b>Labels</b><div id=m_labels></div><div class=row><input id=m_nl class=new type=text placeholder="+ New label"></div></div></div>
-  <div class=pf><span class=msg>Tip: drag an item onto a group or label in the sidebar.</span><button class="btn primary">Done</button></div>
+  <div class=pf><span class=msg>Tip: drag an item onto a type or label in the sidebar.</span><button class="btn primary">Done</button></div>
 </form></dialog>
 <script>
 const SVG=p=>`<svg viewBox="0 0 24 24">${p}</svg>`;
@@ -2049,8 +2320,9 @@ const I={folder:SVG('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0
   copy:SVG('<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>'),
   x:SVG('<path d="M6 6l12 12M18 6 6 18"/>')};
 const SORTS={recent:'Recent',name:'Name',added:'Added'};
-let lib={groups:[],labels:{},items:[]}, st={busy:[]}, rev=0, dragId=null;
-let sel=localStorage.libsel||'all', sort=localStorage.libsort||'recent';
+let lib={groups:[],labels:{},items:[]}, st={busy:[]}, rev=0, trev=0, dragId=null, others=[];  // others: labeled tasks + Scout items
+let sel=localStorage.libsel||'all', ty=localStorage.libty||'', sort=localStorage.libsort||'recent';
+if(sel.startsWith('g:')){ty=sel.slice(2);sel='all'}  // from before groups became types
 const hue=s=>[...s].reduce((h,c)=>(h*31+c.charCodeAt(0))%360,7);  // same colours as Task Manager labels
 const lhue=l=>lib.labels[l]??hue(l);
 const el=(tag,cls,txt)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e};
@@ -2061,34 +2333,67 @@ async function api(p,b){
   await load();return r;
 }
 const meta=b=>api('/api/library/meta',b);
-const allLabels=()=>[...new Set([...Object.keys(lib.labels),...lib.items.flatMap(x=>x.labels)])].sort((a,b)=>a.localeCompare(b));
-const matches=x=>sel==='all'||(sel==='missing'?x.missing:sel.startsWith('g:')?x.group===sel.slice(2):x.labels.includes(sel.slice(2)));
+const allLabels=()=>[...new Set([...Object.keys(lib.labels),...lib.items.flatMap(x=>x.labels),...others.flatMap(x=>x.labels)])].sort((a,b)=>a.localeCompare(b));
+const KIND={arXiv:'paper',YouTube:'video',GitHub:'repo',Link:'link'};
+const KICON={email:'✉︎',task:'✓',paper:'📄',video:'▶︎',repo:'⑂',link:'🔗',path:'📁'},KHUE={email:212,task:140,paper:28,video:0,repo:270,link:180,path:212};
+function mini(x){  // a task, email, Scout item or found file, in the Library's label view and search answers
+  const d=el('div','c mini'+(x.sub.endsWith('· done')?' done':''));
+  const ico=el('div','ico',KICON[x.kind]||'•');ico.style.setProperty('--h',KHUE[x.kind]??212);
+  const b=el('div','body'),t=el(x.url?'a':'div','title',x.title);t.title=x.title;if(x.url){t.href=x.url;t.target='_blank'}
+  const m=el('div','meta');m.append(el('span','kind',x.kind==='path'?'On disk':x.kind));
+  const sub=el('span',x.kind==='path'?'path':'sub',x.kind==='path'?'\u200e'+x.sub.replace(/^\/Users\/[^/]+/,'~')+'\u200e':x.sub);sub.title=x.sub;
+  const up=labels=>api(x.ref.startsWith('task:')?`/api/todo/${x.id}/update`:'/api/feed/update',x.ref.startsWith('task:')?{labels}:{id:x.id,labels});
+  for(const l of x.labels){const c=el('span','chip',l);c.style.setProperty('--h',lhue(l));c.title='Show everything with this label';c.onclick=()=>go('l:'+l);
+    const r=el('b',0,'×');r.title='Remove label';r.onclick=e=>{e.stopPropagation();up(x.labels.filter(y=>y!==l))};c.append(r);m.append(c)}
+  if(x.kind!=='path'){const al=el('input','addl');al.setAttribute('list','labels');al.placeholder='+ label';al.onchange=()=>al.value.trim()&&up([...x.labels,al.value.trim()]);m.append(al)}
+  m.append(sub);b.append(t,m);
+  const side=el('div','side'),btn=(ic,title,f)=>{const e=el('button','icon');e.innerHTML=ic;e.title=title;e.onclick=f;side.append(e)};
+  if(x.eml)btn(I.open,'Open in Outlook',()=>api(`/api/todo/${x.id}/open`));
+  if(x.url)btn(I.open,'Open link',()=>t.click());
+  if(x.kind==='path'){btn(I.reveal,'Show in Finder',()=>api('/api/reveal',{path:x.sub}));
+    btn(SVG('<path d="M12 5v14M5 12h14"/>'),'Add to Library',()=>fetch('/api/library/add',{method:'POST',body:JSON.stringify({paths:[x.sub]})}).then(r=>r.json()).then(dropped))}
+  d.append(ico,b,side);return d;
+}
+// Two filters that combine: sel (all items / a label / missing) and ty (a type, '' = any)
+const OTYPE={email:'Emails',task:'Tasks',paper:'Papers',video:'Videos',repo:'Code',link:'Websites'};  // tasks and Scout items as types
+const typeOf=x=>x.ref?OTYPE[x.kind]:x.group||'No type';
+const inScope=x=>sel==='all'||(sel==='missing'?x.missing:x.labels.includes(sel.slice(2)));
+const matches=x=>inScope(x)&&(!ty||typeOf(x)===ty);
 function go(s){sel=s;localStorage.libsel=s;render()}
+function goType(t){ty=ty===t?'':t;localStorage.libty=ty;render()}
 function navBtn(key,text,n,h){
-  const b=el('button','nav'+(sel===key?' on':'')+(key==='missing'?' miss':''));
+  const isT=key.startsWith('t:'),b=el('button','nav'+((isT?'t:'+ty===key:sel===key)?' on':'')+(key==='missing'?' miss':''));
   if(h!=null){const i=el('i');i.style.setProperty('--h',h);b.append(i)}
-  b.append(el('span',0,text),el('span','n',n));b.title=text;b.onclick=()=>go(key);
-  if(key.startsWith('g:')||key.startsWith('l:')){  // drop an item here: move it to the group / add the label
+  b.append(el('span',0,text),el('span','n',n));b.title=isT?(ty===text?'Show every type':'Only '+text):text;
+  b.onclick=()=>isT?goType(key.slice(2)):go(key);
+  if(isT&&lib.groups.includes(key.slice(2))||key.startsWith('l:')){  // drop an item here: change its type / add the label
     b.ondragover=e=>{if(dragId){e.preventDefault();b.classList.add('over')}};b.ondragleave=()=>b.classList.remove('over');
     b.ondrop=e=>{e.preventDefault();b.classList.remove('over');const x=lib.items.find(y=>y.id===dragId);if(!x)return;
-      api(`/api/library/item/${x.id}/update`,key.startsWith('g:')?{group:key.slice(2)}:{labels:[...x.labels,key.slice(2)]})};
+      api(`/api/library/item/${x.id}/update`,isT?{group:key.slice(2)}:{labels:[...x.labels,key.slice(2)]})};
   }
   return b;
 }
+let fold=(()=>{try{return JSON.parse(localStorage.libfold||'{}')}catch{return {}}})();
+function section(out,name,btns){  // a collapsible sidebar section; a folded one still shows what's selected
+  const h=el('h2','fold'+(fold[name]?' shut':''),name);h.title=fold[name]?'Show':'Hide';
+  h.onclick=()=>{fold[name]=!fold[name];localStorage.libfold=JSON.stringify(fold);renderNav()};
+  out.push(h,...btns.filter(b=>!fold[name]||b.classList.contains('on')));
+}
 function renderNav(){
-  const it=lib.items,out=[navBtn('all','All items',it.length),el('h2',0,'Groups')];
-  for(const g of lib.groups)out.push(navBtn('g:'+g,g,it.filter(x=>x.group===g).length||''));
-  const none=it.filter(x=>!x.group).length;if(none)out.push(navBtn('g:','Ungrouped',none));
+  const it=lib.items,out=[navBtn('all','All items',it.length)];
+  const scope=[...it,...sel.startsWith('l:')?others:[]].filter(inScope),tn=t=>scope.filter(x=>typeOf(x)===t).length;
+  section(out,'Types',[...lib.groups,'Emails','Tasks','No type'].filter(t=>tn(t)||t===ty).map(t=>navBtn('t:'+t,t,tn(t)||'')));
   const ls=allLabels();
-  if(ls.length){out.push(el('h2',0,'Labels'));for(const l of ls)out.push(navBtn('l:'+l,l,it.filter(x=>x.labels.includes(l)).length||'',lhue(l)))}
-  const miss=it.filter(x=>x.missing).length;if(miss)out.push(el('h2',0,'Needs attention'),navBtn('missing','Missing on disk',miss));
-  const e=el('button','linkbtn','Edit groups & labels…');e.onclick=openManage;out.push(el('div'),e);
+  const n=l=>[...it,...others].filter(x=>x.labels.includes(l)).length||'';  // a label view shows tasks and Scout items too
+  if(ls.length)section(out,'Labels',ls.map(l=>navBtn('l:'+l,l,n(l),lhue(l))));
+  const miss=it.filter(x=>x.missing).length;if(miss)section(out,'Needs attention',[navBtn('missing','Missing on disk',miss)]);
+  const e=el('button','linkbtn','Edit types & labels…');e.onclick=openManage;out.push(el('div'),e);
   nav.replaceChildren(...out);
 }
 function card(x){
   const d=el('div','c'+(x.missing?' missing':'')+(st.busy.includes(x.id)?' thinking':''));d.dataset.id=x.id;
   d.innerHTML=`<div class=ico></div><div class=body><input class=title spellcheck=false>
-    <div class=meta><span class=argoing>✨ Argo is reading this…</span><select class=grp title="Group"></select><span class=chips></span>
+    <div class=meta><span class=argoing>✨ Argo is reading this…</span><select class=grp title="Type (set automatically; change it any time)"></select><span class=chips></span>
       <input class=addl list=labels placeholder="+ label"><span class=path></span></div>
     <div class=why></div><details><summary>Notes &amp; contents</summary><textarea rows=2 placeholder="Notes…"></textarea>
       <input class=pathin spellcheck=false title="Path on disk (fix it here if you moved the item)"><pre></pre></details></div>
@@ -2096,12 +2401,13 @@ function card(x){
       <button class=icon data-a=edit title="Open in ${lib.editor}">${I.edit}</button><button class=icon data-a=terminal title="Open in Terminal">${I.term}</button>
       <button class=icon data-a=copy title="Copy path">${I.copy}</button><button class="icon x" title="Remove from Library (the file stays on disk)">${I.x}</button></div>`;
   const $=s=>d.querySelector(s),up=p=>api(`/api/library/item/${x.id}/update`,p);
-  const ext=x.folder?'':(x.name.match(/\.(\w{1,5})$/)||['',''])[1].toUpperCase();
-  const ico=$('.ico');ico.innerHTML=x.folder?I.folder:'';if(!x.folder)ico.textContent=ext||'DOC';
-  ico.style.setProperty('--h',x.folder?212:hue(ext||'doc'));ico.title=x.folder?'Open folder':'Open';
+  const ext=x.folder||x.src?'':(x.name.match(/\.(\w{1,5})$/)||['',''])[1].toUpperCase(),k=x.src&&(KIND[x.src]||'link');
+  const ico=$('.ico');ico.innerHTML=x.folder?I.folder:'';if(!x.folder)ico.textContent=k?KICON[k]:ext||'DOC';
+  ico.style.setProperty('--h',x.folder?212:k?KHUE[k]:hue(ext||'doc'));ico.title=x.folder?'Open folder':k?'Open link':'Open';
+  if(k)d.classList.add('mini');
   ico.onclick=()=>act('open');
   const ti=$('.title');ti.value=x.name;ti.title=x.name;ti.onchange=()=>up({name:ti.value});ti.onkeydown=e=>{if(e.key==='Enter')ti.blur()};
-  const g=$('.grp');g.replaceChildren(new Option('No group',''),...lib.groups.map(n=>new Option(n)));g.value=x.group;
+  const g=$('.grp');g.replaceChildren(new Option('No type',''),...lib.groups.map(n=>new Option(n)));g.value=x.group;
   g.classList.toggle('none',!x.group);g.onchange=()=>up({group:g.value});
   for(const l of x.labels){
     const c=el('span','chip',l);c.style.setProperty('--h',lhue(l));c.title='Show only this label';c.onclick=()=>go('l:'+l);
@@ -2117,31 +2423,38 @@ function card(x){
   const pi=$('.pathin');pi.value=x.path;pi.onchange=()=>pi.value.trim()&&up({path:pi.value});
   if(x.peek)$('pre').textContent=x.peek;else $('pre').remove();
   $('summary').textContent='Notes & contents'+(x.note?' ✎':'');
-  function act(a){return api(`/api/library/item/${x.id}/${a}`).then(r=>r.ok&&a==='copy'&&toast('Path copied'))}
+  function act(a){return api(`/api/library/item/${x.id}/${a}`).then(r=>r.ok&&a==='copy'&&toast(k?'Link copied':'Path copied'))}
   for(const b of d.querySelectorAll('[data-a]')){b.onclick=()=>act(b.dataset.a);b.disabled=x.missing&&b.dataset.a!=='copy'}
-  if(!x.folder&&!/^(txt|md|py|ipynb|json|tex|bib|ya?ml|toml|js|ts|swift|sh|csv|c|h|cpp|m|r|jl|html|css|xml)$/i.test(ext))$('[data-a=edit]').hidden=true;
+  if(k){for(const a of ['reveal','edit','terminal'])$(`[data-a=${a}]`).hidden=true;$('[data-a=open]').title='Open in browser';
+    $('[data-a=copy]').title='Copy link';pi.title='Link'}
+  else if(!x.folder&&!/^(txt|md|py|ipynb|json|tex|bib|ya?ml|toml|js|ts|swift|sh|csv|c|h|cpp|m|r|jl|html|css|xml)$/i.test(ext))$('[data-a=edit]').hidden=true;
   $('.x').onclick=()=>confirm(`Remove "${x.name}" from the Library? The ${x.folder?'folder':'file'} itself stays on disk.`)&&api(`/api/library/item/${x.id}/delete`);
   d.draggable=true;d.ondragstart=e=>{if(/INPUT|TEXTAREA|SELECT/.test(e.target.tagName))return e.preventDefault();dragId=x.id;e.dataTransfer.setData('application/x-lib',x.id)};
   d.ondragend=()=>dragId=null;
   return d;
 }
 function render(){
-  const name=sel.slice(2);  // the selected group/label may have been renamed or deleted
-  if(!['all','missing','g:'].includes(sel)&&!(sel.startsWith('g:')?lib.groups:allLabels()).includes(name))sel='all';
+  if(sel.startsWith('l:')&&!allLabels().includes(sel.slice(2)))sel='all';  // the label may have been renamed or deleted
+  if(ty&&!lib.groups.includes(ty)&&!['Emails','Tasks','No type'].includes(ty))ty='';
   renderNav();
   labels.replaceChildren(...allLabels().map(l=>new Option(l)));
   sorts.replaceChildren(...Object.entries(SORTS).map(([k,v])=>{const b=el('button',k===sort?'on':'',v);b.onclick=()=>{sort=k;localStorage.libsort=k;render()};return b}));
-  const words=q.value.trim().endsWith('?')?[]:q.value.toLowerCase().split(/\s+/).filter(Boolean);
+  const qv=q.value.trim(),words=qv.endsWith('?')||(!ans.hidden&&wordy(qv))?[]:qv.toLowerCase().split(/\s+/).filter(Boolean);
   const key={recent:x=>-Date.parse((x.opened>x.added?x.opened:x.added)||0),name:x=>x.name.toLowerCase(),added:x=>-Date.parse(x.added)}[sort];
   const shown=lib.items.filter(x=>matches(x)&&words.every(w=>[x.name,x.path,x.group,x.note,x.summary,x.peek,...x.labels].join(' ').toLowerCase().includes(w)))
     .sort((a,b)=>{const p=key(a),r=key(b);return p<r?-1:p>r?1:0});
-  list.replaceChildren(...shown.slice(0,400).map(card));
-  if(!shown.length){const e=el('div','empty');
-    e.innerHTML=lib.items.length?'Nothing matches.':'Your Library is empty.<br>Click <b>+ Add</b> to choose folders, files or docs, or drag them in from Finder.';list.append(e)}
-  stats.textContent=`${lib.items.length} item${lib.items.length===1?'':'s'}`+(shown.length!==lib.items.length?` · ${shown.length} shown`:'');
+  const lab=sel.startsWith('l:')&&sel.slice(2);
+  const more=lab?others.filter(x=>matches(x)&&words.every(w=>[x.title,x.sub,...x.labels].join(' ').toLowerCase().includes(w))):[];
+  const files=shown,tasks=more.filter(x=>x.ref.startsWith('task:')),scout=more.filter(x=>x.ref.startsWith('feed:'));
+  list.replaceChildren(...(more.length&&files.length?[el('h3',0,'In the Library')]:[]),...files.slice(0,400).map(card),
+    ...(tasks.length?[el('h3',0,'Tasks & emails'),...tasks.map(mini)]:[]),...(scout.length?[el('h3',0,'From Scout'),...scout.map(mini)]:[]));
+  if(!shown.length&&!more.length){const e=el('div','empty');
+    e.innerHTML=lib.items.length?(st.configured?'Nothing matches. Press <b>Enter</b> to have Argo look for it.':'Nothing matches.'):'Your Library is empty.<br>Click <b>+ Add</b> to choose folders, files or docs, or drag them in from Finder.';list.append(e)}
+  stats.textContent=`${lib.items.length} item${lib.items.length===1?'':'s'}`+(shown.length+more.length!==lib.items.length?` · ${shown.length+more.length} shown`:'');
   if(mdlg.open&&!mdlg.contains(document.activeElement))drawManage();
 }
-async function load(){[lib,st]=await Promise.all(['/api/library','/api/status'].map(u=>fetch(u).then(r=>r.json())));rev=st.lib_rev;render();pill()}
+async function load(){[lib,st,others]=await Promise.all(['/api/library','/api/status','/api/labeled'].map(u=>fetch(u).then(r=>r.json())));
+  rev=st.lib_rev;trev=st.rev;render();pill()}
 function pill(){  // Argo status, as in Task Manager
   const work=st.busy.filter(x=>x!=='check'),waiting=lib.items.filter(x=>x.retry).length;
   argo.className='pill'+(!st.configured?'':work.length||st.busy.includes('check')?' busy':st.argo?' ok':st.argo===false?' down':'');
@@ -2153,7 +2466,7 @@ async function tick(){
   try{st=await (await fetch('/api/status')).json()}catch{return}
   pill();
   for(const e of document.querySelectorAll('.c[data-id]'))e.classList.toggle('thinking',st.busy.includes(e.dataset.id));
-  if(st.lib_rev!==rev&&document.activeElement===document.body&&!document.querySelector('.c details[open]')&&!dragId)load();
+  if((st.lib_rev!==rev||st.rev!==trev)&&document.activeElement===document.body&&!document.querySelector('.c details[open]')&&!dragId)load();
 }
 argo.onclick=()=>{fetch('/api/argo/check',{method:'POST'}).then(tick);setTimeout(tick,150)};
 setInterval(tick,2000);
@@ -2170,22 +2483,21 @@ function mrow(name,count,ren,del,h){
 for(const [i,op] of [[m_ng,'add_group'],[m_nl,'add_label']])
   i.onkeydown=async e=>{if(e.key!=='Enter')return;e.preventDefault();const name=i.value.trim();i.value='';if(name){await meta({op,name});drawManage()}};
 function drawManage(){
-  const n=f=>lib.items.filter(f).length;
+  const n=f=>[...lib.items,...others].filter(f).length;
   m_groups.replaceChildren(...lib.groups.map(g=>mrow(g,n(x=>x.group===g),to=>meta({op:'rename_group',name:g,to}),
-    ()=>confirm(`Delete the group "${g}"? Its items stay, ungrouped.`)&&meta({op:'delete_group',name:g}))));
+    ()=>confirm(`Delete the type "${g}"? Its items stay, with no type.`)&&meta({op:'delete_group',name:g}))));
   m_labels.replaceChildren(...allLabels().map(l=>mrow(l,n(x=>x.labels.includes(l)),to=>meta({op:'rename_label',name:l,to}),
-    ()=>confirm(`Delete the label "${l}" from every item?`)&&meta({op:'delete_label',name:l}),lhue(l))));
+    ()=>confirm(`Delete the label "${l}" everywhere (Library, tasks and Scout)?`)&&meta({op:'delete_label',name:l}),lhue(l))));
 }
 function openManage(){drawManage();mdlg.showModal()}
 mform.onsubmit=e=>{e.preventDefault();mdlg.close()};
 mdlg.addEventListener('focusout',()=>setTimeout(()=>{if(mdlg.open&&!mdlg.contains(document.activeElement))drawManage()}));
 // ---- add ----
 addbtn.onclick=()=>{a_paths.value='';a_log.replaceChildren();a_save.disabled=false;
-  a_grp.replaceChildren(new Option('Let Argo choose',''),...lib.groups.map(g=>new Option(g)));
-  if(sel.startsWith('g:')&&sel.length>2)a_grp.value=sel.slice(2);adddlg.showModal();a_paths.focus()};
+  a_grp.replaceChildren(new Option('Automatic',''),...lib.groups.map(g=>new Option(g)));adddlg.showModal();a_paths.focus()};
 a_close.onclick=()=>adddlg.close();
 const picker=window.webkit?.messageHandlers?.choose;  // only in the Mac app
-a_browse.hidden=a_hint.hidden=!picker;a_browse.onclick=()=>picker.postMessage(0);
+a_zone.hidden=!picker;if(!picker)document.querySelector('.lbl b').textContent='Paste paths and links';a_zone.querySelector('.zi').innerHTML=I.folder;a_browse.onclick=()=>picker.postMessage(0);
 function chosen(paths){  // called by the Mac app with the picked paths
   const have=a_paths.value.split('\n').filter(s=>s.trim());
   a_paths.value=[...new Set([...have,...paths])].join('\n');a_save.focus();
@@ -2207,17 +2519,32 @@ function dropped(j){drop.classList.remove('over');load();  // called by the Mac 
 addEventListener('dragover',e=>{e.preventDefault();if(!dragId)drop.classList.add('over')});
 addEventListener('dragleave',e=>{if(!e.relatedTarget)drop.classList.remove('over')});
 addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('over');  // only reached in a browser: it hides file paths
-  if(!dragId)toast('Browsers hide file paths: use + Add and paste them (⌥⌘C in Finder), or use the Mac app')});
+  const u=e.dataTransfer.getData('text/uri-list')||e.dataTransfer.getData('text/plain');
+  if(!dragId&&/^https?:\/\//.test(u))fetch('/api/library/add',{method:'POST',body:JSON.stringify({paths:u.split(/\s+/).filter(Boolean)})}).then(r=>r.json()).then(dropped);
+  else if(!dragId)toast('Browsers hide file paths: use + Add and paste them (⌥⌘C in Finder), or use the Mac app')});
 // ---- search & ask ----
-function answer(text){const b=el('button',0,'×');b.title='Close';b.onclick=()=>ans.hidden=true;ans.replaceChildren(text,b);ans.hidden=false}
+function answer(text,j){const b=el('button',0,'×');b.title='Close';b.onclick=()=>ans.hidden=true;ans.replaceChildren(text,b);ans.hidden=false;
+  if(!j)return;
+  if(j.steps.length)ans.append(el('div','steps',j.steps.join(' → ')));
+  const refs=el('div','refs');refs.append(...j.refs.map(r=>{const x=r.ref.startsWith('lib:')&&lib.items.find(y=>'lib:'+y.id===r.ref);return x?card(x):mini(r)}));
+  if(j.refs.length)ans.append(refs);
+  render();  // under the answer: the whole Library again, not the plain-text filter's "nothing matches"
+}
 q.oninput=render;
+let asking=null;  // AbortController of the running Argo search
+const wordy=v=>v.endsWith('?')||v.split(/\s+/).length>2||/^(what|where|which|who|when|why|how|find|show|list|any|is|are|do|did|can)\b/i.test(v);
 q.onkeydown=async e=>{
-  if(e.key==='Escape'){q.value='';ans.hidden=true;render();q.blur()}
+  if(e.key==='Escape'){asking?.abort();q.value='';ans.hidden=true;render();q.blur()}
   const v=q.value.trim();
-  if(e.key==='Enter'&&v.endsWith('?')){
-    answer('Asking Argo…');
-    const r=await fetch('/api/library/ask',{method:'POST',body:JSON.stringify({q:v})}).catch(()=>({}));
-    answer(r.ok?(await r.json()).answer:'Argo is unavailable right now (down, or not on VPN). Try again later.');
+  // Enter: a question or request goes to Argo; a keyword or two that the filter already matches stays a plain search
+  if(e.key==='Enter'&&v&&(wordy(v)||!list.querySelector('.c'))){
+    if(!st.configured)return v.endsWith('?')&&answer('Argo is off. Set your Argo username in Settings to ask questions.');
+    asking?.abort();asking=new AbortController();
+    answer('✨ Argo is searching your Library, tasks, Scout and Spotlight…  (Esc cancels)');
+    const r=await fetch('/api/library/ask',{method:'POST',body:JSON.stringify({q:v}),signal:asking.signal}).catch(()=>null);
+    if(!r)return;  // cancelled
+    if(!r.ok)return answer('Argo is unavailable right now (down, or not on VPN). The list below is a plain text search.');
+    const j=await r.json();answer(j.answer||'No answer.',j);
   }
 };
 addEventListener('keydown',e=>{if(e.key==='/'&&!/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)){e.preventDefault();q.focus()}});

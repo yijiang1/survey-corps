@@ -76,7 +76,7 @@ class DropWebView: WKWebView {
 
     func isFile(_ s: NSDraggingInfo) -> Bool {
         let types = s.draggingPasteboard.types ?? []
-        return types.contains(.fileURL) || types.contains(where: Self.promiseTypes.contains)
+        return types.contains(.fileURL) || types.contains(where: Self.promiseTypes.contains) || (library && types.contains(.URL))
     }
     // super still runs so the page shows its drop highlight
     override func draggingEntered(_ s: NSDraggingInfo) -> NSDragOperation {
@@ -89,8 +89,8 @@ class DropWebView: WKWebView {
         guard isFile(s) else { return super.performDragOperation(s) }
         let pb = s.draggingPasteboard
         if library {
-            let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
-            post("api/library/add", ["paths": urls.map(\.path)]) { data, _ in
+            let urls = pb.readObjects(forClasses: [NSURL.self]) as? [URL] ?? []  // files, or links dragged from a browser
+            post("api/library/add", ["paths": urls.map { $0.isFileURL ? $0.path : $0.absoluteString }]) { data, _ in
                 let json = data.flatMap { String(data: $0, encoding: .utf8) } ?? "{\"added\":[],\"skipped\":[]}"
                 self.evaluateJavaScript("dropped(\(json))")
             }
@@ -618,8 +618,9 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         let text = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         switch kind {
         case "library":
-            guard !files.isEmpty else { say(kind, "", "Drop files or folders from Finder on me", ok: false); return false }
-            addToLibrary(files.map(\.path))
+            let link = (pb.readObjects(forClasses: [NSURL.self]) as? [URL])?.first { !$0.isFileURL }?.absoluteString ?? text
+            guard !files.isEmpty || link.hasPrefix("http") else { say(kind, "", "Drop files, folders or a link on me", ok: false); return false }
+            addToLibrary(files.isEmpty ? [link] : files.map(\.path))
         case "scout":
             let link = (pb.readObjects(forClasses: [NSURL.self]) as? [URL])?.first { !$0.isFileURL }?.absoluteString ?? text
             guard link.hasPrefix("http") else { say(kind, "", "Drop a link on me: arXiv, YouTube, GitHub or any page", ok: false); return false }

@@ -37,12 +37,15 @@ A small local task manager for macOS that turns Outlook emails into to-dos.
 
 **Library (third pet, third window)**
 - A third pet (blond bob, open book) opens the **Library**: one place for your local projects, files and docs.
-- Drag folders or files in from Finder, or use **+ Add** and paste paths (⌥⌘C in Finder copies them). Tick "Add each subfolder as its own item" and paste `~/Research/Projects` to add every project at once.
-- Each item sits in one **group** (Projects, Papers, Docs, Data to start) and can have any number of coloured **labels**. Change them inline, or drag an item onto a group or label in the sidebar. **Edit groups & labels…** adds, renames (renaming onto an existing name merges), recolours and deletes them.
-- With Argo, each new item gets a one-line summary, a group and labels, from its name plus a folder's file list and README, or a file's first few KB (PDFs: title and authors only). It never overrides what you set; if Argo is down, it retries later.
-- Search covers names, paths, groups, labels, notes, summaries and that contents snippet. End the search with `?` to ask Argo ("where's my beamtime analysis?").
+- Drag folders or files in from Finder, or use **+ Add** and paste paths (⌥⌘C in Finder copies them). Tick "Add each subfolder of a folder as its own item" and paste `~/Research/Projects` to add every project at once.
+- Links work too: paste or drag in a YouTube video, arXiv paper, GitHub repo or any web page (Scout's link reader fills in the title and description). A link straight to a PDF is downloaded into `data/files` and added as a file.
+- Each item has a **type**, what it is: Folders, Papers, Docs, Slides, Data, Code, Images, Videos, Websites or Other. It's set automatically from the file type or link (a PDF with an abstract or DOI counts as a paper) and you can change it inline. **Labels** are what it's about (projects, topics), any number per item. Drag an item onto a type or label in the sidebar to change it. **Edit types & labels…** adds, renames (renaming onto an existing name merges), recolours and deletes them.
+- With Argo, each new item gets a one-line summary and labels, from its name plus a folder's file list and README, or a file's first few KB (PDFs too, read with macOS's PDFKit; scanned PDFs without text fall back to title and authors). It never overrides what you set; if Argo is down, it retries later.
+- **Labels are shared** by all three windows: one vocabulary (suggested as you type), one colour per label (pick it in the Library), and renaming or deleting a label in **Edit types & labels…** applies everywhere. Scout cards take labels too (**+ label** on each card; Argo also tags new finds with your existing labels), and 📌 passes them on to the task.
+- **Label view**: click a label in the Library sidebar to see everything with it on one page: files and folders, tasks and emails, and Scout papers, videos and repos. Click a type as well to narrow it (say, only the emails); the type counts follow the label.
+- Search covers names, paths, types, labels, notes, summaries and that contents snippet. Typing filters instantly; press Enter on a question or request in plain words ("slides from my last beamtime talk") and Argo takes it: it searches the Library, your tasks and emails, Scout and Spotlight, reads what looks promising, then answers with links to what it found (up to 6 rounds). Files it finds outside the Library can be added with one click. It only looks in your home folder, never in `~/Library` or dot-folders, and what it reads goes to Argo.
 - Buttons on each item: Open, Show in Finder, open in your editor (`"library_editor"` in `data/config.json`, default Visual Studio Code), open in Terminal, copy path, and remove (only from the Library; the file stays on disk). Items that moved are flagged; fix the path under Notes & contents.
-- Stored in `data/library.json`. Only the summary inputs above go to Argo.
+- Stored in `data/library.json`. Argo gets the summary inputs above, plus what an ask (`?`) search reads.
 
 **macOS integration**
 - macOS notification when a task comes due.

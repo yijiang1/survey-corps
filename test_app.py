@@ -8,9 +8,10 @@ assert clean_suggestion('{"actions": ["Send slides", "", "Book room"]}', now)["a
 assert clean_suggestion('{"labels": [], "due": "2026-10-01T17:00"}', now)["due"] == ""  # past
 assert clean_suggestion('{"due": "next friday"}', now)["due"] == ""                      # malformed
 assert clean_suggestion("no json", now) == {"labels": [], "due": "", "title": "", "actions": []}
-assert clean_scores('ok [{"i": 0, "score": 12, "why": "x"}, {"i": "1", "score": 3}, {"score": 5}, {"i": 2, "score": "?"}]') == {0: (10.0, "x"), 1: (3.0, "")}
+assert clean_scores('ok [{"i": 0, "score": 12, "why": "x"}, {"i": "1", "score": 3}, {"score": 5}, {"i": 2, "score": "?"}]') == {0: (10.0, "x", []), 1: (3.0, "", [])}
+assert clean_scores('[{"i": 0, "score": 7, "why": "a", "labels": ["ptychography", "Made Up", "AI"]}]', ["Ptychography", "AI"]) == {0: (7.0, "a", ["AI", "Ptychography"])}
 assert clean_scores(None) == {} and clean_scores("[oops") == {}
-assert clean_scores('[{"i": 0, "score": 7, "why": "a"}, {"i": 1, "score": 4, "wh') == {0: (7.0, "a")}  # truncated reply
+assert clean_scores('[{"i": 0, "score": 7, "why": "a"}, {"i": 1, "score": 4, "wh') == {0: (7.0, "a", [])}  # truncated reply
 a = parse_arxiv(b'''<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/2610.01234v2</id>
 <title>A  new\n ptychography</title><published>2026-10-15T00:00:00Z</published><summary> abc </summary>
 <author><name>A</name></author><author><name>B</name></author><author><name>C</name></author><author><name>D</name></author></entry></feed>''')
@@ -50,9 +51,12 @@ assert [(x["id"], x["title"], x["by"]) for x in v] == [("yt:abc", "Agents rule",
 assert v[0]["date"] == (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
 
 # Library: Argo's suggestion is validated, groups/labels edits cascade to items, folders are split into projects
-assert app.clean_lib_suggestion('x {"summary": " A  tool ", "group": "projects", "labels": ["Py", "", "' + "x" * 30 + '"]}', ["Projects"]) == {
-    "summary": "A tool", "group": "Projects", "labels": ["Py"]}
-assert app.clean_lib_suggestion('{"group": "Made Up"}', ["Projects"])["group"] == "" and app.clean_lib_suggestion("nope", []) == {"summary": "", "group": "", "labels": []}
+assert app.clean_lib_suggestion('x {"summary": " A  tool ", "group": "x", "labels": ["Py", "", "' + "x" * 30 + '"]}') == {
+    "summary": "A tool", "labels": ["Py"]}
+assert app.clean_lib_suggestion("nope") == {"summary": "", "labels": []}
+x = {"folder": False, "path": "/a/b.PDF", "peek": "Abstract. We show"}
+assert app.auto_type(x) == "Papers" and app.auto_type({**x, "peek": "Invoice"}) == "Docs" and app.auto_type({**x, "path": "/a/c.h5"}) == "Data"
+assert app.auto_type({**x, "folder": True}) == "Folders" and app.auto_type({**x, "src": "YouTube"}) == "Videos"
 lib = {"groups": ["A", "B"], "labels": {"X": 40}, "items": [{"group": "A", "labels": ["X", "Y"]}, {"group": "B", "labels": ["Y"]}]}
 app.lib_meta(lib, {"op": "rename_group", "name": "A", "to": "B"})  # merge
 assert lib["groups"] == ["B"] and [x["group"] for x in lib["items"]] == ["B", "B"]
@@ -105,4 +109,59 @@ seen = []
 app.argo = lambda prompt, n, **kw: seen.append(prompt) or "Friday."
 assert app.ask_mail({**app.blank(), "title": "Beamtime", "body": "Slot is Friday", "sender": "Bob", "date": ""}, "when?") == "Friday."
 assert "Question: when?" in seen[-1] and "Slot is Friday" in seen[-1]
+print("ok")
+
+# shared labels: renaming cascades; agentic search runs tools then resolves refs, never leaking hidden paths
+lib = {"groups": [], "labels": {}, "items": [{"labels": ["Ptycho", "B"]}, {"labels": ["B"]}]}
+app.relabel(lib["items"], "Ptycho", "Ptychography")
+assert [x["labels"] for x in lib["items"]] == [["B", "Ptychography"], ["B"]]
+assert app.readable(app.HOME / ".ssh") is None and app.readable(app.HOME / "Library") is None and app.readable(app.HOME) is None
+t = {**app.blank(), "title": "Beamtime proposal", "body": "draft due", "sender": "Bob", "date": "", "eml": True, "labels": ["Beamtime"]}
+app.save([t])
+turns = iter(['{"search": "beamtime proposal"}', '{"read": "task:%s"}' % t["id"],
+              '{"answer": "Bob sent it.", "refs": ["task:%s", "/nope", "%s"]}' % (t["id"], app.HOME / ".ssh")])
+seen = []
+app.argo = lambda prompt, n, **kw: seen.append(prompt) or next(turns)
+r = app.lib_ask("where is the beamtime proposal?")
+assert r["answer"] == "Bob sent it." and [x["ref"] for x in r["refs"]] == ["task:" + t["id"]], r
+assert r["steps"][0] == "Searched “beamtime proposal”" and "draft due" in seen[2] and "Beamtime proposal" in seen[1]
+app.argo = lambda prompt, n, **kw: None
+assert app.lib_ask("x?") is None
+print("ok")
+
+# links in the Library: read by Scout's link reader, deduped by address; a bad link is skipped with why
+app.LIB = Path(tempfile.mkdtemp()) / "library.json"
+app.link_item = lambda url: {"id": "yt:abc", "src": "YouTube", "title": "Ptycho talk", "url": url, "by": "Ch", "date": "2026-10-19", "text": ""}
+app.argo = lambda prompt, n, **kw: None
+new, skipped = app.lib_add(["https://www.youtube.com/watch?v=abc", "www.youtube.com/watch?v=abc"])
+assert [(x["name"], x["src"], x["path"], x["peek"]) for x in new] == [("Ptycho talk", "YouTube", "https://www.youtube.com/watch?v=abc", "Ch\n2026-10-19")], new
+assert skipped == ["Ptycho talk: already in the Library"], skipped
+def boom(url): raise OSError("offline")
+app.link_item = boom
+assert app.lib_add(["https://example.com"])[1] == ["https://example.com: couldn't read that link (offline)"]
+# old groups -> automatic types; the user's own group survives
+import json
+app.LIB.write_text(json.dumps({"groups": ["Projects", "Papers", "Mine"], "labels": {}, "items": [
+    {"group": "Projects", "folder": True, "path": "/p", "peek": "", "labels": []},
+    {"group": "Mine", "folder": False, "path": "/a.py", "peek": "", "labels": []},
+    {"group": "", "folder": False, "path": "/b.key", "peek": "", "labels": []}]}))
+m = app.load_lib()
+assert m["groups"] == app.TYPES + ["Mine"] and [x["group"] for x in m["items"]] == ["Folders", "Mine", "Slides"] and m["v"] == 2, m
+print("ok")
+
+# one-time Scout relabel: only unlabeled 5+ items, never over the user's labels, retried until Argo answers
+app.FEED = Path(tempfile.mkdtemp()) / "feed.json"
+it = lambda i, score, labels: {"id": i, "src": "arXiv", "title": i, "by": "", "text": "", "score": score, "why": "w", "labels": labels}
+app.save_feed({"last": "", "errors": [], "seen": [], "items": [it("a", 8, []), it("b", 3, []), it("c", 7, ["Mine"])]})
+app.argo = lambda prompt, n, **kw: None
+app.relabel_scout()
+assert "relabeled" not in app.load_feed()  # Argo down: try again next launch
+seen = []
+app.argo = lambda prompt, n, **kw: seen.append(prompt) or '[{"i": 0, "score": 2, "labels": ["mine", "Made Up"]}]'
+app.relabel_scout()
+f = app.load_feed()
+assert [(x["labels"], x["score"], x["why"]) for x in f["items"]] == [(["Mine"], 8, "w"), ([], 3, "w"), (["Mine"], 7, "w")], f
+assert f["relabeled"] and len(seen) == 1 and "0. [arXiv] a" in seen[0] and "\n1. " not in seen[0]  # only "a" asked
+app.relabel_scout()
+assert len(seen) == 1  # done once
 print("ok")
