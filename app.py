@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Survey Corps: local todo list fed by emails dragged from Outlook. Run: python3 app.py"""
 from collections import Counter
-import html, json, os, re, socket, sqlite3, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
+import html, inspect, json, os, re, socket, sqlite3, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email import message_from_bytes, policy
@@ -377,8 +377,9 @@ DESKTOP = Path.home() / "Library" / "Application Support" / "Claude" / "claude-c
 desktop, desktop_at = {}, 0.0  # Claude Code session id -> {"id": local_…, "title": sidebar title}; when last read
 
 
-def agent_event(e, tool="cc", pid=0):
-    """A Claude Code hook payload (tool "cc") or a Codex notify payload; a bubble when one finishes or needs you."""
+def agent_event(e, tool="cc", pid=0, host=""):
+    """A Claude Code hook payload (tool "cc") or a Codex notify payload; a bubble when one finishes or needs you.
+    host: "user@host" when the hook ran on a remote machine (through tunnel()); its pid and transcript aren't ours."""
     where = Path(e.get("cwd") or "?").name
     if tool == "codex":
         if e.get("type") == "agent-turn-complete":
@@ -394,15 +395,17 @@ def agent_event(e, tool="cc", pid=0):
     if not sid or ev not in CC_STATE:
         return
     if sid not in cc:
-        cc[sid] = {"cwd": e.get("cwd") or "", "state": "", "since": 0, "pid": pid, "open": app_of(pid)}
+        cwd = e.get("cwd") or ""
+        cc[sid] = {"cwd": cwd, "state": "", "since": 0, "pid": 0 if host else pid,
+                   "tool": remote_tool(host) if host else "Claude Code", "open": remote_open(host, cwd) if host else app_of(pid)}
     a = cc[sid]
     if a["state"] != CC_STATE[ev]:
         a["state"], a["since"] = CC_STATE[ev], time.time()
-    if ev in ("Stop", "Notification") and e.get("transcript_path"):
+    if ev in ("Stop", "Notification") and e.get("transcript_path") and not host:
         a["cached_until"] = cache_expiry(Path(e["transcript_path"])) or a.get("cached_until", 0)
     if ev in ("Stop", "Notification"):
         text = f"Finished in {where}" if ev == "Stop" else f"Needs you in {where}: {flat(str(e.get('message') or ''), 90)}"
-        threading.Thread(target=say, args=("levi", "Claude Code", text), daemon=True).start()
+        threading.Thread(target=say, args=("levi", a.get("tool", "Claude Code"), text), daemon=True).start()
 
 
 def transcript_info(transcript):
@@ -412,14 +415,15 @@ def transcript_info(transcript):
     out = {"cwd": "", "title": "", "entry": "", "last": 0, "cached_until": 0}
     try:
         with transcript.open("rb") as f:
-            f.seek(max(0, f.seek(0, 2) - 300_000))  # the tail is enough: the title and cwd repeat, the last call is last
+            head = f.read(65536).decode(errors="ignore")  # cwd: where it started (a session can cd away later)
+            f.seek(max(0, f.seek(0, 2) - 300_000))  # the tail is enough: the title repeats, the last call is last
             lines = f.read().decode(errors="ignore").splitlines()
     except OSError:
         return out
     for line in reversed(lines):
         try:
             d = json.loads(line)
-            out["title"] = out["title"] or (d.get("customTitle") or "")
+            out["title"] = out["title"] or d.get("customTitle") or d.get("aiTitle") or ""  # yours, else Claude's
             out["cwd"], out["entry"] = out["cwd"] or d.get("cwd") or "", out["entry"] or d.get("entrypoint") or ""
             if not out["last"] and d.get("timestamp"):
                 out["last"] = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
@@ -431,7 +435,43 @@ def transcript_info(transcript):
             continue
         if all(out.values()):
             break
+    start = re.search(r'"cwd":\s*("(?:[^"\\]|\\.)*")', head)
+    out["cwd"] = json.loads(start[1]) if start else out["cwd"]
     return out
+
+
+def remote_tool(host):
+    return f"Claude Code @{host.split('@')[-1].split('.')[0]}"
+
+
+def remote_open(host, cwd):
+    return f"vscode://vscode-remote/ssh-remote+{host}{urllib.parse.quote(cwd)}"
+
+
+remote = {}  # "user@host" -> [{"id", "mtime", **transcript_info}]: that host's recent transcripts, from remote_scan()
+REMOTE_SCAN = inspect.getsource(transcript_info) + f"""
+import json, re, time
+from datetime import datetime
+from pathlib import Path
+out = []
+for p in (Path.home() / ".claude" / "projects").glob("*/*.jsonl"):
+    m = p.stat().st_mtime
+    if time.time() - m < {WINDOW}:
+        out.append(dict(id=p.stem, mtime=m, **transcript_info(p)))
+print(json.dumps(out))
+"""
+
+
+def remote_scan(target):
+    """Reads an SSH host's recent Claude Code transcripts with transcript_info() run there, so its sessions show
+    even when no hook has reported since this server started (or since they started, if before the hooks).
+    Keeps the last result when the host is unreachable: those rows just age."""
+    try:
+        r = subprocess.run(["ssh", "-x", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", target, "python3 -"],
+                           input=REMOTE_SCAN, capture_output=True, text=True, timeout=60)
+        remote[target] = json.loads(r.stdout)
+    except (subprocess.TimeoutExpired, ValueError):
+        pass
 
 
 def cache_expiry(transcript):
@@ -503,7 +543,9 @@ def agents(now=None):
     now = now or time.time()
     for sid in [s for s, a in cc.items() if a["pid"] and not alive(a["pid"])]:
         cc.pop(sid, None)  # closed without SessionEnd (killed terminal, crash)
-    out = [{"tool": "Claude Code", "where": Path(a["cwd"]).name, "state": a["state"], "mins": int(now - a["since"]) // 60,
+    for sid in [s for s, a in cc.items() if not a["pid"] and a["state"] != "working" and now - a["since"] > WINDOW]:
+        cc.pop(sid, None)  # remote: no pid to check, so one quiet for WINDOW is taken as gone
+    out = [{"tool": a.get("tool", "Claude Code"), "where": Path(a["cwd"]).name, "state": a["state"], "mins": int(now - a["since"]) // 60,
             "open": a.get("open", ""),
             **({"cache": max(0, int(a["cached_until"] - now) // 60), "id": sid, "until": a["cached_until"]}
                if a.get("cached_until") and a["state"] != "working" else {})}
@@ -529,6 +571,18 @@ def agents(now=None):
                     "mins": int(age) // 60,
                     **({"cache": max(0, int(t["cached_until"] - now) // 60), "id": p.stem, "until": t["cached_until"]}
                        if t["cached_until"] and age >= 60 else {})})
+    seen = set()  # hosts sharing a home (NFS) list the same transcripts
+    for target, found in remote.items():  # ponytail: shared home -> labelled with the first host, which may not be where it ran
+        for t in found:
+            age = now - (t["last"] or t["mtime"])
+            if t["id"] in cc or t["id"] in cc_ended or t["id"] in seen or t["entry"].startswith("sdk") or age > WINDOW:
+                continue
+            seen.add(t["id"])
+            out.append({"tool": remote_tool(target), "where": t["title"] or Path(t["cwd"]).name or "?",
+                        "state": "working" if age < 60 else "idle", "open": remote_open(target, t["cwd"]),
+                        "mins": int(age) // 60,
+                        **({"cache": max(0, int(t["cached_until"] - now) // 60), "id": t["id"], "until": t["cached_until"]}
+                           if t["cached_until"] and age >= 60 else {})})
     for tid, name, rollout, ms in codex_threads(now - WINDOW):
         try:
             last = max(ms / 1000, Path(rollout).stat().st_mtime)  # the log moves while a turn runs
@@ -556,10 +610,30 @@ def warn_caches(now=None):
 def agents_loop():
     while True:
         try:
+            for target in config().get("remotes", []):
+                remote_scan(target)
             warn_caches()
         except Exception as e:  # a bad transcript must not stop the warnings for good
             print("agents:", e)
         time.sleep(30)
+
+
+def tunnel(target):
+    """Keeps /tmp/survey-corps-<user>.sock on an SSH host (config "remotes": ["user@host", ...]) forwarded to this
+    server, so Claude Code hooks there can report (hooks/README). A Unix socket, mode 0600: other users on a shared
+    machine can't reach this server, as they could a forwarded TCP port. Retries each minute (off VPN, asleep)."""
+    ssh = ["ssh", "-x", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+    while True:
+        # sshd leaves the socket behind on disconnect, and a stale one blocks the next forward
+        r = subprocess.run(ssh + [target, 'rm -f /tmp/survey-corps-"$USER".sock; echo "$USER"'],
+                           capture_output=True, text=True)
+        user = r.stdout.strip()
+        if r.returncode == 0 and user:
+            # `cat` on our stdin, not -N: if this server dies, the pipe closes and the tunnel ends with it
+            subprocess.Popen(ssh + ["-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30",
+                                    "-R", f"/tmp/survey-corps-{user}.sock:127.0.0.1:{PORT}", target, "cat >/dev/null"],
+                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait()
+        time.sleep(60)
 
 
 def notify(title, msg):
@@ -1461,7 +1535,9 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/agent":  # hooks/: ?tool=cc&pid=<claude pid> with the hook's JSON, or ?tool=codex with notify's
             q = parse_qs(u.query)
             try:
-                agent_event(json.loads(raw or b"{}"), q.get("tool", ["cc"])[0], int(q.get("pid", ["0"])[0] or 0))
+                host = q.get("host", [""])[0]
+                agent_event(json.loads(raw or b"{}"), q.get("tool", ["cc"])[0], int(q.get("pid", ["0"])[0] or 0),
+                            host if re.fullmatch(r"[\w.-]+@[\w.-]+", host) else "")
             except (ValueError, AttributeError):  # not JSON / not an object / bad pid
                 return self.reply(400)
             return self.reply(200)
@@ -2782,6 +2858,8 @@ if __name__ == "__main__":
     threading.Thread(target=watcher, daemon=True).start()
     threading.Thread(target=scout_loop, daemon=True).start()
     threading.Thread(target=agents_loop, daemon=True).start()
+    for target in config().get("remotes", []):
+        threading.Thread(target=tunnel, args=(target,), daemon=True).start()
     print(f"Survey Corps on {ORIGIN}  (data in {DATA}, Finder fallback inbox: {INBOX})")
     if "--no-browser" not in sys.argv:  # the Mac app passes this and shows its own window
         subprocess.run(["open", "-a", "Safari", ORIGIN])  # Chromium browsers drop Outlook drags

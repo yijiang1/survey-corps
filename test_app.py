@@ -211,6 +211,30 @@ assert "s1" not in app.cc and [a["tool"] for a in app.agents()] == ["Codex"]
 assert app.agents(now=_t.time() + 120)[0]["state"] == "idle" and app.agents(now=_t.time() + 13 * 3600) == []
 print("ok")
 
+iso = lambda secs_ago: datetime.utcfromtimestamp(_t.time() - secs_ago).isoformat() + "Z"
+# remote Claude Code (hooks on an SSH host, through the tunnel): no pid check, opens VS Code on that host
+said.clear()
+app.agent_event({"session_id": "r", "cwd": "/home/me/My Proj", "hook_event_name": "UserPromptSubmit"}, "cc", 4242, "me@refiner.lab.gov")
+app.agent_event({"session_id": "r", "cwd": "/home/me/My Proj", "hook_event_name": "Stop", "transcript_path": "/home/me/x.jsonl"}, "cc", 4242, "me@refiner.lab.gov")
+_t.sleep(0.2)
+r = next(a for a in app.agents() if a["tool"] == "Claude Code @refiner")
+assert (r["where"], r["state"], r["open"]) == ("My Proj", "idle", "vscode://vscode-remote/ssh-remote+me@refiner.lab.gov/home/me/My%20Proj"), r
+assert said == [("Claude Code @refiner", "Finished in My Proj")] and "cache" not in r, said
+assert not any(a["tool"].startswith("Claude Code @") for a in app.agents(now=_t.time() + 13 * 3600))  # quiet too long: gone
+app.cc.clear()
+# ...and from remote_scan(): transcripts read over SSH; hosts sharing a home list each session once
+rt = Path(tempfile.mkdtemp()) / "rt.jsonl"
+rt.write_text(json.dumps({"type": "user", "cwd": "/h/TomoX", "entrypoint": "claude-vscode", "timestamp": iso(30)}) + "\n"
+              + json.dumps({"type": "user", "cwd": "/h/talks", "timestamp": iso(30)}) + "\n"
+              + json.dumps({"type": "ai-title", "aiTitle": "Radiation damage"}) + "\n")
+info = app.transcript_info(rt)
+assert (info["cwd"], info["title"]) == ("/h/TomoX", "Radiation damage"), info  # where it started; Claude's title
+app.remote = {"me@a.x": [{"id": "rt", "mtime": _t.time(), **info}], "me@b.x": [{"id": "rt", "mtime": _t.time(), **info}]}
+assert [(a["tool"], a["where"], a["state"], a["open"]) for a in app.agents() if "@" in a["tool"]] == [
+    ("Claude Code @a", "Radiation damage", "working", "vscode://vscode-remote/ssh-remote+me@a.x/h/TomoX")]
+app.remote = {}
+print("ok")
+
 # prompt cache: last API call + the TTL it wrote (1 h or 5 min); shown on idle sessions only
 tr = Path(tempfile.mkdtemp()) / "s.jsonl"
 call = lambda ts, m5, h1: json.dumps({"type": "assistant", "timestamp": ts, "message": {"usage": {
