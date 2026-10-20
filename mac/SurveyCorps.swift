@@ -668,6 +668,8 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         if pref("petsLinedUp") { lineUp() }
         if pref("petsHidden") { setPetsHidden(true) }
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [unowned self] _ in self.tick() }
+        NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
+                                               name: NSApplication.didChangeScreenParametersNotification, object: nil)
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [unowned self] _ in self.poll() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.poll() }
     }
@@ -843,6 +845,11 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
     var tucked = false, home: [String: NSPoint] = [:], awaySince = Date()
     func pref(_ k: String) -> Bool { UserDefaults.standard.bool(forKey: k) }
     func flip(_ k: String) { UserDefaults.standard.set(!pref(k), forKey: k) }
+    // true when no other screen sits past that side edge of s, along rect r: pets don't tuck into a shared edge
+    func edgeFree(_ s: NSScreen, left: Bool, _ r: NSRect) -> Bool {
+        let past = NSRect(x: left ? s.frame.minX - 1 : s.frame.maxX, y: r.minY, width: 1, height: r.height)
+        return !NSScreen.screens.contains { $0 != s && $0.frame.intersects(past) }
+    }
     func lineUp(near kind: String = "task") {  // a column on the side and half of the screen that pet is on
         untuck(animate: false)
         let a = pets[kind]!.panel, v = (a.screen ?? NSScreen.main!).visibleFrame
@@ -866,17 +873,23 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         tucked = true
         NSAnimationContext.runAnimationGroup { _ in
             for (k, p) in pets {
-                let f = p.panel.frame, v = (p.panel.screen ?? NSScreen.main!).visibleFrame
+                let f = p.panel.frame, s = p.panel.screen ?? NSScreen.main!, v = s.visibleFrame, left = f.midX < v.midX
                 home[k] = f.origin
-                p.panel.animator().setFrame(NSRect(x: f.midX < v.midX ? v.minX - petSize + 28 : v.maxX - 28, y: f.minY,
+                guard edgeFree(s, left: left, f) else { p.panel.animator().alphaValue = 0.25; continue }  // another screen there: fade instead
+                p.panel.animator().setFrame(NSRect(x: left ? v.minX - petSize + 28 : v.maxX - 28, y: f.minY,
                                                    width: petSize, height: petSize), display: true)
             }
         }
+    }
+    @objc func screensChanged() {  // a display plugged in, unplugged or rearranged, or the Dock moved
+        untuck(animate: false)
+        if pref("petsLinedUp") { lineUp() } else { pets.values.forEach { $0.view.keepOnScreen() } }
     }
     func untuck(animate: Bool = true) {
         guard tucked else { return }
         tucked = false
         for (k, p) in pets {
+            p.panel.alphaValue = 1
             guard let o = home[k] else { continue }
             let r = NSRect(origin: o, size: p.panel.frame.size)
             animate ? p.panel.animator().setFrame(r, display: true) : p.panel.setFrame(r, display: true)
