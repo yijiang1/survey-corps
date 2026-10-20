@@ -459,7 +459,6 @@ class PetView: NSView {
     var scout = false, librarian = false, levi = false, frameName = "pet", badgeColor = NSColor.systemRed
     var grab = NSPoint.zero, moved = false
     var overdue = 0 { didSet { if overdue != oldValue { needsDisplay = true } } }  // badge count
-    var review = 0 { didSet { if review != oldValue { needsDisplay = true } } }    // Argo fill-ins to Keep / Undo
     var agents = 0 { didSet { if agents != oldValue { needsDisplay = true } } }    // Claude Code / Codex sessions working
     var agentsWaiting = false { didSet { if agentsWaiting != oldValue { needsDisplay = true } } }  // one needs you
     var hover = false { didSet { if hover != oldValue { needsDisplay = true } } }  // something dragged over it
@@ -476,7 +475,6 @@ class PetView: NSView {
             if !self.busy && self.anim == nil { t.invalidate(); self.ticker = nil }
         }
     }
-    var reviewRect: NSRect { NSRect(x: bounds.maxX - 30, y: 2, width: 28, height: 22) }
     override func draw(_ r: NSRect) {
         // Fully transparent pixels let clicks fall through; a near-invisible fill makes the whole square clickable.
         NSColor.black.withAlphaComponent(0.01).setFill(); bounds.fill()
@@ -517,13 +515,6 @@ class PetView: NSView {
                 (phase % 3 == i ? NSColor.darkGray : NSColor(white: 0.78, alpha: 1)).setFill()
                 NSBezierPath(ovalIn: NSRect(x: t.minX + 7 + CGFloat(i) * 8, y: t.midY - 2.5, width: 5, height: 5)).fill()
             }
-        }
-        if review > 0 {
-            let pill = NSBezierPath(roundedRect: reviewRect, xRadius: 11, yRadius: 11)
-            NSColor.systemOrange.setFill(); pill.fill(); NSColor.white.setStroke(); pill.lineWidth = 2; pill.stroke()
-            let s = NSAttributedString(string: "✓\(review > 9 ? "9+" : "\(review)")", attributes: [
-                .font: NSFont.boldSystemFont(ofSize: 11), .foregroundColor: NSColor.white])
-            s.draw(at: NSPoint(x: reviewRect.midX - s.size().width / 2, y: reviewRect.midY - s.size().height / 2))
         }
         if agents > 0 {  // bottom-left: green while agents work, purple when one is waiting for you
             let s = NSAttributedString(string: "▸\(agents > 9 ? "9+" : "\(agents)")", attributes: [
@@ -628,7 +619,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
     var window: NSWindow!, feedWindow: NSWindow!, libWindow: NSWindow!, settingsWindow: NSWindow!, leviWindow: NSWindow!
     var pets: [String: (panel: NSPanel, view: PetView, window: NSWindow?)] = [:]  // "task", "scout", "library", "levi"
     var bubbles: [String: Bubble] = [:], lastBubble = 0
-    var review: [[String: Any]] = [], routines: [[String: String]] = [], agents: [[String: Any]] = []
+    var routines: [[String: String]] = [], agents: [[String: Any]] = []
     var feedWeb: WKWebView!, libWeb: DropWebView!, settingsWeb: WKWebView!, leviWeb: WKWebView!
     let server = Process()
 
@@ -747,14 +738,13 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.poll() }
     }
 
-    // Everything the pets show comes from one call: badges, who's busy, review queue, new speech bubbles.
+    // Everything the pets show comes from one call: badges, who's busy, new speech bubbles.
     func poll() {
         URLSession.shared.dataTask(with: URL(string: "\(base)/api/pets?after=\(lastBubble)")!) { data, _, _ in
             let s = json(data)
             guard !s.isEmpty else { return }
             DispatchQueue.main.async {
                 let busy = s["busy"] as? [String: Bool] ?? [:]
-                self.review = s["review"] as? [[String: Any]] ?? []
                 self.routines = s["routines"] as? [[String: String]] ?? []
                 self.agents = s["agents"] as? [[String: Any]] ?? []
                 let active = self.agents.filter { $0["state"] as? String != "idle" }
@@ -762,7 +752,6 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
                 self.pets["levi"]?.view.agentsWaiting = active.contains { $0["state"] as? String == "waiting" }
                 for (k, p) in self.pets { p.view.busy = busy[k] ?? false }
                 self.pets["task"]?.view.overdue = s["overdue"] as? Int ?? 0  // red: open tasks past their due time
-                self.pets["task"]?.view.review = self.review.count           // orange: Argo fill-ins to Keep / Undo
                 self.pets["scout"]?.view.overdue = s["picks"] as? Int ?? 0   // blue: unread picks (score 7+, not thumbed down)
                 for b in s["bubbles"] as? [[String: Any]] ?? [] {
                     self.lastBubble = max(self.lastBubble, b["id"] as? Int ?? 0)
@@ -841,22 +830,6 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         }
     }
 
-    func reviewItem(_ r: [String: Any]) -> NSMenuItem {
-        let id = r["id"] as? String ?? "", labels = r["labels"] as? [String] ?? [], due = r["due"] as? String ?? ""
-        var what = labels.isEmpty ? [] : ["labels " + labels.joined(separator: ", ")]
-        if !due.isEmpty { what.append("due " + due.replacingOccurrences(of: "T", with: " ")) }
-        if r["renamed"] as? Bool == true { what.append("renamed") }
-        if let n = r["actions"] as? Int, n > 0 { what.append("\(n) action items") }
-        let title = r["title"] as? String ?? ""
-        let item = NSMenuItem(title: (title.count > 44 ? title.prefix(43) + "…" : title) + "  —  " + what.joined(separator: "; "),
-                              action: nil, keyEquivalent: "")
-        let sub = NSMenu()
-        sub.addItem(Item("Keep") { post("api/todo/\(id)/keep") { _, _ in self.poll() } })
-        sub.addItem(Item("Undo Argo's Changes") { post("api/todo/\(id)/undo") { _, _ in self.poll() } })
-        item.submenu = sub
-        return item
-    }
-
     func menu(_ kind: String) -> NSMenu {
         let m = NSMenu(), p = pets[kind]!
         m.autoenablesItems = false
@@ -870,12 +843,6 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
                 if let v = textPrompt("New task", info: "With Argo, plain language works.", placeholder: "review Bob's draft by Fri 3pm") { self.addTask(v) }
             })
             m.addItem(Item("Ask About My Tasks…") { self.ask(kind, "api/ask", "Ask about your tasks and emails", "what did Bob ask me about the beamtime?") })
-            if !review.isEmpty {
-                m.addItem(.separator())
-                m.addItem(Item("Argo filled in:", enabled: false))
-                review.forEach { m.addItem(reviewItem($0)) }
-                m.addItem(Item("Keep All") { for r in self.review { post("api/todo/\(r["id"] as? String ?? "")/keep") { _, _ in self.poll() } } })
-            }
         case "levi": break  // just show/hide; the window has the sessions
         case "scout":
             m.addItem(Item("Check for New Now") { post("api/feed/refresh") { _, _ in self.poll() } })

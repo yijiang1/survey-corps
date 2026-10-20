@@ -85,24 +85,17 @@ assert app.config() == {"retry_minutes": 1440, "github_token": "tok"}, app.confi
 app.set_settings({"clear_github_token": True})
 assert "github_token" not in app.config()
 print("ok")
-# Pets: routines parse and fire once a day; Argo's fill-ins can be undone; /api/pets sums it up
+# Pets: routines parse and fire once a day; /api/pets sums it up
 app.set_settings({"routines": "fri 17 task: what did I finish?\nweekdays 9 scout: top 3\nsun 25 task: bad hour\nnonsense"})
 assert [(r["days"], r["hour"], r["pet"]) for r in app.routines()] == [("fri", 17, "task"), ("weekdays", 9, "scout")]
 app.RAN = Path(tempfile.mkdtemp()) / "ran.json"
 fri5 = datetime(2026, 10, 23, 17, 30)
 assert [r["pet"] for r in app.due_routines(fri5)] == ["task", "scout"] and app.due_routines(fri5) == []  # once a day
 assert app.due_routines(datetime(2026, 10, 24, 18)) == []                                              # saturday: neither
-t = {**app.blank(), "title": "Review draft", "body": "", "labels": ["Review"], "due": "2026-10-23T17:00", "actions": ["a", "b"],
-     "review": {"labels": ["Review"], "due": "2026-10-23T17:00", "title": "Review draft", "was": "review draft by fri",
-                "body": "review draft by fri", "actions": ["a", "b"]}}
-u = {**t, "labels": ["Mine"]}  # user changed the labels since: those stay
-app.undo_review(t); app.undo_review(u)
-assert (t["title"], t["labels"], t["due"], t["actions"], "review" in t) == ("review draft by fri", [], "", [], False), t
-assert u["labels"] == ["Mine"] and u["due"] == ""
 app.FEED = Path(tempfile.mkdtemp()) / "feed.json"
-app.save([{**app.blank(), "title": "x", "due": "2020-01-01T00:00", "review": {"labels": ["L"]}}])
+app.save([{**app.blank(), "title": "x", "due": "2020-01-01T00:00"}])
 s = app.pets()
-assert s["overdue"] == 1 and s["review"][0]["labels"] == ["L"] and s["routines"][0] == {"line": "fri 17 task: what did I finish?", "pet": "task"}
+assert s["overdue"] == 1 and s["routines"][0] == {"line": "fri 17 task: what did I finish?", "pet": "task"}
 app.say("scout", "Scout", "2 new picks")
 assert app.pets()["bubbles"][-1]["text"] == "2 new picks" and app.pets(after=app.bubbles[-1]["id"])["bubbles"] == []
 seen = []

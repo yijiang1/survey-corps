@@ -188,32 +188,15 @@ def enrich(t):
         cur.pop("retry", None)
         if not s:
             return save(todos)
-        rev = {}  # what Argo filled in, for the pet's Keep / Undo
         if s["labels"] and not cur.get("labels"):
-            cur["labels"] = rev["labels"] = sorted(set(s["labels"]))
+            cur["labels"] = sorted(set(s["labels"]))
         if s["due"] and not cur["due"]:
-            cur["due"], cur["notified"], rev["due"] = s["due"], False, s["due"]
+            cur["due"], cur["notified"] = s["due"], False
         if s["title"] and not t["eml"] and cur["title"] == t["title"]:  # typed task the user hasn't renamed
-            rev["title"], rev["was"], rev["body"] = s["title"], t["title"], cur["body"]
             cur["title"], cur["body"] = s["title"], "" if cur["body"] == t["title"] else cur["body"]
         if s["actions"] and not cur.get("actions"):
-            cur["actions"] = rev["actions"] = s["actions"]
-        if rev:
-            cur["review"] = rev
+            cur["actions"] = s["actions"]
         save(todos)
-
-
-def undo_review(t):
-    """Put back whatever Argo filled in, unless the user has changed that field since."""
-    rev = t.pop("review", None) or {}
-    if "labels" in rev and t.get("labels") == rev["labels"]:
-        t["labels"] = []
-    if "due" in rev and t["due"] == rev["due"]:
-        t["due"] = ""
-    if "title" in rev and t["title"] == rev["title"]:
-        t["title"], t["body"] = rev["was"], rev["body"]
-    if "actions" in rev and t.get("actions") == rev["actions"]:
-        t["actions"] = []
 
 
 def blank():
@@ -1447,7 +1430,7 @@ def lib_ask(q, steps=6):
 
 
 def pets(after=0):
-    """Everything the Mac app's four pets show: badges, who's working, review queue, new bubbles."""
+    """Everything the Mac app's four pets show: badges, who's working, new bubbles."""
     global pets_seen
     pets_seen = time.time()
     now = datetime.now().strftime("%Y-%m-%dT%H:%M")
@@ -1461,8 +1444,6 @@ def pets(after=0):
     ag = agents()
     return {"overdue": sum(1 for t in todos if not t["done"] and t["due"] and t["due"] <= now),
             "picks": sum(1 for x in items if not x["read"] and x["vote"] >= 0 and (x["score"] or 0) >= 7),
-            "review": [{"id": t["id"], "title": t["title"], "labels": t["review"].get("labels", []), "due": t["review"].get("due", ""),
-                        "renamed": "was" in t["review"], "actions": len(t["review"].get("actions", []))} for t in todos if t.get("review") and not t["done"]],
             "busy": {"task": any(not k.startswith(("lib", "scout")) for k in tags),
                      "scout": scout_busy.locked() or "scout" in tags, "library": any(k.startswith("lib") for k in tags),
                      "levi": any(a["state"] == "working" for a in ag)},
@@ -1744,7 +1725,6 @@ class H(BaseHTTPRequestHandler):
                             t[k] = patch[k]
                     if patch.get("done"):
                         t["done_at"] = datetime.now().isoformat(timespec="minutes")  # for "what did I finish" routines
-                    t.pop("review", None)  # touched it: Argo's fill-in no longer needs reviewing
                     if "labels" in patch:
                         t["labels"] = sorted({str(x).strip() for x in patch["labels"] if str(x).strip()})
                     if "due" in patch:
@@ -1755,8 +1735,6 @@ class H(BaseHTTPRequestHandler):
                     if title:
                         todos.insert(0, {**t, **blank(), "title": title, "actions": [], "due": t["due"], "retry": "",
                                          "mail": t.get("mail", t["id"])})
-                elif parts[3] in ("keep", "undo"):  # the pet's review queue
-                    undo_review(t) if parts[3] == "undo" else t.pop("review", None)
                 elif parts[3] == "delete":
                     todos.remove(t)
                     mid = t.get("mail", t["id"])
