@@ -372,6 +372,73 @@ func drawPet(_ b: NSRect, scout: Bool = false, librarian: Bool = false, levi: Bo
     }
 }
 
+// Busy animation over the pet, in drawPet's 64-unit space at time t (s): each pet shows its own kind of work.
+func drawWork(_ b: NSRect, t: Double, scout: Bool = false, librarian: Bool = false, levi: Bool = false) {
+    let k = min(b.width, b.height) / 64
+    NSGraphicsContext.current?.cgContext.scaleBy(x: k, y: k)
+    func rgb(_ r: CGFloat, _ g: CGFloat, _ bl: CGFloat, _ a: CGFloat = 1) -> NSColor {
+        NSColor(srgbRed: r / 255, green: g / 255, blue: bl / 255, alpha: a)
+    }
+    func life(_ period: Double, _ offset: Double = 0) -> CGFloat { CGFloat((t / period + offset).truncatingRemainder(dividingBy: 1)) }
+    func sparkle(_ x: CGFloat, _ y: CGFloat, _ r: CGFloat, _ c: NSColor) {  // four-point star
+        let s = NSBezierPath(); s.move(to: NSPoint(x: x, y: y + r))
+        for (dx, dy) in [(1, 0), (0, -1), (-1, 0), (0, 1)] as [(CGFloat, CGFloat)] {
+            s.curve(to: NSPoint(x: x + dx * r, y: y + dy * r), controlPoint1: NSPoint(x: x, y: y), controlPoint2: NSPoint(x: x, y: y))
+        }
+        c.setFill(); s.fill()
+    }
+
+    if levi {  // code types out on the laptop a line at a time, cursor blinking; clears and starts over
+        rgb(30, 34, 42).setFill(); NSBezierPath(roundedRect: NSRect(x: 17, y: 4, width: 30, height: 13), xRadius: 1.5, yRadius: 1.5).fill()
+        let lines: [(indent: CGFloat, width: CGFloat, color: NSColor)] = [(0, 17, rgb(90, 230, 120)), (3, 12, rgb(120, 180, 255)), (3, 20, rgb(240, 200, 90))]
+        var left = min(life(3) * 1.25, 1) * lines.reduce(0) { $0 + $1.width }, cursor = NSPoint(x: 19, y: 13)
+        for (i, l) in lines.enumerated() where left > 0 {
+            let y = 13 - CGFloat(i) * 3.4, n = min(left, l.width); left -= l.width
+            l.color.setFill(); NSRect(x: 19 + l.indent, y: y, width: n, height: 1.6).fill()
+            cursor = NSPoint(x: 19 + l.indent + n + 0.8, y: y)
+        }
+        if Int(t * 4) % 2 == 0 { rgb(90, 230, 120).setFill(); NSRect(x: cursor.x, y: cursor.y - 0.4, width: 1.5, height: 2.4).fill() }
+        return
+    }
+    if scout {  // a radar sweep turns in the lens, sparkles pop around it: finds
+        let c = NSPoint(x: 54.5, y: 16.5), a = CGFloat((t * 260).truncatingRemainder(dividingBy: 360))
+        let wedge = NSBezierPath(); wedge.move(to: c); wedge.appendArc(withCenter: c, radius: 5.4, startAngle: a - 80, endAngle: a); wedge.close()
+        rgb(60, 200, 255, 0.75).setFill(); wedge.fill()
+        for i in 0..<3 {
+            let p = life(1.1, Double(i) / 3), round = floor(t / 1.1 + Double(i) / 3)
+            let ang = Double(i) * 2.1 + round * 1.7, r: CGFloat = 11
+            let x = c.x + r * CGFloat(cos(ang)), y = max(c.y + r * CGFloat(sin(ang)), 4)
+            sparkle(x, y, 4.2 * sin(p * .pi), rgb(255, 196, 30, sin(p * .pi)))
+        }
+        return
+    }
+    if librarian {  // pages turn right to left, a pause between each
+        let p = min(life(1.4) / 0.65, 1), th = p * .pi, ex = 32 + 17.5 * cos(th), lift = 7 * sin(th)
+        guard p < 1 else { return }
+        let page = NSBezierPath(); page.move(to: NSPoint(x: 32, y: 3)); page.line(to: NSPoint(x: ex, y: 5.3 + lift))
+        page.line(to: NSPoint(x: ex, y: 16.2 + lift)); page.line(to: NSPoint(x: 32, y: 14)); page.close()
+        let shade = 0.82 + 0.18 * abs(cos(th))
+        NSColor(white: shade, alpha: 1).blended(withFraction: 0.5, of: rgb(255, 250, 238))!.setFill(); page.fill()
+        rgb(200, 185, 160).setStroke(); page.lineWidth = 0.6; page.stroke()
+        return
+    }
+    // task pet: little letters rise out of the envelope, one to each side, and turn into green ticks
+    for (i, side) in [(0, 1.0), (1, -1.0)] as [(Int, CGFloat)] {
+        let p = life(1.8, Double(i) / 2), x = 32 + side * (17 + 13 * p), y = 13 + 26 * p - 12 * p * p  // up past the cheeks, clear of the face
+        if p < 0.6 {
+            let a = min(1, p * 6), r = NSRect(x: x - 3.5, y: y - 2.2, width: 7, height: 4.6)
+            rgb(255, 250, 240, a).setFill(); NSBezierPath(roundedRect: r, xRadius: 0.8, yRadius: 0.8).fill()
+            let v = NSBezierPath(); v.move(to: NSPoint(x: r.minX + 0.6, y: r.maxY - 0.6)); v.line(to: NSPoint(x: r.midX, y: r.midY - 0.3))
+            v.line(to: NSPoint(x: r.maxX - 0.6, y: r.maxY - 0.6))
+            rgb(40, 96, 190, a).setStroke(); v.lineWidth = 0.8; v.stroke(); NSBezierPath(roundedRect: r, xRadius: 0.8, yRadius: 0.8).stroke()
+        } else {
+            let a = 1 - (p - 0.6) / 0.4, tick = NSBezierPath()
+            tick.move(to: NSPoint(x: x - 2.6, y: y)); tick.line(to: NSPoint(x: x - 0.6, y: y - 2)); tick.line(to: NSPoint(x: x + 3, y: y + 2.4))
+            rgb(52, 180, 90, a).setStroke(); tick.lineWidth = 1.8; tick.lineCapStyle = .round; tick.lineJoinStyle = .round; tick.stroke()
+        }
+    }
+}
+
 // Menu item that runs a closure.
 class Item: NSMenuItem {
     var run: () -> Void = {}
@@ -421,14 +488,20 @@ class PetView: NSView {
             else if a == .hop { dy = 9 * sin(t / 0.5 * .pi) }
             else { dx = 5 * sin(t * 45) * (1 - t / 0.5) }
         }
-        if busy { turn = 4 * sin(now * 3.5) }
+        if busy {  // each pet works its own way: Levi types, Scout scans, the Librarian reads, the Task pet bobs along
+            if levi { dy = 0.8 * abs(sin(now * 16)) }
+            else if scout { dx += 3 * sin(now * 2); turn = 3 * sin(now * 2) }
+            else if librarian { turn = 2.5 * sin(now * 1.6) }
+            else { dy += 1.5 * abs(sin(now * 4)) }
+        }
         let pet = NSRect(x: (bounds.width - 96) / 2, y: 3, width: 96, height: 96)
         NSGraphicsContext.saveGraphicsState()
         let cg = NSGraphicsContext.current!.cgContext
         cg.translateBy(x: pet.midX + dx, y: pet.minY + dy)  // pivot at the feet
         cg.rotate(by: turn * .pi / 180); cg.scaleBy(x: grow, y: grow)
         cg.translateBy(x: -48, y: 0)
-        drawPet(NSRect(x: 0, y: 0, width: 96, height: 96), scout: scout, librarian: librarian, levi: levi)
+        cg.saveGState(); drawPet(NSRect(x: 0, y: 0, width: 96, height: 96), scout: scout, librarian: librarian, levi: levi); cg.restoreGState()
+        if busy { drawWork(NSRect(x: 0, y: 0, width: 96, height: 96), t: now, scout: scout, librarian: librarian, levi: levi) }
         NSGraphicsContext.restoreGraphicsState()
         let phase = Int(now / 0.35)
         if hover {
