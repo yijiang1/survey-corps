@@ -235,6 +235,11 @@ assert [(a["tool"], a["where"], a["state"], a["open"]) for a in app.agents() if 
 app.agent_event({"session_id": "rt", "cwd": "/h/talks", "hook_event_name": "Stop"}, "cc", 1, "me@a.x"); _t.sleep(0.2)
 assert [(a["where"], a["host"], a["dir"], a["open"]) for a in app.agents() if "@" in a["tool"]] == [
     ("Radiation damage", "a", "/h/TomoX", "vscode://vscode-remote/ssh-remote+me@a.x/h/TomoX")]  # hooked: title from the log
+# a permission prompt answered (or auto mode switched on) fires no hook: the log moving on means it works again
+app.agent_event({"session_id": "rt", "hook_event_name": "Notification", "message": "Claude needs your permission"}, "cc", 1, "me@a.x")
+_t.sleep(0.2); assert [a["state"] for a in app.agents() if "@" in a["tool"]] == ["waiting"]  # log older than the prompt
+app.remote["me@a.x"][0]["last"] = _t.time() + 30
+assert [a["state"] for a in app.agents() if "@" in a["tool"]] == ["working"]
 app.remote = {}; app.cc.clear()
 print("ok")
 

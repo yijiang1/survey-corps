@@ -570,6 +570,8 @@ def agents(now=None):
     out = []
     for sid, a in cc.items():
         t, host = logs.get(sid, ({}, 0, ""))[0], a.get("host", "")
+        if a["state"] == "waiting" and t.get("last", 0) > a["since"] + 5:  # answered (or auto mode took it): no hook says so
+            a["state"], a["since"] = "working", t["last"]
         cwd = t.get("cwd") or a["cwd"]  # where it started: a session can cd away
         out.append(row(now, a.get("tool", "Claude Code"), t.get("title") or Path(cwd).name, a["state"], now - a["since"],
                        remote_open(host, cwd) if host else a.get("open", ""), host, cwd, sid,
