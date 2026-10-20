@@ -577,6 +577,8 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        // the Dock caches app icons; setting it here shows a new icon right away
+        if let name = Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") as? String { NSApp.applicationIconImage = NSImage(named: name) }
         let logPath = NSHomeDirectory() + "/Library/Logs/SurveyCorps.log"
         FileManager.default.createFile(atPath: logPath, contents: nil)
         let log = FileHandle(forWritingAtPath: logPath)

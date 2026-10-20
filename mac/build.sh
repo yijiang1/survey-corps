@@ -22,17 +22,24 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </dict></plist>
 EOF
 
-# Icon: mac/icon-source.png (any image, not in git), fitted onto a transparent 1024px canvas. Skipped if missing.
+# Icon: mac/icon-source.png (any image, not in git) on a green rounded square, sized to match the Dock's other icons. Skipped if missing.
 cat > "$B/icon.swift" <<'EOF'
 import AppKit
 let src = NSImage(contentsOfFile: CommandLine.arguments[1])!
+func rgb(_ v: Int) -> NSColor { NSColor(srgbRed: CGFloat(v >> 16 & 255) / 255, green: CGFloat(v >> 8 & 255) / 255, blue: CGFloat(v & 255) / 255, alpha: 1) }
 let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1024, pixelsHigh: 1024, bitsPerSample: 8,
     samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
 NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
 NSGraphicsContext.current!.imageInterpolation = .high
-let box: CGFloat = 880, k = min(box / src.size.width, box / src.size.height)
+func shadow(_ blur: CGFloat, _ y: CGFloat, _ a: CGFloat) { let s = NSShadow(); s.shadowBlurRadius = blur; s.shadowOffset = NSSize(width: 0, height: y); s.shadowColor = .black.withAlphaComponent(a); s.set() }
+let shape = NSBezierPath(roundedRect: NSRect(x: 88, y: 88, width: 848, height: 848), xRadius: 190, yRadius: 190)
+NSGraphicsContext.saveGraphicsState(); shadow(20, -10, 0.3); rgb(0x1d3a27).setFill(); shape.fill(); NSGraphicsContext.restoreGraphicsState()
+NSGradient(starting: rgb(0x3f6b4a), ending: rgb(0x1d3a27))!.draw(in: shape, angle: -90)  // Survey Corps cloak green
+let box: CGFloat = 618, k = min(box / src.size.width, box / src.size.height)
 let w = src.size.width * k, h = src.size.height * k
+NSGraphicsContext.saveGraphicsState(); shadow(14, -6, 0.45)
 src.draw(in: NSRect(x: (1024 - w) / 2, y: (1024 - h) / 2, width: w, height: h))
+NSGraphicsContext.restoreGraphicsState()
 try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
 EOF
 if [ -f icon-source.png ]; then
@@ -41,7 +48,9 @@ for s in 16 32 128 256 512; do
   sips -z $s $s "$B/icon.png" --out "$B/AppIcon.iconset/icon_${s}x${s}.png" >/dev/null
   sips -z $((s*2)) $((s*2)) "$B/icon.png" --out "$B/AppIcon.iconset/icon_${s}x${s}@2x.png" >/dev/null
 done
-iconutil -c icns "$B/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
+ICON="AppIcon-$(shasum "$B/icon.png" | cut -c1-8)"  # new name per image: macOS caches icons by file and ignores a changed one
+iconutil -c icns "$B/AppIcon.iconset" -o "$APP/Contents/Resources/$ICON.icns"
+plutil -replace CFBundleIconFile -string "$ICON" "$APP/Contents/Info.plist"
 fi
 
 mkdir -p ~/Applications
