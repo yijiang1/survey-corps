@@ -387,6 +387,7 @@ class Item: NSMenuItem {
 class PetView: NSView {
     var onClick: () -> Void = {}
     var onDrop: (NSPasteboard) -> Bool = { _ in false }
+    var onMoved: () -> Void = {}
     var makeMenu: () -> NSMenu = { NSMenu() }
     var scout = false, librarian = false, levi = false, frameName = "pet", badgeColor = NSColor.systemRed
     var grab = NSPoint.zero, moved = false
@@ -481,12 +482,13 @@ class PetView: NSView {
         window?.setFrameOrigin(NSPoint(x: p.x - grab.x, y: p.y - grab.y))
     }
     override func mouseUp(with e: NSEvent) {
-        if moved { keepOnScreen(); window?.saveFrame(usingName: frameName) } else { onClick() }
+        if moved { keepOnScreen(); window?.saveFrame(usingName: frameName); onMoved() } else { onClick() }
     }
-    func keepOnScreen() {  // all of the pet stays clickable: pull it back inside the screen it is mostly on
+    func keepOnScreen() {  // all of the pet stays clickable: pull it back inside the screen, snap to an edge within 24 pt
         guard let w = window, let v = (w.screen ?? NSScreen.main)?.visibleFrame else { return }
-        w.setFrameOrigin(NSPoint(x: min(max(w.frame.minX, v.minX), v.maxX - w.frame.width),
-                                 y: min(max(w.frame.minY, v.minY), v.maxY - w.frame.height)))
+        func fit(_ a: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat { a - lo < 24 ? lo : hi - a < 24 ? hi : a }
+        w.setFrameOrigin(NSPoint(x: fit(w.frame.minX, v.minX, v.maxX - w.frame.width),
+                                 y: fit(w.frame.minY, v.minY, v.maxY - w.frame.height)))
     }
     static let dragTypes = DropWebView.promiseTypes + [.fileURL, .URL, .string]
     override func draggingEntered(_ s: NSDraggingInfo) -> NSDragOperation { hover = true; return .copy }
@@ -652,14 +654,18 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
             v.frameName = ["task": "pet", "scout": "scoutPet", "library": "libPet", "levi": "leviPet"][kind]!
             if kind == "scout" { v.badgeColor = .systemBlue }
             if let w {
-                v.toolTip = tip + (kind == "levi" ? ". Click to show/hide, drag to move, right-click for the active ones"
+                v.toolTip = tip + (kind == "levi" ? ". Click to show/hide, drag to move, right-click for more"
                                                   : ". Click to show/hide, drag to move, drop things on it, right-click for more")
                 v.onClick = { [unowned self] in self.toggle(w) }
                 if kind != "levi" { v.onDrop = { [unowned self] in self.drop(kind, $0) } }
             }
             v.makeMenu = { [unowned self] in self.menu(kind) }
+            v.onMoved = { [unowned self] in if self.pref("petsLinedUp") { self.lineUp(near: kind) } }
             pets[kind] = (makePet(v, offset: 26 + CGFloat(i) * (petSize + 4)), v, w)
         }
+        if pref("petsLinedUp") { lineUp() }
+        if pref("petsHidden") { setPetsHidden(true) }
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [unowned self] _ in self.tick() }
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [unowned self] _ in self.poll() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.poll() }
     }
@@ -691,6 +697,8 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
 
     func say(_ kind: String, _ title: String, _ text: String, ok: Bool = true) {
         guard let p = pets[kind] else { return }
+        if pref("petsHidden") { setPetsHidden(false) }  // hidden pets come back when they have something to say
+        untuck(animate: false); awaySince = Date()
         let b = bubbles[kind] ?? Bubble()
         bubbles[kind] = b
         b.onClick = { NSApp.activate(ignoringOtherApps: true); p.window?.makeKeyAndOrderFront(nil) }
@@ -788,18 +796,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
                 review.forEach { m.addItem(reviewItem($0)) }
                 m.addItem(Item("Keep All") { for r in self.review { post("api/todo/\(r["id"] as? String ?? "")/keep") { _, _ in self.poll() } } })
             }
-        case "levi":  // the active sessions (working, waiting, still cached); the window has them all
-            let now = Date().timeIntervalSince1970
-            let live = agents.filter { $0["state"] as? String != "idle" || ($0["until"] as? Double ?? 0) > now }
-            m.addItem(Item(live.isEmpty ? "No active sessions" : "Active sessions:", enabled: false))
-            for a in live {
-                let mins = a["mins"] as? Int ?? 0, ago = mins < 1 ? "just now" : mins < 60 ? "\(mins)m" : "\(mins / 60)h"
-                let cache = (a["cache"] as? Int).map { $0 > 0 ? "  ·  cache \($0)m left" : "  ·  cache expired" } ?? ""
-                let open = URL(string: a["open"] as? String ?? "")  // claude:// or codex:// session link, or the terminal's app
-                m.addItem(Item("\(a["tool"] as? String ?? "")  ·  \(a["where"] as? String ?? "")  —  \(a["state"] as? String ?? "") \(ago)" + cache,
-                               enabled: open != nil) { if let open { NSWorkspace.shared.open(open) } })
-            }
-            return m
+        case "levi": break  // just show/hide; the window has the sessions
         case "scout":
             m.addItem(Item("Check for New Now") { post("api/feed/refresh") { _, _ in self.poll() } })
             m.addItem(Item("Save a Link…") { if let v = textPrompt("Add a link to Scout and the Library", placeholder: "https://arxiv.org/abs/…") { self.saveLink(v) } })
@@ -813,7 +810,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
                 if o.runModal() == .OK { self.addToLibrary(o.urls.map(\.path)) }
             })
         }
-        m.addItem(.separator())
+        if kind != "levi" { m.addItem(.separator()) }
         let mine = routines.filter { $0["pet"] == kind }
         if !mine.isEmpty {
             let run = NSMenuItem(title: "Run Routine Now", action: nil, keyEquivalent: ""), sub = NSMenu()
@@ -821,8 +818,72 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
             run.submenu = sub
             m.addItem(run)
         }
-        m.addItem(Item("Edit Routines…") { self.openSettings() })
+        if kind != "levi" { m.addItem(Item("Edit Routines…") { self.openSettings() }); m.addItem(.separator()) }
+        let all = NSMenuItem(title: "All Pets", action: nil, keyEquivalent: ""), sub = NSMenu()
+        sub.autoenablesItems = false
+        sub.addItem(Item("Line Up Here") { self.lineUp(near: kind) })
+        for (title, key) in [("Keep Lined Up", "petsLinedUp"), ("Tuck Into the Edge When the Mouse Is Away", "petsTuck")] {
+            let i = Item(title) {
+                self.flip(key)
+                if key == "petsLinedUp" && self.pref(key) { self.lineUp(near: kind) }
+                if key == "petsTuck" && !self.pref(key) { self.untuck() }
+            }
+            i.state = pref(key) ? .on : .off
+            sub.addItem(i)
+        }
+        sub.addItem(Item("Hide Pets (⇧⌘P or the Dock icon brings them back)") { self.setPetsHidden(true) })
+        all.submenu = sub
+        m.addItem(all)
         return m
+    }
+
+    // Pet layout: line up along an edge, tuck into the edge while the mouse is away, hide them all.
+    var tucked = false, home: [String: NSPoint] = [:], awaySince = Date()
+    func pref(_ k: String) -> Bool { UserDefaults.standard.bool(forKey: k) }
+    func flip(_ k: String) { UserDefaults.standard.set(!pref(k), forKey: k) }
+    func lineUp(near kind: String = "task") {  // a column on the side and half of the screen that pet is on
+        untuck(animate: false)
+        let a = pets[kind]!.panel, v = (a.screen ?? NSScreen.main!).visibleFrame
+        let left = a.frame.midX < v.midX, top = a.frame.midY > v.midY
+        let order = ["task", "scout", "library", "levi"].compactMap { pets[$0] }
+        NSAnimationContext.runAnimationGroup({ _ in
+            for (i, p) in order.enumerated() {
+                let y = top ? v.maxY - CGFloat(i + 1) * (petSize + 4) : v.minY + CGFloat(i) * (petSize + 4)
+                p.panel.animator().setFrame(NSRect(x: left ? v.minX : v.maxX - petSize, y: y, width: petSize, height: petSize), display: true)
+            }
+        }, completionHandler: { order.forEach { $0.panel.saveFrame(usingName: $0.view.frameName) } })
+    }
+    func tick() {  // tucking: out while the mouse is within 50 pt or a bubble shows, back in after 3 s away
+        guard pref("petsTuck"), !pref("petsHidden") else { return }
+        let m = NSEvent.mouseLocation
+        if pets.values.contains(where: { $0.panel.frame.insetBy(dx: -50, dy: -50).contains(m) }) || bubbles.values.contains(where: \.isVisible) {
+            awaySince = Date(); untuck()
+        } else if !tucked && Date().timeIntervalSince(awaySince) > 3 { tuck() }
+    }
+    func tuck() {  // slide each pet into its nearest side edge, leaving a 28 pt sliver to see badges and aim at
+        tucked = true
+        NSAnimationContext.runAnimationGroup { _ in
+            for (k, p) in pets {
+                let f = p.panel.frame, v = (p.panel.screen ?? NSScreen.main!).visibleFrame
+                home[k] = f.origin
+                p.panel.animator().setFrame(NSRect(x: f.midX < v.midX ? v.minX - petSize + 28 : v.maxX - 28, y: f.minY,
+                                                   width: petSize, height: petSize), display: true)
+            }
+        }
+    }
+    func untuck(animate: Bool = true) {
+        guard tucked else { return }
+        tucked = false
+        for (k, p) in pets {
+            guard let o = home[k] else { continue }
+            let r = NSRect(origin: o, size: p.panel.frame.size)
+            animate ? p.panel.animator().setFrame(r, display: true) : p.panel.setFrame(r, display: true)
+        }
+    }
+    func setPetsHidden(_ h: Bool) {
+        UserDefaults.standard.set(h, forKey: "petsHidden")
+        for p in pets.values { h ? p.panel.orderOut(nil) : p.panel.orderFrontRegardless() }
+        if h { bubbles.values.forEach { $0.orderOut(nil) } }
     }
 
     func makePet(_ view: PetView, offset: CGFloat) -> NSPanel {
@@ -872,6 +933,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
     }
 
     func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if pref("petsHidden") { setPetsHidden(false) }
         window.makeKeyAndOrderFront(nil); return true
     }
 
@@ -910,6 +972,10 @@ let appMenu = NSMenu()
 let settingsItem = NSMenuItem(title: "Settings…", action: #selector(App.openSettings), keyEquivalent: ",")
 settingsItem.target = delegate
 appMenu.addItem(settingsItem)
+appMenu.addItem(.separator())
+let petsItem = Item("Show or Hide Pets") { delegate.setPetsHidden(!delegate.pref("petsHidden")) }
+petsItem.keyEquivalent = "p"; petsItem.keyEquivalentModifierMask = [.command, .shift]
+appMenu.addItem(petsItem)
 appMenu.addItem(.separator())
 appMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
 appMenu.addItem(withTitle: "Quit Survey Corps", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
