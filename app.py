@@ -2582,6 +2582,7 @@ main{flex:1;min-width:0;padding:6px 20px 40px 6px}
 .body{flex:1;min-width:0}
 .title{width:100%;border:0;background:none;font-weight:600;font-size:14px;padding:0;outline:none;text-overflow:ellipsis}
 .meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;margin-top:3px;font-size:12px}
+.path a,.why a{color:var(--accent);text-decoration:none}.path a:hover,.why a:hover{text-decoration:underline}
 .path{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;max-width:340px;direction:rtl;text-align:left}
 .grp{border:0;border-radius:6px;background:var(--bg);color:var(--text);padding:1px 4px;font-size:12px;cursor:pointer;max-width:130px}
 .grp.none{color:var(--muted)}
@@ -2732,15 +2733,18 @@ function mini(x){  // a task, email or found file, in the Library's label view a
 // Two filters that combine: sel (all items / a label / missing) and ty (a type, '' = any)
 const OTYPE={email:'Emails',task:'Tasks',paper:'Papers',video:'Videos',repo:'Code',link:'Websites'};  // tasks, and what Argo's search finds, as types
 const typeOf=x=>x.ref?OTYPE[x.kind]:x.group||'No type';
-const inScope=x=>sel==='all'||(sel==='missing'?x.missing:x.labels.includes(sel.slice(2)));
+const sels=()=>sel.startsWith('l:')?sel.slice(2).split('\t'):[];  // clicking labels toggles them; an item must have all of them
+const inScope=x=>sel==='all'||(sel==='missing'?x.missing:sels().every(l=>x.labels.includes(l)));
 const matches=x=>inScope(x)&&(!ty||typeOf(x)===ty);
 function go(s){sel=s;localStorage.libsel=s;render()}
 function goType(t){ty=ty===t?'':t;localStorage.libty=ty;render()}
 function navBtn(key,text,n,h){
-  const isT=key.startsWith('t:'),b=el('button','nav'+((isT?'t:'+ty===key:sel===key)?' on':'')+(key==='missing'?' miss':''));
+  const isT=key.startsWith('t:'),b=el('button','nav'+((isT?'t:'+ty===key:key.startsWith('l:')?sels().includes(key.slice(2)):sel===key)?' on':'')+(key==='missing'?' miss':''));
   if(h!=null){const i=el('i');i.style.setProperty('--h',h);b.append(i)}
-  b.append(el('span',0,text),el('span','n',n));b.title=isT?(ty===text?'Show every type':'Only '+text):text;
-  b.onclick=()=>isT?goType(key.slice(2)):go(key);
+  b.append(el('span',0,text),el('span','n',n));b.title=isT?(ty===text?'Show every type':'Only '+text):key.startsWith('l:')?text+' (click more labels to combine)':text;
+  b.onclick=e=>{if(isT)return goType(key.slice(2));
+    if(key.startsWith('l:')){const l=key.slice(2),cur=sels(),nx=cur.includes(l)?cur.filter(y=>y!==l):[...cur,l];return go(nx.length?'l:'+nx.join('\t'):'all')}
+    go(key)};
   if(isT&&lib.groups.includes(key.slice(2))||key.startsWith('l:')){  // drop an item here: change its type / add the label
     b.ondragover=e=>{if(dragId){e.preventDefault();b.classList.add('over')}};b.ondragleave=()=>b.classList.remove('over');
     b.ondrop=e=>{e.preventDefault();b.classList.remove('over');const x=lib.items.find(y=>y.id===dragId);if(!x)return;
@@ -2792,8 +2796,11 @@ function card(x){
   const al=$('.addl');al.onchange=()=>{const v=al.value.trim();if(v)up({labels:[...x.labels,v]})};
   const p=$('.path');p.textContent='\u200e'+x.path.replace(/^\/Users\/[^/]+/,'~')+'\u200e';  // LRM: keeps ~/ in front under rtl (which ellipsizes the start)
   p.title=x.path;
+  if(k&&/^https?:\/\//.test(x.path)){const a=el('a',0,x.path);a.href=x.path;a.target='_blank';a.onclick=e=>e.stopPropagation();p.replaceChildren(a)}
   const why=$('.why');if(x.missing){why.className='warn';why.textContent='⚠︎ Not found at this path. Moved or renamed? Fix the path under Notes & contents.'}
-  else if(x.summary)why.textContent=x.summary;else why.remove();
+  else if(x.summary){let i=0,m;for(const re=/https?:\/\/[^\s<>"]*[^\s<>".,;)]/g;(m=re.exec(x.summary));i=re.lastIndex){
+    why.append(x.summary.slice(i,m.index));const a=el('a',0,m[0]);a.href=m[0];a.target='_blank';why.append(a)}
+    why.append(x.summary.slice(i))}else why.remove();
   const n=$('textarea');n.value=x.note;n.onchange=()=>up({note:n.value});
   const pi=$('.pathin');pi.value=x.path;pi.onchange=()=>pi.value.trim()&&up({path:pi.value});
   if(x.peek)$('pre').textContent=x.peek;else $('pre').remove();
@@ -2809,7 +2816,7 @@ function card(x){
   return d;
 }
 function render(){
-  if(sel.startsWith('l:')&&!allLabels().includes(sel.slice(2)))sel='all';  // the label may have been renamed or deleted
+  if(sels().some(l=>!allLabels().includes(l)))sel='all';  // the label may have been renamed or deleted
   if(ty&&!lib.groups.includes(ty)&&!['Emails','Tasks','No type'].includes(ty))ty='';
   renderNav();
   labels.replaceChildren(...allLabels().map(l=>new Option(l)));
@@ -2818,7 +2825,7 @@ function render(){
   const key={recent:x=>-Date.parse((x.opened>x.added?x.opened:x.added)||0),name:x=>x.name.toLowerCase(),added:x=>-Date.parse(x.added)}[sort];
   const shown=lib.items.filter(x=>matches(x)&&words.every(w=>[x.name,x.path,x.group,x.note,x.summary,x.peek,...x.labels].join(' ').toLowerCase().includes(w)))
     .sort((a,b)=>{const p=key(a),r=key(b);return p<r?-1:p>r?1:0});
-  const lab=sel.startsWith('l:')&&sel.slice(2);
+  const lab=sels().length;
   const more=lab?others.filter(x=>matches(x)&&words.every(w=>[x.title,x.sub,...x.labels].join(' ').toLowerCase().includes(w))):[];
   const files=shown,tasks=more;
   list.replaceChildren(...(more.length&&files.length?[el('h3',0,'In the Library')]:[]),...files.slice(0,400).map(card),
