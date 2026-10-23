@@ -199,6 +199,11 @@ assert app.cc["s1"]["state"] == "idle" and said == [("Claude Code", "Needs you i
                                                     ("Claude Code", "Finished in proj")], said
 app.agent_event({"type": "agent-turn-complete", "cwd": "/y/cdx", "last-assistant-message": "Done."}, "codex"); _t.sleep(0.2)
 assert said[-1] == ("Codex", "Finished in cdx: Done.")
+n = len(said)
+app.agent_event({"type": "agent-turn-complete", "thread-id": "t2", "cwd": "/y/cdx", "last-assistant-message": "ok"}, "codex")
+app.agent_event({"type": "agent-turn-complete", "thread-id": "t1", "cwd": "/y/cdx", "last-assistant-message": "Built."}, "codex")
+_t.sleep(0.2)
+assert said[n:] == [("Codex", "Finished in cdx: Built.")], said[n:]  # t2 is Codex's own Guardian review: silent
 ev("SessionEnd")
 assert "s1" not in app.cc and [a["tool"] for a in app.agents()] == ["Codex"]
 assert app.agents(now=_t.time() + 120)[0]["state"] == "idle" and app.agents(now=_t.time() + 13 * 3600) == []

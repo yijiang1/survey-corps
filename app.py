@@ -365,6 +365,9 @@ def agent_event(e, tool="cc", pid=0, host=""):
     host: "user@host" when the hook ran on a remote machine (through tunnel()); its pid and transcript aren't ours."""
     where = Path(e.get("cwd") or "?").name
     if tool == "codex":
+        src = codex_query("select thread_source from threads where id = ?", (str(e.get("thread-id")),))
+        if src and src[0][0] != "user":
+            return  # Codex's own Guardian review of an approval, which finishes right after your prompt; not your thread
         if e.get("type") == "agent-turn-complete":
             msg = flat(str(e.get("last-assistant-message") or ""), 90)
             threading.Thread(target=say, args=("levi", "Codex", f"Finished in {where}" + (f": {msg}" if msg else "")), daemon=True).start()
@@ -491,22 +494,33 @@ def desktop_session(cli_id):
     return desktop.get(cli_id, {})
 
 
-def codex_threads(since):
-    """[(id, title, cwd, rollout path, last active ms)]: your unarchived Codex threads active since `since`
-    (not Codex's own Guardian-review subthreads). [] if Codex isn't installed or its schema changed."""
+def codex_query(sql, args=()):
+    """Rows from the Codex app's thread list, read-only; [] if Codex isn't installed or its schema changed."""
     dbs = sorted(CODEX.glob("state_*.sqlite"), key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
     if not dbs:
         return []
-    try:
-        db = sqlite3.connect(f"file:{dbs[-1]}?mode=ro", uri=True)
+    # mode=ro can't open a WAL database while Codex is closed (no -shm to read); then nothing writes it, so immutable is safe
+    for mode in ("mode=ro", "immutable=1"):
         try:
-            return db.execute("select id, coalesce(nullif(name, ''), nullif(title, ''), cwd), cwd, rollout_path,"
-                              " max(updated_at_ms, recency_at_ms) as ms from threads"
-                              " where thread_source = 'user' and archived = 0 and ms > ?", (since * 1000,)).fetchall()
-        finally:
-            db.close()
-    except sqlite3.Error:
-        return []
+            db = sqlite3.connect(f"file:{dbs[-1]}?{mode}", uri=True)
+            try:
+                return db.execute(sql, args).fetchall()
+            finally:
+                db.close()
+        except sqlite3.OperationalError as e:
+            if "unable to open" not in str(e):
+                return []
+        except sqlite3.Error:
+            return []
+    return []
+
+
+def codex_threads(since):
+    """[(id, title, cwd, rollout path, last active ms)]: your unarchived Codex threads active since `since`
+    (not Codex's own Guardian-review subthreads)."""
+    return codex_query("select id, coalesce(nullif(name, ''), nullif(title, ''), cwd), cwd, rollout_path,"
+                       " max(updated_at_ms, recency_at_ms) as ms from threads"
+                       " where thread_source = 'user' and archived = 0 and ms > ?", (since * 1000,))
 
 
 def alive(pid):
