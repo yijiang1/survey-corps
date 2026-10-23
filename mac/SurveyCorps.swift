@@ -546,18 +546,36 @@ class PetView: NSView {
         window?.setFrameOrigin(NSPoint(x: p.x - grab.x, y: p.y - grab.y))
     }
     override func mouseUp(with e: NSEvent) {
-        if moved { keepOnScreen(); window?.saveFrame(usingName: frameName); onMoved() } else { onClick() }
+        if moved { keepOnScreen(); onMoved() } else { onClick() }
     }
     func keepOnScreen() {  // all of the pet stays clickable: pull it back inside the screen, snap to an edge within 24 pt
-        guard let w = window, let v = (w.screen ?? NSScreen.main)?.visibleFrame else { return }
-        func fit(_ a: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat { a - lo < 24 ? lo : hi - a < 24 ? hi : a }
-        w.setFrameOrigin(NSPoint(x: fit(w.frame.minX, v.minX, v.maxX - w.frame.width),
-                                 y: fit(w.frame.minY, v.minY, v.maxY - w.frame.height)))
+        if let w = window { w.setFrameOrigin(onScreen(w.frame)) }
     }
     static let dragTypes = DropWebView.promiseTypes + [.fileURL, .URL, .string]
     override func draggingEntered(_ s: NSDraggingInfo) -> NSDragOperation { hover = true; return .copy }
     override func draggingExited(_ s: NSDraggingInfo?) { hover = false }
     override func performDragOperation(_ s: NSDraggingInfo) -> Bool { hover = false; return onDrop(s.draggingPasteboard) }
+}
+
+func screenOf(_ r: NSRect) -> NSScreen {  // the screen a pet's rect is centered on (or the main one, if off every screen)
+    NSScreen.screens.first { $0.frame.contains(NSPoint(x: r.midX, y: r.midY)) } ?? NSScreen.main!
+}
+// Pet at r tucked into an edge of its screen (frame f, visible v), a 28 pt sliver left showing: its nearer side, else
+// the other side, else the bottom, else the top. An edge another screen touches (others) is skipped: the pet would
+// show up on that screen instead. Stays at r if every edge is shared.
+func tuckSpot(_ r: NSRect, _ f: NSRect, _ v: NSRect, _ others: [NSRect]) -> NSRect {
+    let w = r.width, h = r.height, sides = [  // (tucked rect, a 1 pt strip just past that edge)
+        (NSRect(x: v.minX - w + 28, y: r.minY, width: w, height: h), NSRect(x: f.minX - 1, y: r.minY, width: 1, height: h)),
+        (NSRect(x: v.maxX - 28, y: r.minY, width: w, height: h), NSRect(x: f.maxX, y: r.minY, width: 1, height: h)),
+        (NSRect(x: r.minX, y: v.minY - h + 28, width: w, height: h), NSRect(x: r.minX, y: f.minY - 1, width: w, height: 1)),
+        (NSRect(x: r.minX, y: v.maxY - 28, width: w, height: h), NSRect(x: r.minX, y: f.maxY, width: w, height: 1))]
+    let order = r.midX < v.midX ? [0, 1, 2, 3] : [1, 0, 2, 3]
+    return order.map { sides[$0] }.first { side in !others.contains { $0.intersects(side.1) } }?.0 ?? r
+}
+func onScreen(_ r: NSRect) -> NSPoint {  // r pulled back inside its screen, snapped to an edge within 24 pt
+    let v = screenOf(r).visibleFrame
+    func fit(_ a: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat { a - lo < 24 ? lo : hi - a < 24 ? hi : a }
+    return NSPoint(x: fit(r.minX, v.minX, v.maxX - r.width), y: fit(r.minY, v.minY, v.maxY - r.height))
 }
 
 // Speech bubble above a pet: briefings, Scout picks, answers, routine results. Click: open the pet's window.
@@ -726,8 +744,14 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
                 if kind != "levi" { v.onDrop = { [unowned self] in self.drop(kind, $0) } }
             }
             v.makeMenu = { [unowned self] in self.menu(kind) }
-            v.onMoved = { [unowned self] in if self.pref("petsLinedUp") { self.lineUp(near: kind) } }
-            pets[kind] = (makePet(v, offset: 26 + CGFloat(i) * (petSize + 4)), v, w)
+            v.onMoved = { [unowned self, unowned v] in
+                self.setHome(kind, v.window!.frame.origin)
+                if self.pref("petsLinedUp") { self.lineUp(near: kind) }
+            }
+            let panel = makePet(v, offset: 26 + CGFloat(i) * (petSize + 4))
+            pets[kind] = (panel, v, w)
+            let saved = UserDefaults.standard.string(forKey: "petHome." + kind).map(NSPointFromString) ?? panel.frame.origin
+            setHome(kind, onScreen(NSRect(origin: saved, size: panel.frame.size)))
         }
         if pref("petsLinedUp") { lineUp() }
         if pref("petsHidden") { setPetsHidden(true) }
@@ -764,7 +788,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
     func say(_ kind: String, _ title: String, _ text: String, ok: Bool = true) {
         guard let p = pets[kind] else { return }
         if pref("petsHidden") { setPetsHidden(false) }  // hidden pets come back when they have something to say
-        untuck(animate: false); awaySince = Date()
+        tucked = false; awaySince = Date(); settle(animate: false)  // out at home before the bubble is placed over it
         let b = bubbles[kind] ?? Bubble()
         bubbles[kind] = b
         b.onClick = { NSApp.activate(ignoringOtherApps: true); p.window?.makeKeyAndOrderFront(nil) }
@@ -876,7 +900,6 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
             let i = Item(title) {
                 self.flip(key)
                 if key == "petsLinedUp" && self.pref(key) { self.lineUp(near: kind) }
-                if key == "petsTuck" && !self.pref(key) { self.untuck() }
             }
             i.state = pref(key) ? .on : .off
             sub.addItem(i)
@@ -887,59 +910,57 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         return m
     }
 
-    // Pet layout: line up along an edge, tuck into the edge while the mouse is away, hide them all.
-    var tucked = false, home: [String: NSPoint] = [:], awaySince = Date()
+    // Pet layout: each pet has a home spot (where you dropped it, or where Line Up put it). Every tick moves each pet
+    // to where it belongs right now, home or tucked, rather than remembering what it did last: a slide or fade cut short
+    // (by a bubble, a display change, a drag) gets finished on the next tick instead of leaving a pet stuck.
+    var tucked = false, home: [String: NSPoint] = [:], awaySince = Date(), settleUntil = Date.distantPast
     func pref(_ k: String) -> Bool { UserDefaults.standard.bool(forKey: k) }
     func flip(_ k: String) { UserDefaults.standard.set(!pref(k), forKey: k) }
-    // true when no other screen sits past that side edge of s, along rect r: pets don't tuck into a shared edge
-    func edgeFree(_ s: NSScreen, left: Bool, _ r: NSRect) -> Bool {
-        let past = NSRect(x: left ? s.frame.minX - 1 : s.frame.maxX, y: r.minY, width: 1, height: r.height)
-        return !NSScreen.screens.contains { $0 != s && $0.frame.intersects(past) }
+    func setHome(_ kind: String, _ o: NSPoint) {
+        home[kind] = o
+        UserDefaults.standard.set(NSStringFromPoint(o), forKey: "petHome." + kind)
     }
-    func lineUp(near kind: String = "task") {  // a column on the side and half of the screen that pet is on
-        untuck(animate: false)
-        let a = pets[kind]!.panel, v = (a.screen ?? NSScreen.main!).visibleFrame
-        let left = a.frame.midX < v.midX, top = a.frame.midY > v.midY
-        let order = ["task", "scout", "library", "levi"].compactMap { pets[$0] }
-        NSAnimationContext.runAnimationGroup({ _ in
-            for (i, p) in order.enumerated() {
-                let y = top ? v.maxY - CGFloat(i + 1) * (petSize + 4) : v.minY + CGFloat(i) * (petSize + 4)
-                p.panel.animator().setFrame(NSRect(x: left ? v.minX : v.maxX - petSize, y: y, width: petSize, height: petSize), display: true)
-            }
-        }, completionHandler: { order.forEach { $0.panel.saveFrame(usingName: $0.view.frameName) } })
+    func homeRect(_ kind: String) -> NSRect { NSRect(origin: home[kind] ?? .zero, size: NSSize(width: petSize, height: petSize)) }
+    func lineUp(near kind: String = "task") {  // a column on the side and half of the screen that pet's home is on
+        let a = homeRect(kind), v = screenOf(a).visibleFrame
+        let left = a.midX < v.midX, top = a.midY > v.midY
+        for (i, k) in ["task", "scout", "library", "levi"].enumerated() where pets[k] != nil {
+            setHome(k, NSPoint(x: left ? v.minX : v.maxX - petSize, y: top ? v.maxY - CGFloat(i + 1) * (petSize + 4) : v.minY + CGFloat(i) * (petSize + 4)))
+        }
+        tucked = false; awaySince = Date(); settle()
+    }
+    func spot(_ kind: String) -> NSRect {  // where the pet belongs now
+        let r = homeRect(kind), s = screenOf(r)
+        return tucked ? tuckSpot(r, s.frame, s.visibleFrame, NSScreen.screens.filter { $0 != s }.map(\.frame)) : r
     }
     func tick() {  // tucking: out while the mouse is within 50 pt or a bubble shows, back in after 3 s away
-        guard pref("petsTuck"), !pref("petsHidden") else { return }
         let m = NSEvent.mouseLocation
-        if pets.values.contains(where: { $0.panel.frame.insetBy(dx: -50, dy: -50).contains(m) }) || bubbles.values.contains(where: \.isVisible) {
-            awaySince = Date(); untuck()
-        } else if !tucked && Date().timeIntervalSince(awaySince) > 3 { tuck() }
+        if !pref("petsTuck") || pref("petsHidden") || bubbles.values.contains(where: \.isVisible)
+            || pets.values.contains(where: { $0.panel.frame.insetBy(dx: -50, dy: -50).contains(m) }) {
+            awaySince = Date(); tucked = false
+        } else if Date().timeIntervalSince(awaySince) > 3 { tucked = true }
+        if NSEvent.pressedMouseButtons == 0 && Date() > settleUntil { settle() }  // not mid-drag, not mid-slide
     }
-    func tuck() {  // slide each pet into its nearest side edge, leaving a 28 pt sliver to see badges and aim at
-        tucked = true
-        NSAnimationContext.runAnimationGroup { _ in
-            for (k, p) in pets {
-                let f = p.panel.frame, s = p.panel.screen ?? NSScreen.main!, v = s.visibleFrame, left = f.midX < v.midX
-                home[k] = f.origin
-                guard edgeFree(s, left: left, f) else { p.panel.animator().alphaValue = 0.25; continue }  // another screen there: fade instead
-                p.panel.animator().setFrame(NSRect(x: left ? v.minX - petSize + 28 : v.maxX - 28, y: f.minY,
-                                                   width: petSize, height: petSize), display: true)
+    func settle(animate: Bool = true) {  // move any pet that isn't where spot() says
+        let off = pets.keys.filter { k in
+            let f = spot(k), p = pets[k]!.panel
+            return hypot(f.minX - p.frame.minX, f.minY - p.frame.minY) > 0.5 || p.alphaValue < 1
+        }
+        guard !off.isEmpty else { return }
+        settleUntil = Date() + 0.35
+        NSAnimationContext.runAnimationGroup { c in
+            c.duration = animate ? 0.25 : 0
+            for k in off {
+                let f = spot(k), p = pets[k]!.panel
+                if animate { p.animator().setFrame(f, display: true); p.animator().alphaValue = 1 }
+                else { p.setFrame(f, display: true); p.alphaValue = 1 }
             }
         }
     }
     @objc func screensChanged() {  // a display plugged in, unplugged or rearranged, or the Dock moved
-        untuck(animate: false)
-        if pref("petsLinedUp") { lineUp() } else { pets.values.forEach { $0.view.keepOnScreen() } }
-    }
-    func untuck(animate: Bool = true) {
-        guard tucked else { return }
-        tucked = false
-        for (k, p) in pets {
-            p.panel.alphaValue = 1
-            guard let o = home[k] else { continue }
-            let r = NSRect(origin: o, size: p.panel.frame.size)
-            animate ? p.panel.animator().setFrame(r, display: true) : p.panel.setFrame(r, display: true)
-        }
+        for k in pets.keys { setHome(k, onScreen(homeRect(k))) }
+        if pref("petsLinedUp") { lineUp() }
+        settle(animate: false)
     }
     func setPetsHidden(_ h: Bool) {
         UserDefaults.standard.set(h, forKey: "petsHidden")
