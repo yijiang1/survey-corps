@@ -2868,10 +2868,18 @@ async function api(p,b){
 const meta=b=>api('/api/library/meta',b);
 const allLabels=()=>[...new Set([...Object.keys(lib.labels),...lib.items.flatMap(x=>x.labels),...others.flatMap(x=>x.labels)])].sort((a,b)=>a.localeCompare(b));
 const KIND={arXiv:'paper',YouTube:'video',GitHub:'repo',Link:'link'};
-const KICON={email:'✉︎',task:'✓',paper:'📄',video:'▶︎',repo:'⑂',link:'🔗',path:'📁'},KHUE={email:212,task:140,paper:28,video:0,repo:270,link:180,path:212};
+// Survey Corps kit: sealed dispatch, supply wagon, scroll, crest shield, crossed blades, scouting compass, the Wall
+const WALL=SVG('<path d="M3 20V8h3V5h3v3h2V5h2v3h2V5h3v3h3v12zM10 20v-3.5a2 2 0 0 1 4 0V20"/>');
+const KICON={email:SVG('<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/><circle cx="12" cy="14" r="2.2" fill="currentColor"/>'),
+  task:SVG('<path d="M4.5 12.5 3 6c3-1.5 6-2 9-2s6 .5 9 2l-1.5 6.5M8.6 4.5l.4 8M15.4 4.5l-.4 8M3 12.5h18v2.6H3zM21 13.8h2.5M7 16.2v4.8M4.6 18.6h4.8M17 16.2v4.8M14.6 18.6h4.8"/><circle cx="7" cy="18.6" r="2.4"/><circle cx="17" cy="18.6" r="2.4"/>'),
+  paper:SVG('<path d="M17 7h2a2 2 0 0 0 0-4H8a2 2 0 0 0-2 2v12M17 5v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2h11v2M9.5 9h4.5M9.5 12.5h4.5"/>'),
+  video:SVG('<path d="M12 3l8 3v6c0 4.5-3.5 8-8 9-4.5-1-8-4.5-8-9V6z"/><path d="M10 8.5v7l5.5-3.5z" fill="currentColor"/>'),
+  repo:SVG('<path d="M3 21l3.5-3.5M21 21l-3.5-3.5M5 15.5l3.5 3.5M19 15.5 15.5 19"/><path d="M7.5 16.5 20 4M16.5 16.5 4 4" stroke-width="3" stroke-linecap="butt"/>'),
+  link:SVG('<circle cx="12" cy="12" r="9"/><path d="M12 5.5l2.2 6.5-2.2 6.5-2.2-6.5z"/><path d="M12 5.5l2.2 6.5H9.8z" fill="currentColor"/>'),
+  path:WALL},KHUE={email:212,task:140,paper:28,video:0,repo:270,link:180,path:212};
 function mini(x){  // a task, email or found file, in the Library's label view and search answers
   const d=el('div','c mini'+(x.sub.endsWith('· done')?' done':''));
-  const ico=el('div','ico',KICON[x.kind]||'•');ico.style.setProperty('--h',KHUE[x.kind]??212);
+  const ico=el('div','ico');ico.innerHTML=KICON[x.kind]||'•';ico.style.setProperty('--h',KHUE[x.kind]??212);
   const b=el('div','body'),t=el(x.url?'a':'div','title',x.title);t.title=x.title;if(x.url){t.href=x.url;t.target='_blank'}
   const m=el('div','meta');m.append(el('span','kind',x.kind==='path'?'On disk':x.kind));
   const sub=el('span',x.kind==='path'?'path':'sub',x.kind==='path'?'\u200e'+x.sub.replace(/^\/Users\/[^/]+/,'~')+'\u200e':x.sub);sub.title=x.sub;
@@ -2938,7 +2946,7 @@ function card(x){
       <button class=icon data-a=copy title="Copy path">${I.copy}</button><button class="icon x" title="Remove from Library (the file stays on disk)">${I.x}</button></div>`;
   const $=s=>d.querySelector(s),up=p=>api(`/api/library/item/${x.id}/update`,p);
   const ext=x.folder||x.src?'':(x.name.match(/\.(\w{1,5})$/)||['',''])[1].toUpperCase(),k=x.src&&(KIND[x.src]||'link');
-  const ico=$('.ico');ico.innerHTML=x.folder?I.folder:'';if(!x.folder)ico.textContent=k?KICON[k]:ext||'DOC';
+  const ico=$('.ico');ico.innerHTML=x.folder?WALL:k?KICON[k]:'';if(!x.folder&&!k)ico.textContent=ext||'DOC';
   ico.style.setProperty('--h',x.folder?212:k?KHUE[k]:hue(ext||'doc'));ico.title=x.folder?'Open folder':k?'Open link':'Open';
   if(k)d.classList.add('mini');
   ico.onclick=()=>act('open');
