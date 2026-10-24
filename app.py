@@ -346,7 +346,10 @@ def retry_argo():
             jobs = [({"summary": summarize, "shot": read_shot}.get(t["retry"], enrich), t)
                     for t in load() if t.get("retry") and not t["done"]]
         with lib_lock:
-            jobs += [(lib_enrich, x["id"]) for x in load_lib()["items"] if x.get("retry")]
+            items = load_lib()["items"]
+        jobs += [(lib_enrich, x["id"]) for x in items if x.get("retry")]
+        # links for items from before Related existed, or whose link pass failed: a few per round
+        jobs += [(lib_relate, x["id"]) for x in items if "related" not in x and not x.get("retry")][:RELATE_ROUND]
         for fn, arg in jobs:
             fn(arg)
             if not argo_ok:
@@ -1394,6 +1397,62 @@ def lib_enrich(item_id):
         if s.get("labels") and not cur["labels"]:
             cur["labels"] = sorted(set(s["labels"]))
         save_lib(lib)
+    lib_relate(item_id)  # with its summary and labels, it's easier to match
+
+
+RELATE_ROUND = 20  # retry_argo: at most this many items get their links found per round
+
+
+def clean_related(text, n):
+    """[(candidate index, why)] from the model's JSON array reply: valid indexes below n, each once, at most 4."""
+    out = {}
+    for m in re.finditer(r"\{[^{}]*\}", text or ""):
+        try:
+            r = json.loads(m.group(0))
+            i = int(r["i"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 <= i < n and i not in out:
+            out[i] = flat(str(r.get("why") or ""), 80)
+    return list(out.items())[:4]
+
+
+def lib_relate(item_id):
+    """Background: Argo links an item to the Library items, tasks and emails it belongs with. Keeps links you made and
+    never brings back one you removed; links it made before are replaced."""
+    with lib_lock:
+        x = next((x for x in load_lib()["items"] if x["id"] == item_id), None)
+    if not x or not argo_on():
+        return
+    me = "lib:" + item_id
+    pool = [c for c in corpus() if c["ref"] != me]
+    # ponytail: keyword overlap picks 30 candidates for Argo to judge; embeddings if it misses obvious ones
+    cands = top_hits(pool, " ".join([x["name"], x["summary"], *x["labels"], x["peek"][:800]]),
+                     lambda c: " ".join([c["title"], *c["labels"], c["text"][:1500]]), 30)
+    if not cands:
+        reply = "[]"
+    else:
+        lines = "\n".join(f"{i}. [{c['kind']}] {c['title']}" + (f" (labels: {', '.join(c['labels'])})" if c["labels"] else "")
+                          + f": {flat(c['text'], 300)}" for i, c in enumerate(cands))
+        reply = argo("Below is an item from my library of projects, files, papers and links, then numbered candidates "
+                     "(other library items, my tasks and emails). Which candidates is it directly connected to: the same "
+                     "project, one cites, uses or describes the other, an email or task about it, its data, code or talk? "
+                     "Skip ones that only share a broad topic. Reply with ONLY a JSON array, at most 4, empty if none: "
+                     '[{"i": <candidate number>, "why": "<how they connect, max 8 words>"}]\n\n'
+                     f"Item: {x['name']}\n{x['summary']}\nLabels: {', '.join(x['labels']) or '-'}\n{flat(x['peek'], 1200)}"
+                     f"\n\nCandidates:\n{lines}", 600, tag="lib:" + item_id)
+    if reply is None:  # Argo down: no "related" yet, so retry_argo() tries again later
+        return
+    with lib_lock:
+        lib = load_lib()
+        cur = next((y for y in lib["items"] if y["id"] == item_id), None)
+        if not cur:
+            return
+        keep = [r for r in cur.get("related", []) if r.get("by") == "me"]
+        skip = {r["ref"] for r in keep} | set(cur.get("unlinked", []))
+        cur["related"] = keep + [{"ref": cands[i]["ref"], "why": why, "by": "argo"}
+                                 for i, why in clean_related(reply, len(cands)) if cands[i]["ref"] not in skip]
+        save_lib(lib)
 
 
 def lib_meta(lib, d):
@@ -1617,9 +1676,9 @@ class H(BaseHTTPRequestHandler):
             with lib_lock:
                 hues = {k: v for k, v in load_lib()["labels"].items() if v is not None}
             self.reply(200, json.dumps({"all": all_labels(), "hues": hues}).encode())
-        elif self.path == "/api/labeled":  # tasks for the Library's label view
+        elif self.path == "/api/labeled":  # tasks and emails for the Library: label view, Related links, Map
             self.reply(200, json.dumps([{k: v for k, v in x.items() if k != "text"}
-                                        for x in corpus() if x["labels"] and not x["ref"].startswith("lib:")]).encode())
+                                        for x in corpus() if not x["ref"].startswith("lib:")]).encode())
         elif self.path == "/api/feed":
             with feed_lock:
                 f = load_feed()
@@ -1796,6 +1855,25 @@ class H(BaseHTTPRequestHandler):
                         x["folder"], x["peek"] = Path(x["path"]).is_dir(), peek(x["path"])
                 elif act == "delete":  # only forgets it; the file stays where it is
                     lib["items"].remove(x)
+                    for y in lib["items"]:
+                        if "related" in y:
+                            y["related"] = [r for r in y["related"] if r["ref"] != "lib:" + x["id"]]
+                elif act == "link":  # {"ref": "lib:<id>" | "task:<id>"}: a link you made
+                    ref = str(d.get("ref") or "")
+                    if ref == "lib:" + x["id"] or not re.fullmatch(r"(lib|task):\w+", ref):
+                        return self.reply(400)
+                    x["related"] = [r for r in x.get("related", []) if r["ref"] != ref] + [{"ref": ref, "why": "", "by": "me"}]
+                    x["unlinked"] = [r for r in x.get("unlinked", []) if r != ref]
+                elif act == "unlink":  # {"ref"}: drops the link from either end, and Argo won't add it back
+                    ref = str(d.get("ref") or "")
+                    x["related"] = [r for r in x.get("related", []) if r["ref"] != ref]
+                    x["unlinked"] = sorted(set(x.get("unlinked", [])) | {ref})
+                    y = next((y for y in lib["items"] if "lib:" + y["id"] == ref), None)
+                    if y:
+                        y["related"] = [r for r in y.get("related", []) if r["ref"] != "lib:" + x["id"]]
+                        y["unlinked"] = sorted(set(y.get("unlinked", [])) | {"lib:" + x["id"]})
+                elif act == "relate":  # "Find links" again with Argo, in the background
+                    threading.Thread(target=lib_relate, args=(x["id"],), daemon=True).start()
                 elif act in ("open", "reveal", "edit", "terminal", "copy"):
                     cmd = {"open": ["open", x["path"]], "reveal": ["open", "-R", x["path"]],
                            "edit": ["open", "-a", config().get("library_editor", "Visual Studio Code"), x["path"]],
@@ -2812,6 +2890,25 @@ a.title:hover{color:var(--accent);text-decoration:underline}.mini.done .title{te
 .kind{color:var(--muted);text-transform:capitalize;font-weight:600}.sub{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:420px}
 main h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:18px 2px 4px;font-weight:600}
 #ans .steps{color:var(--muted);font-size:12px;margin-top:6px}#ans .refs{white-space:normal;margin-top:6px}
+.rel{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;margin-top:5px;font-size:12px}.rel:empty{display:none}
+.rl{color:var(--muted);font-weight:600;cursor:pointer}.rl:hover{color:var(--accent)}
+.rchip{display:inline-flex;align-items:center;gap:5px;max-width:260px;border:1px solid var(--line);border-radius:10px;padding:0 8px;cursor:pointer;background:var(--bg)}
+.rchip:hover{border-color:var(--accent)}.rchip i{flex:none;width:7px;height:7px;border-radius:50%;background:hsl(var(--h) 70% 50%)}
+.rchip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.rchip.argo{border-style:dashed}
+.rchip b{display:none;font-weight:400;opacity:.6}.rchip:hover b{display:inline}.rchip b:hover{opacity:1;color:var(--red)}
+.rel .addl{width:0}.c:hover .rel .addl{width:70px}.rel .find{display:none;padding:0 4px;font-size:12px}.c:hover .rel .find{display:inline}
+#focusbar{display:flex;align-items:center;gap:8px;margin:10px 0 4px;padding:8px 12px;border-radius:10px;background:color-mix(in srgb,var(--accent) 10%,var(--card));font-size:12.5px}
+#focusbar[hidden]{display:none}#focusbar span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#mapbox{position:relative;margin-top:8px}#mapbox[hidden]{display:none}
+#mapc{display:block;width:100%;height:calc(100vh - 172px);min-height:320px;background:var(--card);border:1px solid var(--line);border-radius:12px;cursor:grab;touch-action:none}
+#focusbar:not([hidden])~#mapbox #mapc{height:calc(100vh - 226px)}#mapc.drag{cursor:grabbing}#mapc.on{cursor:pointer}
+#tip{position:absolute;z-index:3;max-width:320px;pointer-events:none;background:var(--card);border:1px solid var(--line);border-radius:8px;
+  padding:7px 10px;font-size:12px;box-shadow:0 6px 24px #0003}#tip[hidden]{display:none}#tip b{display:block;font-size:12.5px}#tip small{color:var(--muted);display:block;margin-top:2px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;color:var(--muted);font-size:11.5px;margin:6px 4px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px;vertical-align:-1px;background:var(--muted)}
+.legend .ln{width:16px;height:0;border-radius:0;border-top:2px solid var(--accent);background:none;vertical-align:3px}
+.legend .ll{width:16px;height:0;border-radius:0;border-top:1px solid var(--muted);background:none;vertical-align:3px}
+.seg[hidden]{display:none}
 </style>
 <div id=drop>Drop files, folders or links to add them</div><div id=toast></div>
 <header>
@@ -2819,11 +2916,16 @@ main h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(-
     <button class=btn id=addbtn title="Add folders, files or docs">+ Add</button></div>
   <div class=bar>
     <input id=q type=search placeholder="Search, or ask Argo in plain words and press Enter: “slides from my last beamtime talk”  ( / )">
-    <span class=seg id=sorts></span>
+    <span class=seg id=sorts></span><span class=seg id=views></span>
   </div>
 </header>
-<datalist id=labels></datalist>
-<div class=wrap><aside id=nav></aside><main><div id=ans hidden></div><div id=list></div></main></div>
+<datalist id=labels></datalist><datalist id=refs></datalist>
+<div class=wrap><aside id=nav></aside><main><div id=ans hidden></div><div id=focusbar hidden></div><div id=list></div>
+  <div id=mapbox hidden><canvas id=mapc></canvas><div id=tip hidden></div>
+    <div class=legend><span><i style="width:13px;height:13px;vertical-align:-3px"></i>Label</span><span><i></i>Item (coloured by kind)</span>
+      <span><i class=ll></i>has the label</span><span><i class=ln></i>Related</span>
+      <span>Click a label to filter, an item to see what it connects to; double-click opens it. Scroll to zoom, drag to move.</span></div></div>
+</main></div>
 <dialog id=adddlg class=sheet><form id=aform>
   <div class=ph><h3>Add to Library</h3><p>Folders, files, docs and links. Each gets its type automatically; Argo summarizes it and suggests labels.</p></div>
   <div class=pb>
@@ -2853,8 +2955,9 @@ const I={folder:SVG('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0
   copy:SVG('<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>'),
   x:SVG('<path d="M6 6l12 12M18 6 6 18"/>')};
 const SORTS={recent:'Recent',name:'Name',added:'Added'};
-let lib={groups:[],labels:{},items:[]}, st={busy:[]}, rev=0, trev=0, dragId=null, others=[];  // others: labeled tasks
-let sel=localStorage.libsel||'all', ty=localStorage.libty||'', sort=localStorage.libsort||'recent';
+let lib={groups:[],labels:{},items:[]}, st={busy:[]}, rev=0, trev=0, dragId=null, tasks=[], others=[];  // tasks & emails; others: the labeled ones
+let byRef=new Map(), back=new Map();  // "lib:<id>"/"task:<id>" -> item; ref -> links other items made to it
+let sel=localStorage.libsel||'all', ty=localStorage.libty||'', sort=localStorage.libsort||'recent', view=localStorage.libview||'list';
 if(sel.startsWith('g:')){ty=sel.slice(2);sel='all'}  // from before groups became types
 const hue=s=>[...s].reduce((h,c)=>(h*31+c.charCodeAt(0))%360,7);  // same colours as Task Manager labels
 const lhue=l=>lib.labels[l]??hue(l);
@@ -2868,6 +2971,21 @@ async function api(p,b){
 const meta=b=>api('/api/library/meta',b);
 const allLabels=()=>[...new Set([...Object.keys(lib.labels),...lib.items.flatMap(x=>x.labels),...others.flatMap(x=>x.labels)])].sort((a,b)=>a.localeCompare(b));
 const KIND={arXiv:'paper',YouTube:'video',GitHub:'repo',Link:'link'};
+const refOf=x=>x.ref||'lib:'+x.id;
+const extOf=x=>x.folder||x.src?'':(x.name.match(/\.(\w{1,5})$/)||['',''])[1].toUpperCase(),kindOf=x=>x.src&&(KIND[x.src]||'link');
+const hueOf=x=>x.ref?KHUE[x.kind]??212:x.folder?212:kindOf(x)?KHUE[kindOf(x)]:hue(extOf(x)||'doc');
+const titleOf=x=>x.ref?x.title:x.name;
+function links(x){  // what x is related to, both the links it holds and the ones others hold to it; gone items dropped
+  const out=new Map();for(const r of x.related||[])out.set(r.ref,r);
+  for(const r of back.get(refOf(x))||[])if(!out.has(r.ref))out.set(r.ref,r);
+  return [...out.values()].filter(r=>byRef.has(r.ref));
+}
+function index(){
+  byRef=new Map([...lib.items.map(x=>['lib:'+x.id,x]),...tasks.map(x=>[x.ref,x])]);back=new Map();
+  for(const y of lib.items)for(const r of y.related||[]){if(!back.has(r.ref))back.set(r.ref,[]);back.get(r.ref).push({...r,ref:'lib:'+y.id,back:true})}
+}
+function openRef(ref){const x=byRef.get(ref);if(!x)return;  // double-click on the map
+  if(!x.ref)return api(`/api/library/item/${x.id}/open`);if(x.eml)return api(`/api/todo/${x.id}/open`);toast(x.title+' (a task: open it in Task Manager)')}
 // Survey Corps kit: sealed dispatch, supply wagon, scroll, crest shield, crossed blades, scouting compass, the Wall
 const WALL=SVG('<path d="M3 20V8h3V5h3v3h2V5h2v3h2V5h3v3h3v12zM10 20v-3.5a2 2 0 0 1 4 0V20"/>');
 const KICON={email:SVG('<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/><circle cx="12" cy="14" r="2.2" fill="currentColor"/>'),
@@ -2899,7 +3017,8 @@ function mini(x){  // a task, email or found file, in the Library's label view a
 const OTYPE={email:'Emails',task:'Tasks',paper:'Papers',video:'Videos',repo:'Code',link:'Websites'};  // tasks, and what Argo's search finds, as types
 const typeOf=x=>x.ref?OTYPE[x.kind]:x.group||'No type';
 const sels=()=>sel.startsWith('l:')?sel.slice(2).split('\t'):[];  // clicking labels toggles them; an item must have all of them
-const inScope=x=>sel==='all'||(sel==='missing'?x.missing:sels().every(l=>x.labels.includes(l)));
+let near=new Set();  // sel "r:<ref>": that item and what it's related to
+const inScope=x=>sel==='all'||(sel==='missing'?x.missing:sel.startsWith('r:')?near.has(refOf(x)):sels().every(l=>x.labels.includes(l)));
 const matches=x=>inScope(x)&&(!ty||typeOf(x)===ty);
 function go(s){sel=s;localStorage.libsel=s;render()}
 function goType(t){ty=ty===t?'':t;localStorage.libty=ty;render()}
@@ -2925,7 +3044,7 @@ function section(out,name,btns){  // a collapsible sidebar section; a folded one
 }
 function renderNav(){
   const it=lib.items,out=[navBtn('all','All items',it.length)];
-  const scope=[...it,...sel.startsWith('l:')?others:[]].filter(inScope),tn=t=>scope.filter(x=>typeOf(x)===t).length;
+  const scope=[...it,...sel.startsWith('l:')?others:sel.startsWith('r:')?tasks:[]].filter(inScope),tn=t=>scope.filter(x=>typeOf(x)===t).length;
   section(out,'Types',[...lib.groups,'Emails','Tasks','No type'].filter(t=>tn(t)||t===ty).map(t=>navBtn('t:'+t,t,tn(t)||'')));
   const ls=allLabels();
   const n=l=>[...it,...others].filter(x=>x.labels.includes(l)).length||'';  // a label view shows tasks too
@@ -2939,15 +3058,15 @@ function card(x){
   d.innerHTML=`<div class=ico></div><div class=body><input class=title spellcheck=false>
     <div class=meta><span class=argoing>✨ Argo is reading this…</span><select class=grp title="Type (set automatically; change it any time)"></select><span class=chips></span>
       <input class=addl list=labels placeholder="+ label"><span class=path></span></div>
-    <div class=why></div><details><summary>Notes &amp; contents</summary><textarea rows=2 placeholder="Notes…"></textarea>
+    <div class=why></div><div class=rel></div><details><summary>Notes &amp; contents</summary><textarea rows=2 placeholder="Notes…"></textarea>
       <input class=pathin spellcheck=false title="Path on disk (fix it here if you moved the item)"><pre></pre></details></div>
     <div class=side><button class=icon data-a=open title="Open">${I.open}</button><button class=icon data-a=reveal title="Show in Finder">${I.reveal}</button>
       <button class=icon data-a=edit title="Open in ${lib.editor}">${I.edit}</button><button class=icon data-a=terminal title="Open in Terminal">${I.term}</button>
       <button class=icon data-a=copy title="Copy path">${I.copy}</button><button class="icon x" title="Remove from Library (the file stays on disk)">${I.x}</button></div>`;
   const $=s=>d.querySelector(s),up=p=>api(`/api/library/item/${x.id}/update`,p);
-  const ext=x.folder||x.src?'':(x.name.match(/\.(\w{1,5})$/)||['',''])[1].toUpperCase(),k=x.src&&(KIND[x.src]||'link');
+  const ext=extOf(x),k=kindOf(x);
   const ico=$('.ico');ico.innerHTML=x.folder?WALL:k?KICON[k]:'';if(!x.folder&&!k)ico.textContent=ext||'DOC';
-  ico.style.setProperty('--h',x.folder?212:k?KHUE[k]:hue(ext||'doc'));ico.title=x.folder?'Open folder':k?'Open link':'Open';
+  ico.style.setProperty('--h',hueOf(x));ico.title=x.folder?'Open folder':k?'Open link':'Open';
   if(k)d.classList.add('mini');
   ico.onclick=()=>act('open');
   const ti=$('.title');ti.value=x.name;ti.title=x.name;ti.onchange=()=>up({name:ti.value});ti.onkeydown=e=>{if(e.key==='Enter')ti.blur()};
@@ -2966,6 +3085,7 @@ function card(x){
   else if(x.summary){let i=0,m;for(const re=/https?:\/\/[^\s<>"]*[^\s<>".,;)]/g;(m=re.exec(x.summary));i=re.lastIndex){
     why.append(x.summary.slice(i,m.index));const a=el('a',0,m[0]);a.href=m[0];a.target='_blank';why.append(a)}
     why.append(x.summary.slice(i))}else why.remove();
+  related($('.rel'),x);
   const n=$('textarea');n.value=x.note;n.onchange=()=>up({note:n.value});
   const pi=$('.pathin');pi.value=x.path;pi.onchange=()=>pi.value.trim()&&up({path:pi.value});
   if(x.peek)$('pre').textContent=x.peek;else $('pre').remove();
@@ -2980,28 +3100,57 @@ function card(x){
   d.ondragend=()=>dragId=null;
   return d;
 }
+function related(box,x){  // a card's "Related" row: click one to see what it connects to
+  const ls=links(x),me=refOf(x);
+  const h=el('span','rl','Related');h.title='Show this and everything it connects to';h.onclick=()=>go('r:'+me);
+  if(ls.length)box.append(h);
+  for(const r of ls.slice(0,8)){const y=byRef.get(r.ref),c=el('span','rchip'+(r.by==='argo'?' argo':''));
+    const i=el('i');i.style.setProperty('--h',hueOf(y));c.append(i,el('span',0,titleOf(y)));
+    c.title=(r.why?r.why+'\n':'')+(r.by==='argo'?'Found by Argo':'Linked by you')+' · click to see what it connects to';c.onclick=()=>go('r:'+r.ref);
+    const b=el('b',0,'×');b.title='Not related';b.onclick=e=>{e.stopPropagation();api(`/api/library/item/${x.id}/unlink`,{ref:r.ref})};c.append(b);box.append(c)}
+  if(ls.length>8)box.append(el('span','rl',`+${ls.length-8} more`));
+  const al=el('input','addl');al.setAttribute('list','refs');al.placeholder='+ link';al.title='Link it to another item, task or email (type its name)';
+  al.onchange=()=>{const v=al.value.trim(),y=[...byRef.values()].find(y=>titleOf(y)===v&&refOf(y)!==me);
+    if(y)api(`/api/library/item/${x.id}/link`,{ref:refOf(y)});else if(v)toast('No item, task or email has that name')};
+  box.append(al);
+  if(st.configured){const f=el('button','linkbtn find','✨ Find links');f.title='Ask Argo again what this connects to (keeps the links you made)';
+    f.onclick=()=>api(`/api/library/item/${x.id}/relate`).then(()=>toast('Argo is looking for what this connects to…'));box.append(f)}
+}
 function render(){
   if(sels().some(l=>!allLabels().includes(l)))sel='all';  // the label may have been renamed or deleted
+  if(sel.startsWith('r:')&&!byRef.has(sel.slice(2)))sel='all';  // its item was removed
+  const center=sel.startsWith('r:')&&byRef.get(sel.slice(2));
+  near=new Set(center?[sel.slice(2),...links(center).map(r=>r.ref)]:[]);
+  focusbar.hidden=!center;
+  if(center){const b=el('button','linkbtn','Show all');b.onclick=()=>go('all');
+    focusbar.replaceChildren(el('span',0,`“${titleOf(center)}” and the ${near.size-1} thing${near.size===2?'':'s'} it connects to`),b)}
   if(ty&&!lib.groups.includes(ty)&&!['Emails','Tasks','No type'].includes(ty))ty='';
   renderNav();
   labels.replaceChildren(...allLabels().map(l=>new Option(l)));
   sorts.replaceChildren(...Object.entries(SORTS).map(([k,v])=>{const b=el('button',k===sort?'on':'',v);b.onclick=()=>{sort=k;localStorage.libsort=k;render()};return b}));
+  views.replaceChildren(...[['list','List'],['map','Map']].map(([k,v])=>{const b=el('button',k===view?'on':'',v);
+    b.title=k==='map'?'How your items, tasks and emails connect, through labels and Related links':'';b.onclick=()=>{view=k;localStorage.libview=k;render()};return b}));
+  refs.replaceChildren(...[...byRef.values()].map(y=>new Option(titleOf(y))));
+  sorts.hidden=view==='map';
   const qv=q.value.trim(),words=qv.endsWith('?')||(!ans.hidden&&wordy(qv))?[]:qv.toLowerCase().split(/\s+/).filter(Boolean);
   const key={recent:x=>-Date.parse((x.opened>x.added?x.opened:x.added)||0),name:x=>x.name.toLowerCase(),added:x=>-Date.parse(x.added)}[sort];
   const shown=lib.items.filter(x=>matches(x)&&words.every(w=>[x.name,x.path,x.group,x.note,x.summary,x.peek,...x.labels].join(' ').toLowerCase().includes(w)))
     .sort((a,b)=>{const p=key(a),r=key(b);return p<r?-1:p>r?1:0});
-  const lab=sels().length;
-  const more=lab?others.filter(x=>matches(x)&&words.every(w=>[x.title,x.sub,...x.labels].join(' ').toLowerCase().includes(w))):[];
-  const files=shown,tasks=more;
+  const lab=sels().length||center,tw=x=>words.every(w=>[x.title,x.sub,...x.labels].join(' ').toLowerCase().includes(w));
+  if(center)shown.sort((a,b)=>(b===center)-(a===center));
+  const more=lab?tasks.filter(x=>matches(x)&&tw(x)).sort((a,b)=>(b===center)-(a===center)):[];
+  list.hidden=view==='map';mapbox.hidden=view!=='map';
+  if(view==='map')drawMap([...shown,...lab?more:tasks.filter(x=>matches(x)&&tw(x)&&(x.labels.length||back.has(x.ref)))]);else stopMap();
+  const files=shown;
   list.replaceChildren(...(more.length&&files.length?[el('h3',0,'In the Library')]:[]),...files.slice(0,400).map(card),
-    ...(tasks.length?[el('h3',0,'Tasks & emails'),...tasks.map(mini)]:[]));
+    ...(more.length?[el('h3',0,'Tasks & emails'),...more.map(mini)]:[]));
   if(!shown.length&&!more.length){const e=el('div','empty');
     e.innerHTML=lib.items.length?(st.configured?'Nothing matches. Press <b>Enter</b> to have Argo look for it.':'Nothing matches.'):'Your Library is empty.<br>Click <b>+ Add</b> to choose folders, files or docs, or drag them in from Finder.';list.append(e)}
   stats.textContent=`${lib.items.length} item${lib.items.length===1?'':'s'}`+(shown.length+more.length!==lib.items.length?` · ${shown.length+more.length} shown`:'');
   if(mdlg.open&&!mdlg.contains(document.activeElement))drawManage();
 }
-async function load(){[lib,st,others]=await Promise.all(['/api/library','/api/status','/api/labeled'].map(u=>fetch(u).then(r=>r.json())));
-  rev=st.lib_rev;trev=st.rev;render();pill()}
+async function load(){[lib,st,tasks]=await Promise.all(['/api/library','/api/status','/api/labeled'].map(u=>fetch(u).then(r=>r.json())));
+  others=tasks.filter(x=>x.labels.length);index();rev=st.lib_rev;trev=st.rev;render();pill()}
 function pill(){  // Argo status, as in Task Manager
   const work=st.busy.filter(x=>x!=='check'),waiting=lib.items.filter(x=>x.retry).length;
   argo.className='pill'+(!st.configured?'':work.length||st.busy.includes('check')?' busy':st.argo?' ok':st.argo===false?' down':'');
@@ -3017,6 +3166,108 @@ async function tick(){
 }
 argo.onclick=()=>{fetch('/api/argo/check',{method:'POST'}).then(tick);setTimeout(tick,150)};
 setInterval(tick,2000);
+// ---- map: labels and items as a force-directed graph; lines are "has this label" and Related links ----
+// ponytail: plain O(n²) forces, fine for a few hundred nodes; Barnes-Hut if Libraries get into the thousands
+const M={nodes:[],edges:[],sig:'',scope:'',alpha:0,k:1,tx:0,ty:0,fit:true,hover:null,drag:null,pan:null,raf:0};
+const pos=new Map();  // node id -> {x,y,vx,vy}, kept across redraws so the map doesn't reshuffle
+function drawMap(items){
+  const nodes=[],edges=[],at=new Map(),cnt={};
+  for(const x of items){at.set(refOf(x),nodes.length);nodes.push({id:refOf(x),item:x,r:x.ref?4:5.5,h:hueOf(x)})}
+  for(const x of items)for(const l of x.labels)cnt[l]=(cnt[l]||0)+1;
+  for(const l in cnt){at.set('L:'+l,nodes.length);nodes.push({id:'L:'+l,label:l,n:cnt[l],r:7+Math.sqrt(cnt[l])*2.4,h:lhue(l)})}
+  for(const x of items){const a=at.get(refOf(x));for(const l of x.labels)edges.push({a,b:at.get('L:'+l)});
+    for(const r of x.related||[]){const b=at.get(r.ref);if(b!=null&&b!==a)edges.push({a,b,rel:true})}}
+  for(const n of nodes)n.nb=new Set([n]);
+  for(const e of edges){nodes[e.a].nb.add(nodes[e.b]);nodes[e.b].nb.add(nodes[e.a])}
+  for(const n of nodes){  // new nodes start next to something they're tied to
+    if(!pos.has(n.id)){const m=[...n.nb].find(m=>pos.has(m.id)),o=m?pos.get(m.id):{x:0,y:0},a=Math.random()*6.3,d=m?20:60+Math.random()*160;
+      pos.set(n.id,{x:o.x+Math.cos(a)*d,y:o.y+Math.sin(a)*d,vx:0,vy:0})}
+    n.p=pos.get(n.id)}
+  const sig=nodes.map(n=>n.id).join()+'|'+edges.length,scope=sel+'\t'+ty+'\t'+q.value;
+  if(scope!==M.scope){M.fit=true;M.alpha=Math.max(M.alpha,.5)}
+  if(sig!==M.sig)M.alpha=Math.max(M.alpha,M.sig?.4:1);
+  Object.assign(M,{nodes,edges,sig,scope});
+  M.hover=M.hover&&nodes.find(n=>n.id===M.hover.id);if(!M.hover)tip.hidden=true;
+  run();
+}
+function stopMap(){cancelAnimationFrame(M.raf);M.raf=0;tip.hidden=true}
+function run(){if(!M.raf)M.raf=requestAnimationFrame(frame)}
+function frame(){
+  M.raf=0;
+  if(M.alpha>.005){for(let i=0;i<2;i++)step();if(M.fit)fit()}
+  paint();
+  if(M.alpha>.005||M.drag)run();
+}
+function step(){
+  const N=M.nodes,a=M.alpha;
+  for(let i=0;i<N.length;i++){const p=N[i].p,ci=N[i].label?3:1;
+    for(let j=i+1;j<N.length;j++){const q=N[j].p,cj=N[j].label?3:1,dx=q.x-p.x,dy=q.y-p.y,d2=Math.max(dx*dx+dy*dy,25);
+      if(d2>160000&&ci*cj<9)continue;
+      const f=160*ci*cj*a/d2;p.vx-=dx*f;p.vy-=dy*f;q.vx+=dx*f;q.vy+=dy*f}}
+  for(const e of M.edges){const p=M.nodes[e.a].p,q=M.nodes[e.b].p,dx=q.x-p.x,dy=q.y-p.y,d=Math.hypot(dx,dy)||1,
+    f=(d-(e.rel?45:60))/d*a*(e.rel?.12:.06);p.vx+=dx*f;p.vy+=dy*f;q.vx-=dx*f;q.vy-=dy*f}
+  for(const n of N){const p=n.p;if(n===M.drag){p.vx=p.vy=0;continue}
+    p.vx-=p.x*.01*a;p.vy-=p.y*.01*a;p.vx*=.55;p.vy*=.55;p.x+=p.vx;p.y+=p.vy}
+  M.alpha*=.99;
+}
+function fit(){  // zoom and centre so everything shows, until you pan or zoom yourself
+  if(!M.nodes.length)return;
+  const W=mapc.clientWidth,H=mapc.clientHeight;let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+  for(const n of M.nodes){x0=Math.min(x0,n.p.x-n.r);x1=Math.max(x1,n.p.x+n.r);y0=Math.min(y0,n.p.y-n.r);y1=Math.max(y1,n.p.y+n.r+16)}
+  M.k=Math.min(2.5,(W-80)/Math.max(x1-x0,1),(H-60)/Math.max(y1-y0,1));M.tx=-(x0+x1)/2*M.k;M.ty=-(y0+y1)/2*M.k;
+}
+function paint(){
+  const c=mapc,dpr=devicePixelRatio||1,W=c.clientWidth,H=c.clientHeight;
+  if(c.width!==Math.round(W*dpr)||c.height!==Math.round(H*dpr)){c.width=Math.round(W*dpr);c.height=Math.round(H*dpr)}
+  const g=c.getContext('2d'),cs=getComputedStyle(document.body),v=k=>cs.getPropertyValue(k).trim(),hot=M.hover?.nb,k=M.k;
+  g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,H);g.translate(W/2+M.tx,H/2+M.ty);g.scale(k,k);
+  for(const e of M.edges){const A=M.nodes[e.a],B=M.nodes[e.b],on=!hot||A===M.hover||B===M.hover;
+    g.globalAlpha=on?(e.rel?.9:hot?.7:.28):.05;g.strokeStyle=e.rel?v('--accent'):`hsl(${B.h} 55% 55%)`;g.lineWidth=(e.rel?1.8:1)/k;
+    g.beginPath();g.moveTo(A.p.x,A.p.y);g.lineTo(B.p.x,B.p.y);g.stroke()}
+  g.textAlign='center';g.textBaseline='top';
+  for(const n of M.nodes){g.globalAlpha=!hot||hot.has(n)?1:.15;
+    g.beginPath();g.arc(n.p.x,n.p.y,n.r,0,7);
+    if(n.label){g.fillStyle=`hsl(${n.h} 70% 50% / .22)`;g.fill();g.strokeStyle=`hsl(${n.h} 70% 50%)`;g.lineWidth=1.5/k;g.stroke()}
+    else{g.fillStyle=`hsl(${n.h} 70% 50%)`;g.fill();if(n===M.hover){g.strokeStyle=v('--text');g.lineWidth=2/k;g.stroke()}}
+    if(sel==='r:'+n.id){g.beginPath();g.arc(n.p.x,n.p.y,n.r+4/k,0,7);g.strokeStyle=v('--accent');g.lineWidth=2/k;g.stroke()}}
+  const few=M.nodes.length<=30;  // small maps (one label, one item's connections): every title
+  for(const n of M.nodes){const on=!hot||hot.has(n);if(!n.label&&!(hot&&on)&&!few&&k<1.6)continue;
+    g.globalAlpha=on?1:.15;g.fillStyle=n.label?v('--text'):v('--muted');g.font=`${n.label?600:400} ${(n.label?12:10.5)/k}px -apple-system,sans-serif`;
+    const t=n.label||titleOf(n.item);g.fillText(t.length>34?t.slice(0,33)+'…':t,n.p.x,n.p.y+n.r+3/k)}
+  g.globalAlpha=1;
+  if(!M.nodes.length){g.setTransform(dpr,0,0,dpr,0,0);g.fillStyle=v('--muted');g.font='15px -apple-system,sans-serif';g.textAlign='center';
+    g.fillText(lib.items.length?'Nothing matches.':'Your Library is empty.',W/2,H/2)}
+}
+const world=e=>{const b=mapc.getBoundingClientRect();return {x:(e.clientX-b.left-b.width/2-M.tx)/M.k,y:(e.clientY-b.top-b.height/2-M.ty)/M.k}};
+function hit(e){const w=world(e);let best=null,bd=1e9;
+  for(const n of M.nodes){const d=Math.hypot(n.p.x-w.x,n.p.y-w.y);if(d<n.r+5/M.k&&d<bd){best=n;bd=d}}return best}
+function showTip(n,e){
+  if(!n){tip.hidden=true;return}
+  const x=n.item,b=mapbox.getBoundingClientRect();
+  if(n.label)tip.replaceChildren(el('b',0,n.label),el('small',0,`Label · ${n.n} here · click to ${sels().includes(n.label)?'remove the filter':'filter by it'}`));
+  else{const ls=links(x);tip.replaceChildren(el('b',0,titleOf(x)),el('small',0,[x.ref?x.kind:typeOf(x),...x.labels].join(' · ')));
+    const s=x.ref?x.sub:x.summary;if(s)tip.append(el('small',0,s));
+    if(ls.length)tip.append(el('small',0,'Related: '+ls.slice(0,4).map(r=>titleOf(byRef.get(r.ref))+(r.why?` (${r.why})`:'')).join('; ')+(ls.length>4?' …':'')))}
+  tip.hidden=false;
+  const L=Math.min(e.clientX-b.left+14,b.width-tip.offsetWidth-4),T=e.clientY-b.top+14;
+  tip.style.left=Math.max(4,L)+'px';tip.style.top=(T+tip.offsetHeight>b.height?e.clientY-b.top-tip.offsetHeight-10:T)+'px';
+}
+mapc.onpointerdown=e=>{mapc.setPointerCapture(e.pointerId);const n=hit(e);M.moved=0;
+  if(n){M.drag=n;M.fit=false}else{M.pan={x:e.clientX,y:e.clientY};mapc.classList.add('drag')}};
+mapc.onpointermove=e=>{
+  if(M.drag){M.moved++;if(M.moved<3)return;Object.assign(M.drag.p,world(e));M.alpha=Math.max(M.alpha,.15);tip.hidden=true;run();return}
+  if(M.pan){M.tx+=e.clientX-M.pan.x;M.ty+=e.clientY-M.pan.y;M.pan={x:e.clientX,y:e.clientY};M.moved++;M.fit=false;run();return}
+  const n=hit(e);if(n!==M.hover){M.hover=n;mapc.classList.toggle('on',!!n);run()}showTip(n,e)};
+mapc.onpointerup=()=>{const n=M.drag,click=M.moved<3;M.drag=M.pan=null;mapc.classList.remove('drag');if(!click||!n)return;
+  M.hover=null;tip.hidden=true;
+  if(n.label){const cur=sels(),nx=cur.includes(n.label)?cur.filter(y=>y!==n.label):[...cur,n.label];go(nx.length?'l:'+nx.join('\t'):'all')}
+  else go('r:'+n.id)};
+mapc.ondblclick=e=>{const n=hit(e);if(n&&!n.label)openRef(n.id)};
+mapc.onpointerleave=()=>{if(M.hover){M.hover=null;run()}tip.hidden=true};
+mapc.addEventListener('wheel',e=>{e.preventDefault();const w=world(e),k=Math.max(.15,Math.min(6,M.k*Math.exp(-e.deltaY*.0015)));
+  M.tx-=w.x*(k-M.k);M.ty-=w.y*(k-M.k);M.k=k;M.fit=false;run()},{passive:false});
+addEventListener('resize',()=>view==='map'&&run());
+matchMedia('(prefers-color-scheme:dark)').addEventListener('change',()=>view==='map'&&run());
 // ---- groups & labels editor: every change is saved right away ----
 function mrow(name,count,ren,del,h){
   const r=el('div','row');
