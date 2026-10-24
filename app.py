@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Survey Corps: local todo list fed by emails dragged from Outlook. Run: python3 app.py"""
 from collections import Counter
-import html, inspect, json, os, re, socket, sqlite3, subprocess, sys, threading, time, urllib.parse, urllib.request, uuid
+import base64, html, inspect, json, os, re, socket, sqlite3, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email import message_from_bytes, policy
@@ -15,9 +15,12 @@ ORIGIN = f"http://127.0.0.1:{PORT}"
 DATA = Path(__file__).resolve().parent / "data"
 MAILS = DATA / "mails"   # original .eml copies, opened in Outlook via "Open mail"
 INBOX = DATA / "inbox"   # fallback: drag emails from Outlook into this Finder folder
+SHOTS = DATA / "shots"   # screenshots turned into tasks
+IMAGE = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
 DB = DATA / "todos.json"
-CONFIG = DATA / "config.json"  # optional: {"argo_user": "<ANL username>", "argo_model": "claudesonnet5"}
+CONFIG = DATA / "config.json"  # optional: {"argo_user": "<ANL username>", "argo_model": "claudesonnet55"}
 ARGO = "https://apps.inside.anl.gov/argoapi/v1/chat/completions"
+MODEL, BACKUP = "claudesonnet55", "claudesonnet5"  # default Argo model, and the one tried when it errors
 BRIEFED = DATA / "briefed"  # date of the last morning briefing
 RAN = DATA / "routines_ran.json"  # {routine line: date it last ran}
 lock = threading.Lock()
@@ -75,7 +78,7 @@ def config():
 
 
 SETTINGS = {  # editable in the app's Settings dialog -> (default, max for ints / None for text)
-    "argo_user": ("", None), "argo_model": ("claudesonnet5", None), "retry_minutes": (10, 1440),
+    "argo_user": ("", None), "argo_model": (MODEL, None), "retry_minutes": (10, 1440),
     "briefing_hour": (8, 24), "library_editor": ("Visual Studio Code", None), "github_token": ("", None),
     "routines": ("", None)}
 
@@ -111,8 +114,9 @@ def argo_on():
     return bool(config().get("argo_user"))
 
 
-def argo(prompt, max_tokens, timeout=120, tag=""):
-    """Ask the lab's Argo LLM. Returns the reply text, or None if unconfigured, down or unreachable (e.g. no VPN)."""
+def argo(prompt, max_tokens, timeout=120, tag="", image=None):
+    """Ask the lab's Argo LLM (with an optional image file it can see). Returns the reply text, or None if unconfigured,
+    down or unreachable (e.g. no VPN)."""
     global argo_ok, argo_at
     cfg = config()
     if not cfg.get("argo_user"):
@@ -123,15 +127,23 @@ def argo(prompt, max_tokens, timeout=120, tag=""):
     except OSError:
         argo_ok, argo_at = False, time.time()
         return None
-    req = urllib.request.Request(ARGO, json.dumps({
-        "model": cfg.get("argo_model", "claudesonnet5"), "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}]}).encode(),
-        {"Content-Type": "application/json", "Authorization": "Bearer " + cfg["argo_user"]})
+    content = prompt if not image else [{"type": "text", "text": prompt},
+                                        {"type": "image_url", "image_url": {"url": data_url(image)}}]
+    models = list(dict.fromkeys([cfg.get("argo_model") or MODEL, BACKUP]))
     with busy_lock:
         busy[tag] += 1
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            text = json.load(r)["choices"][0]["message"]["content"]
+        for i, model in enumerate(models):
+            req = urllib.request.Request(ARGO, json.dumps({
+                "model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": content}]}).encode(),
+                {"Content-Type": "application/json", "Authorization": "Bearer " + cfg["argo_user"]})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    text = json.load(r)["choices"][0]["message"]["content"]
+                break
+            except (urllib.error.HTTPError, KeyError, IndexError, ValueError):  # model errored: try the backup
+                if i == len(models) - 1:
+                    raise
     except Exception:  # down, 5xx, timeout, off VPN, malformed reply: all the same to callers
         argo_ok = False
         return None
@@ -141,6 +153,18 @@ def argo(prompt, max_tokens, timeout=120, tag=""):
             busy[tag] -= 1
     argo_ok = True
     return text
+
+
+def data_url(path):
+    """A screenshot as a data: URL, shrunk to the 1568 px Claude reads anyway (so big Retina shots stay small)."""
+    small = Path(str(path) + ".send.jpg")
+    if subprocess.run(["sips", "-Z", "1568", "-s", "format", "jpeg", str(path), "--out", str(small)],
+                      capture_output=True).returncode == 0:
+        data, mime = small.read_bytes(), "image/jpeg"
+        small.unlink()
+    else:  # no sips (not a Mac): send it as is
+        data, mime = Path(path).read_bytes(), IMAGE.get(Path(path).suffix.lower(), "image/png")
+    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
 
 
 def check_argo():
@@ -153,7 +177,7 @@ def suggest(t, known):
     now = datetime.now()
     labels = ("- labels: up to 3 short labels (1-2 words, Title Case). Reuse an existing label whenever one fits; "
               "invent a new one only if none does.\n")
-    if t["eml"]:
+    if t["eml"] or t.get("shot"):  # a screenshot reads like an email: its date, sender and asks
         prompt = (f"Today is {now:%A %Y-%m-%d %H:%M} (local time). Existing labels: {json.dumps(known)}.\n"
                   "Below is an email I saved as a to-do. Reply with ONLY a JSON object "
                   '{"labels": [...], "due": "...", "actions": [...]}.\n' + labels +
@@ -207,6 +231,13 @@ def blank():
 def make_todo(raw, name):
     t = blank()
     tid = t["id"]
+    ext = Path(name).suffix.lower()
+    if ext in IMAGE:  # a screenshot: Argo reads it in the background
+        SHOTS.mkdir(parents=True, exist_ok=True)
+        (SHOTS / f"{tid}{ext}").write_bytes(raw)
+        t.update(title="Screenshot", sender="", date="", body="", eml=False, shot=ext)
+        threading.Thread(target=read_shot, args=(t,), daemon=True).start()
+        return t
     msg = message_from_bytes(raw, policy=policy.default)
     if name.lower().endswith(".eml") or (msg["From"] and msg["Subject"] is not None):
         (MAILS / f"{tid}.eml").write_bytes(raw)
@@ -219,6 +250,47 @@ def make_todo(raw, name):
                  body=text[:3000], eml=False)
     threading.Thread(target=enrich, args=(t,), daemon=True).start()
     return t
+
+
+def clean_shot(text):
+    """{"title", "sender", "date", "text"} from the model's reply; None if it isn't that JSON."""
+    try:
+        d = json.loads(re.search(r"\{.*\}", text, re.S).group())
+    except (AttributeError, ValueError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    return {k: str(d.get(k) or "").strip()[:3000 if k == "text" else 200] for k in ("title", "sender", "date", "text")}
+
+
+def read_shot(t):
+    """Background: Argo reads a screenshot (an email, chat, calendar invite, web page...) into the task's title and text,
+    then labels/due/action items are filled in as for any other task."""
+    reply = argo("This is a screenshot I took to make a to-do from. Reply with ONLY a JSON object "
+                 '{"title": "...", "sender": "...", "date": "...", "text": "..."}.\n'
+                 "- title: what I need to do, as a short imperative to-do (max 12 words); if it's just a message, its subject.\n"
+                 '- sender: who it is from (name <email> if shown), or "".\n'
+                 '- date: when it was sent or posted, as shown, or "".\n'
+                 "- text: all the readable text that matters (message body, deadlines, links, names), transcribed as "
+                 "plain text; skip window chrome, menus and toolbars.", 3000, tag=t["id"], image=SHOTS / f"{t['id']}{t['shot']}")
+    s = None if reply is None else clean_shot(reply)
+    with lock:
+        todos = load()
+        cur = next((x for x in todos if x["id"] == t["id"]), None)
+        if not cur or not argo_on():
+            return
+        if reply is None:  # Argo down: retry_argo() tries again later
+            cur["retry"] = "shot"
+            return save(todos)
+        cur.pop("retry", None)
+        if s:
+            if cur["title"] == "Screenshot" and s["title"]:  # unless the user renamed it meanwhile
+                cur["title"] = s["title"]
+            cur.update(sender=s["sender"], date=s["date"], body=s["text"])
+        save(todos)
+        t = dict(cur)
+    if s:
+        enrich(t)
 
 
 def summarize(t):
@@ -245,7 +317,8 @@ def retry_argo():
         return
     try:
         with lock:
-            jobs = [((summarize if t["retry"] == "summary" else enrich), t) for t in load() if t.get("retry") and not t["done"]]
+            jobs = [({"summary": summarize, "shot": read_shot}.get(t["retry"], enrich), t)
+                    for t in load() if t.get("retry") and not t["done"]]
         with lib_lock:
             jobs += [(lib_enrich, x["id"]) for x in load_lib()["items"] if x.get("retry")]
         for fn, arg in jobs:
@@ -1482,6 +1555,9 @@ class H(BaseHTTPRequestHandler):
                 self.reply(200, json.dumps(load()).encode())
         elif self.path == "/api/settings":
             self.reply(200, json.dumps(get_settings()).encode())
+        elif self.path.startswith("/api/shot/"):  # a screenshot task's image
+            f = next(SHOTS.glob(re.sub(r"\W", "", self.path.rsplit("/", 1)[1]) + ".*"), None)
+            self.reply(200, f.read_bytes(), IMAGE.get(f.suffix, "application/octet-stream")) if f else self.reply(404)
         elif self.path == "/api/status":
             with busy_lock:
                 working = sorted(k for k, n in busy.items() if n > 0)
@@ -1754,6 +1830,8 @@ class H(BaseHTTPRequestHandler):
                     mid = t.get("mail", t["id"])
                     if not any(x.get("mail", x["id"]) == mid for x in todos):  # split-off tasks may share the email
                         (MAILS / f"{mid}.eml").unlink(missing_ok=True)
+                        for f in SHOTS.glob(f"{mid}.*"):
+                            f.unlink()
                 elif parts[3] == "open":
                     eml = MAILS / f"{t.get('mail', t['id'])}.eml"
                     if subprocess.run(["open", "-a", "Microsoft Outlook", eml]).returncode:
@@ -1781,10 +1859,12 @@ header{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 85
 .top{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}
 h1{font-size:20px;margin:0;font-weight:700}
 #stats{color:var(--muted)}
-.bar{display:flex;gap:8px}
+.bar{display:flex;gap:8px}#shot{opacity:1;width:34px;height:auto;border:1px solid var(--line);background:var(--card);border-radius:8px}
+#shot[hidden]{display:none}
+.shotimg{display:block;max-width:100%;max-height:320px;margin-top:8px;border:1px solid var(--line);border-radius:10px;cursor:zoom-in}
 .bar input,.bar select{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 10px;outline:none}
 .bar input:focus,.bar select:focus{border-color:var(--accent);box-shadow:0 0 0 3px #0a84ff33}
-#new{flex:2}#q{flex:1.3}
+#new,#q{flex:1}.bar{flex-wrap:wrap;row-gap:3px}.bar .brk{flex-basis:100%;height:0}
 main{padding:6px 20px 40px}
 h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:18px 4px 6px;font-weight:600}
 h2 span{font-weight:400;margin-left:4px}h2.late{color:var(--red)}
@@ -1884,8 +1964,9 @@ details .askm{border-color:color-mix(in srgb,var(--accent) 35%,transparent)}
   <div class=top><h1>Task Manager</h1><span id=stats></span><button id=argo class=pill></button>
     <button id=rt class=pill hidden title="Retry the work Argo missed, now">Retry now</button></div>
   <div class=bar>
-    <input id=new placeholder="Add a task (&quot;review Bob's draft by Fri 3pm&quot;) or drag in emails from Outlook">
-    <input id=q type=search placeholder="Search, or ask a question ending in ?  ( / )">
+    <input id=new placeholder="Add a task (&quot;review Bob's draft by Fri 3pm&quot;), or drag in an email or image">
+    <button id=shot class=icon hidden title="Screenshot to task: drag over an area (Space picks a window, Esc cancels). Already have one copied? Paste it here with ⌘V."><svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.5"/></svg></button>
+    <div class=brk></div><input id=q type=search placeholder="Search, or ask a question ending in ?  ( / )">
     <span class=seg><button id=vl>List</button><button id=vc>Calendar</button></span>
   </div>
   <div id=lbar></div>
@@ -1981,7 +2062,9 @@ function item(t){
   const n=$('textarea'); n.value=t.note; n.onchange=()=>up({note:n.value});
   const grow=()=>{n.style.height='auto';n.style.height=n.scrollHeight+2+'px'}; n.oninput=grow;
   $('details').ontoggle=grow;
-  $('summary').textContent=(hasBody?'Email & notes':'Notes')+(t.note?' ✎':'');
+  if(t.shot){const a=document.createElement('a'),i=document.createElement('img');a.href=i.src=`/api/shot/${t.mail||t.id}`;a.target='_blank';
+    i.className='shotimg';i.title='Open full size';a.append(i);$('details summary').after(a)}
+  $('summary').textContent=(t.shot?'Screenshot & notes':hasBody?'Email & notes':'Notes')+(t.note?' ✎':'');
   return d;
 }
 // Outlook Safe Links / urldefense wrap every URL; show the real one, keep the wrapped href for the security scan
@@ -2140,6 +2223,14 @@ addEventListener('drop',async e=>{
   const txt=!files.length&&(e.dataTransfer.getData('text/plain')||e.dataTransfer.getData('text/uri-list'));
   if(txt) await fetch('/api/drop?name=drop.txt',{method:'POST',body:txt});
   load();
+});
+// screenshots: the camera button (Mac app: it hides the window and runs the area picker), or ⌘V an image copied with ⌃⇧⌘4
+const shotBtn=document.getElementById('shot');shotBtn.hidden=!window.webkit?.messageHandlers?.shot;
+shotBtn.onclick=()=>webkit.messageHandlers.shot.postMessage('');
+addEventListener('paste',async e=>{
+  const f=[...e.clipboardData.files].find(f=>f.type.startsWith('image/'));if(!f)return;e.preventDefault();
+  toast('Reading the screenshot…');
+  await fetch('/api/drop?name=paste.'+(f.type.split('/')[1]||'png'),{method:'POST',body:f});load();
 });
 setInterval(()=>{if(!document.querySelector('.t details[open]')&&document.activeElement===document.body)load()},60000);  // due-date groups move with the clock
 load();
@@ -2413,7 +2504,7 @@ button{font:inherit;border:1px solid var(--line);background:var(--card);color:va
 <h2>Argo</h2>
 <div class=group>
   <div class=r><label for=argo_user>ANL username<small>Blank turns all LLM features off</small></label><input id=argo_user autocomplete=off spellcheck=false></div>
-  <div class=r><label for=argo_model>Model</label><input id=argo_model spellcheck=false placeholder=claudesonnet5></div>
+  <div class=r><label for=argo_model>Model</label><input id=argo_model spellcheck=false placeholder=claudesonnet55></div>
   <div class=r><label for=retry_minutes>Retry missed work<small>When Argo was down or off VPN</small></label><select id=retry_minutes></select></div>
   <div class=r><label>Connection<small id=res>&nbsp;</small></label><button id=test>Test Connection</button></div>
 </div>

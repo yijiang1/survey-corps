@@ -670,7 +670,9 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         server.standardError = log
         try? server.run()  // if a server is already running, this one exits and we use that one
 
-        let web = DropWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let mainConfig = WKWebViewConfiguration()
+        mainConfig.userContentController.add(self, name: "shot")  // the page's camera button
+        let web = DropWebView(frame: .zero, configuration: mainConfig)
         web.navigationDelegate = self
         web.uiDelegate = self
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
@@ -822,6 +824,28 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         return true
     }
 
+    // Hide the app, let the user drag over an area with macOS's own picker (Space: a window, Esc: cancel),
+    // then Argo reads the image into a task. First use asks for Screen Recording permission.
+    func screenshotTask() {
+        let shown = window.isVisible
+        NSApp.hide(nil)
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("survey-corps-shot.png")
+        try? FileManager.default.removeItem(at: file)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {  // let the window finish hiding first
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            p.arguments = ["-i", "-x", file.path]
+            p.terminationHandler = { _ in DispatchQueue.main.async {
+                if shown { NSApp.activate(ignoringOtherApps: true); self.window.makeKeyAndOrderFront(nil) }
+                guard FileManager.default.fileExists(atPath: file.path) else { return }  // Esc: nothing taken
+                uploadEmail(file) { title in
+                    self.say("task", "", title != nil ? "Added the screenshot. Argo is reading it." : "Couldn't add the screenshot", ok: title != nil)
+                }
+            } }
+            try? p.run()
+        }
+    }
+
     func addTask(_ text: String) {
         post("api/drop", raw: Data(text.utf8)) { d, code in
             self.say("task", "", code == 200 ? "Added: \(json(d)["title"] as? String ?? text)" : "Couldn't add that task", ok: code == 200)
@@ -866,6 +890,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
             m.addItem(Item("Quick Add Task…") {
                 if let v = textPrompt("New task", info: "With Argo, plain language works.", placeholder: "review Bob's draft by Fri 3pm") { self.addTask(v) }
             })
+            m.addItem(Item("Screenshot to Task…") { self.screenshotTask() })
             m.addItem(Item("Ask About My Tasks…") { self.ask(kind, "api/ask", "Ask about your tasks and emails", "what did Bob ask me about the beamtime?") })
         case "levi": break  // just show/hide; the window has the sessions
         case "scout":
@@ -999,6 +1024,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
 
     // Library "Choose in Finder…": the standard Open panel (files and folders, several at once, New Folder for a new project)
     func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+        if m.name == "shot" { return screenshotTask() }
         let p = NSOpenPanel()
         p.canChooseFiles = true; p.canChooseDirectories = true; p.allowsMultipleSelection = true; p.canCreateDirectories = true
         p.prompt = "Choose"; p.message = "Pick projects, files or docs (⌘-click for several). New Folder starts a new project."

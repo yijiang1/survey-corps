@@ -76,7 +76,7 @@ assert app.lib_add([str(root / "proj1")])[1] == ["proj1: already in the Library"
 import tempfile
 app.CONFIG = Path(tempfile.mkdtemp()) / "config.json"
 app.config = lambda: __import__("json").loads(app.CONFIG.read_text()) if app.CONFIG.exists() else {}  # undo earlier patch
-app.set_settings({"argo_user": " bob ", "retry_minutes": "30", "github_token": "tok", "bogus": 1, "argo_model": "claudesonnet5"})
+app.set_settings({"argo_user": " bob ", "retry_minutes": "30", "github_token": "tok", "bogus": 1, "argo_model": app.MODEL})
 c = app.get_settings()
 assert (c["argo_user"], c["retry_minutes"], c["github_token"], c["github_token_set"]) == ("bob", 30, "", True), c
 assert "argo_model" not in app.config() and "bogus" not in app.config()  # default values aren't stored
@@ -290,4 +290,46 @@ app.DESKTOP = Path(tempfile.mkdtemp()); (app.DESKTOP / "u" / "o").mkdir(parents=
 app.desktop_at = 0
 assert app.desktop_session("desk") == {"id": "local_abc", "title": "My chat (fork)"} and app.desktop_session("nope") == {}
 assert [a["open"] for a in app.agents() if a["where"] == "My chat (fork)"] == ["claude://claude.ai/epitaxy/local_abc"]  # sidebar title wins
+# screenshot -> task: Argo's JSON fills title/sender/text, then the usual labels/due step runs; Argo down -> retry later
+import struct, zlib
+def png(w, h):
+    chunk = lambda k, d: struct.pack(">I", len(d)) + k + d + struct.pack(">I", zlib.crc32(k + d))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(b"\0" + b"\xff" * 3 * w for _ in range(h)))) + chunk(b"IEND", b""))
+app.SHOTS = Path(tempfile.mkdtemp())
+cfg, app.config = app.config, lambda: {"argo_user": "x"}
+(app.SHOTS / "big.png").write_bytes(png(3000, 200))
+u = app.data_url(app.SHOTS / "big.png")
+assert u.startswith("data:image/jpeg;base64,") and not list(app.SHOTS.glob("*.send.jpg")), u[:40]  # shrunk, temp removed
+assert app.clean_shot('Sure: {"title": "Book travel", "text": "Flight by Fri"}') == {"title": "Book travel", "sender": "", "date": "", "text": "Flight by Fri"}
+assert app.clean_shot("no json here") is None
+t = {**app.blank(), "title": "Screenshot", "sender": "", "date": "", "body": "", "eml": False, "shot": ".png"}
+(app.SHOTS / f"{t['id']}.png").write_bytes(png(2, 2))
+app.save([t])
+app.argo = lambda prompt, n, **kw: None
+app.read_shot(t)
+assert app.load()[0]["retry"] == "shot"
+seen = []
+app.argo = lambda prompt, n, **kw: seen.append(kw.get("image")) or '{"title": "Book travel", "sender": "Ann", "text": "Flight by Fri"}'
+app.read_shot(t)
+x = app.load()[0]
+assert (x["title"], x["sender"], x["body"], "retry" in x) == ("Book travel", "Ann", "Flight by Fri", False), x
+assert seen[0] == app.SHOTS / f"{t['id']}.png" and seen[1] is None  # image for the read, plain text for labels/due
+app.config = cfg
+# main model errors -> the backup model answers
+import http.server, importlib, json, threading
+importlib.reload(app)  # undo the earlier patches of app.argo / app.config
+asked = []
+class Fake(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        m = json.loads(self.rfile.read(int(self.headers["Content-Length"])))["model"]
+        asked.append(m)
+        body = b'{"error": "no such model"}' if m == app.MODEL else b'{"choices": [{"message": {"content": "hi"}}]}'
+        self.send_response(400 if m == app.MODEL else 200); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), Fake)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+app.ARGO, app.config = f"http://127.0.0.1:{srv.server_port}/", lambda: {"argo_user": "x"}
+assert app.argo("hello", 5) == "hi" and asked == [app.MODEL, app.BACKUP], asked
+srv.shutdown()
 print("ok")
