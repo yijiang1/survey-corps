@@ -5,7 +5,7 @@ import base64, html, inspect, json, os, re, socket, sqlite3, subprocess, sys, th
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email import message_from_bytes, policy
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -194,10 +194,25 @@ def suggest(t, known):
                   "- title: the task restated cleanly, without the date/time words, first letter capitalised.\n" + labels +
                   '- due: the deadline it mentions, as local YYYY-MM-DDTHH:MM resolved against today; if only a date is '
                   'given use 17:00. Use "" if it mentions no time (do not invent one).\n\n' + t["body"][:3000])
-    reply = argo(prompt, 800, tag=t["id"])
+    reply = argo(prompt, 800, tag="new:" + t["id"])  # "new:": the page shows a status line, then scrolls to the task
     return None if reply is None else clean_suggestion(reply, now)
 
 
+def new_input(fn):
+    """Marks a new task's whole Argo job (read, then labels/due) as one busy "new:<id>" stretch, for the page's status line."""
+    def run(t):
+        tag = "new:" + t["id"]
+        with busy_lock:
+            busy[tag] += 1
+        try:
+            return fn(t)
+        finally:
+            with busy_lock:
+                busy[tag] -= 1
+    return run
+
+
+@new_input
 def enrich(t):
     """Background: fill in labels/due on a freshly dropped email, unless the user already set them."""
     s = suggest(t, all_labels())
@@ -210,17 +225,27 @@ def enrich(t):
             cur["retry"] = "enrich"
             return save(todos)
         cur.pop("retry", None)
-        if not s:
-            return save(todos)
+        s = s or {"labels": [], "due": "", "title": "", "actions": []}  # nonsense reply: still give emails a default due
         if s["labels"] and not cur.get("labels"):
             cur["labels"] = sorted(set(s["labels"]))
         if s["due"] and not cur["due"]:
             cur["due"], cur["notified"] = s["due"], False
+        if not cur["due"] and (t["eml"] or t.get("shot")):  # it states no deadline: 3 days after it was sent
+            cur["due"], cur["notified"], cur["due_auto"] = default_due(cur), False, True
         if s["title"] and not t["eml"] and cur["title"] == t["title"]:  # typed task the user hasn't renamed
             cur["title"], cur["body"] = s["title"], "" if cur["body"] == t["title"] else cur["body"]
         if s["actions"] and not cur.get("actions"):
             cur["actions"] = s["actions"]
         save(todos)
+
+
+def default_due(t):
+    """17:00, 3 days after the email was sent (its Date header); when that's unreadable, after it was added."""
+    try:
+        sent = parsedate_to_datetime(t["date"]).astimezone().replace(tzinfo=None)  # in local time
+    except (TypeError, ValueError, IndexError):
+        sent = datetime.fromisoformat(t["added"])
+    return (sent + timedelta(days=3)).strftime("%Y-%m-%dT17:00")
 
 
 def blank():
@@ -263,6 +288,7 @@ def clean_shot(text):
     return {k: str(d.get(k) or "").strip()[:3000 if k == "text" else 200] for k in ("title", "sender", "date", "text")}
 
 
+@new_input
 def read_shot(t):
     """Background: Argo reads a screenshot (an email, chat, calendar invite, web page...) into the task's title and text,
     then labels/due/action items are filled in as for any other task."""
@@ -272,7 +298,7 @@ def read_shot(t):
                  '- sender: who it is from (name <email> if shown), or "".\n'
                  '- date: when it was sent or posted, as shown, or "".\n'
                  "- text: all the readable text that matters (message body, deadlines, links, names), transcribed as "
-                 "plain text; skip window chrome, menus and toolbars.", 3000, tag=t["id"], image=SHOTS / f"{t['id']}{t['shot']}")
+                 "plain text; skip window chrome, menus and toolbars.", 3000, tag="new:" + t["id"], image=SHOTS / f"{t['id']}{t['shot']}")
     s = None if reply is None else clean_shot(reply)
     with lock:
         todos = load()
@@ -1803,7 +1829,7 @@ class H(BaseHTTPRequestHandler):
                 t = make_todo(raw, parse_qs(u.query).get("name", [""])[0])
                 todos.insert(0, t)
                 save(todos)
-                return self.reply(200, json.dumps({"title": t["title"]}).encode())
+                return self.reply(200, json.dumps({"title": t["title"], "id": t["id"]}).encode())
             elif len(parts) == 4 and parts[1] == "todo":
                 t = next((x for x in todos if x["id"] == parts[2]), None)
                 if not t:
@@ -1819,6 +1845,7 @@ class H(BaseHTTPRequestHandler):
                         t["labels"] = sorted({str(x).strip() for x in patch["labels"] if str(x).strip()})
                     if "due" in patch:
                         t["notified"] = False
+                        t.pop("due_auto", None)  # the user set it
                 elif parts[3] == "split":  # one suggested action item -> its own task, sharing the email
                     title = json.loads(raw or b"{}").get("title", "").strip()
                     t["actions"] = [a for a in t.get("actions", []) if a != title]
@@ -1864,7 +1891,11 @@ h1{font-size:20px;margin:0;font-weight:700}
 .shotimg{display:block;max-width:100%;max-height:320px;margin-top:8px;border:1px solid var(--line);border-radius:10px;cursor:zoom-in}
 .bar input,.bar select{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 10px;outline:none}
 .bar input:focus,.bar select:focus{border-color:var(--accent);box-shadow:0 0 0 3px #0a84ff33}
-#new,#q{flex:1}.bar{flex-wrap:wrap;row-gap:3px}.bar .brk{flex-basis:100%;height:0}
+#new,#q{flex:1}.bar{flex-wrap:wrap;row-gap:3px}
+#status{margin-top:6px;padding:6px 12px;border-radius:8px;font-size:13px;background:color-mix(in srgb,var(--accent) 12%,var(--card));
+  border:1px solid color-mix(in srgb,var(--accent) 35%,transparent)}
+#status[hidden]{display:none}#status.done{background:color-mix(in srgb,#30d158 14%,var(--card));border-color:color-mix(in srgb,#30d158 40%,transparent)}
+.t.flash{animation:flash 2.4s ease-out}@keyframes flash{0%,30%{box-shadow:0 0 0 3px var(--accent)}100%{box-shadow:0 0 0 0 transparent}}.bar .brk{flex-basis:100%;height:0}
 main{padding:6px 20px 40px}
 h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:18px 4px 6px;font-weight:600}
 h2 span{font-weight:400;margin-left:4px}h2.late{color:var(--red)}
@@ -1969,6 +2000,7 @@ details .askm{border-color:color-mix(in srgb,var(--accent) 35%,transparent)}
     <div class=brk></div><input id=q type=search placeholder="Search, or ask a question ending in ?  ( / )">
     <span class=seg><button id=vl>List</button><button id=vc>Calendar</button></span>
   </div>
+  <div id=status hidden></div>
   <div id=lbar></div>
 </header>
 <datalist id=labels></datalist>
@@ -1996,7 +2028,7 @@ function senderName(s){return (s||'').replace(/<[^>]*>/,'').replace(/"/g,'').tri
 function shortDate(s){const d=new Date(s);return isNaN(d)?s:d.toLocaleDateString([],{month:'short',day:'numeric',year:d.getFullYear()!==new Date().getFullYear()?'numeric':undefined})}
 function item(t){
   const d=document.createElement('div'),late=t.due&&!t.done&&t.due<=nowStr();
-  d.className='t'+(t.done?' done':'')+(late?' late':'')+(st.busy.includes(t.id)?' thinking':''); d.dataset.id=t.id;
+  d.className='t'+(t.done?' done':'')+(late?' late':'')+(isBusy(t.id)?' thinking':''); d.dataset.id=t.id;
   d.innerHTML=`<input type=checkbox class=cb title="Mark done">
     <div class=main><input class=title type=text spellcheck=false>
       <div class=meta><span class=argoing>✨ Argo is working on this…</span><span class=info></span><span class=chips></span><input class=addl list=labels placeholder="+ label"></div>
@@ -2013,7 +2045,7 @@ function item(t){
   ti.onkeydown=e=>{if(e.key==='Enter')ti.blur()};
   // friendly due label; the raw date input only appears while editing
   const db=$('.due'),du=$('.side input');
-  if(t.due){db.className='due set';db.textContent=fmtDue(t.due);db.title=t.due.replace('T',' ');
+  if(t.due){db.className='due set';db.textContent=fmtDue(t.due);db.title=t.due.replace('T',' ')+(t.due_auto?'\nNo deadline in the email: set to 3 days after it was sent':'');
     const c=document.createElement('b');c.textContent='×';c.title='Clear due date';
     c.onclick=e=>{e.stopPropagation();up({due:''})};db.append(c)}
   else{db.className='due unset';db.textContent='Set due'}
@@ -2117,7 +2149,7 @@ function renderCal(shown){
     for(const t of ts.slice(0,3)){
       const e=el('div','ev'+(t.done?' done':'')+(!t.done&&t.due<=nowStr()?' late':''),t.title);
       e.style.setProperty('--h',(t.labels||[])[0]?hue(t.labels[0]):210);e.title=t.title+'\n'+fmtDue(t.due);
-      e.dataset.id=t.id;if(st.busy.includes(t.id))e.classList.add('thinking');
+      e.dataset.id=t.id;if(isBusy(t.id))e.classList.add('thinking');
       e.draggable=true;e.ondragstart=ev=>{dragId=t.id;ev.dataTransfer.setData('application/x-todo',t.id)};e.ondragend=()=>dragId=null;
       c.append(e);
     }
@@ -2187,9 +2219,29 @@ function pill(){  // Argo status in the header: off / reachable / unavailable / 
 async function tick(){
   try{st=await (await fetch('/api/status')).json()}catch{return}
   pill();
-  for(const e of document.querySelectorAll('[data-id]'))e.classList.toggle('thinking',st.busy.includes(e.dataset.id));
+  for(const e of document.querySelectorAll('[data-id]'))e.classList.toggle('thinking',isBusy(e.dataset.id));
+  // new inputs (typed, dropped, pasted, screenshots): a status line while Argo reads them, then jump to the finished task
+  const now=st.busy.filter(b=>b.startsWith('new:')).map(b=>b.slice(4)), ae=document.activeElement,
+    idle=(ae===document.body||ae.id==='new'&&!ae.value)&&!document.querySelector('.t details[open]');  // just pressed Enter in the add box counts as idle
+  for(const id of reading)if(!now.includes(id))arrived.push(id);
+  reading=now;
+  if(reading.length){const t=all.find(t=>t.id===reading[0]);
+    showStatus(`✨ Argo is reading ${!t?'a new task':t.shot&&t.title==='Screenshot'?'your screenshot':`“${t.title}”`}…`+(reading.length>1?` (+${reading.length-1} more)`:''))}
+  else if(!arrived.length&&!statusEl.classList.contains('done'))statusEl.hidden=true;
+  if(arrived.length&&idle){await load();jump(arrived.splice(0))}
   // data changed on the server (LLM fill-ins, retries, Scout 📌): reload, unless the user is in the middle of something
-  if(st.rev!==rev&&document.activeElement===document.body&&!document.querySelector('.t details[open]'))load();
+  else if(st.rev!==rev&&idle)load();
+}
+const isBusy=id=>st.busy.includes(id)||st.busy.includes('new:'+id);
+let reading=[], arrived=[];
+const statusEl=document.getElementById('status');  // not window.status: that's a built-in string
+function showStatus(text,done){statusEl.textContent=text;statusEl.classList.toggle('done',!!done);statusEl.hidden=false;
+  clearTimeout(showStatus.t);if(done)showStatus.t=setTimeout(()=>{statusEl.hidden=true;statusEl.classList.remove('done')},4000)}
+function jump(ids){  // scroll to the last finished task and flash it
+  const t=all.find(t=>t.id===ids.at(-1)), e=document.querySelector(`.t[data-id="${ids.at(-1)}"]`);
+  if(t)showStatus(`✓ Ready: “${t.title}”`+(ids.length>1?` and ${ids.length-1} more`:''),true);
+  if(!e)return;  // filtered out, or in the calendar view
+  e.scrollIntoView({block:'center',behavior:'smooth'});e.classList.remove('flash');void e.offsetWidth;e.classList.add('flash');
 }
 argo.onclick=()=>{fetch('/api/argo/check',{method:'POST'}).then(tick);setTimeout(tick,150)};
 rt.onclick=()=>{rt.disabled=true;fetch('/api/argo/retry',{method:'POST'}).then(()=>{rt.disabled=false;tick();load()});setTimeout(tick,150)};

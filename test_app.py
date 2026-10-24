@@ -332,4 +332,8 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 app.ARGO, app.config = f"http://127.0.0.1:{srv.server_port}/", lambda: {"argo_user": "x"}
 assert app.argo("hello", 5) == "hi" and asked == [app.MODEL, app.BACKUP], asked
 srv.shutdown()
+# no deadline in an email -> due 17:00, 3 days after its Date header (or after it was added, if unreadable)
+assert app.default_due({"date": "Tue, 20 Oct 2026 09:14:00 -0500", "added": "2026-10-24T10:00"}).startswith("2026-10-23T17:00")
+assert app.default_due({"date": "Tue Oct 20, 2026 9:14 AM", "added": "2026-10-24T10:00"}) == "2026-10-23T17:00"  # screenshot-style
+assert app.default_due({"date": "yesterday", "added": "2026-10-24T10:00"}) == "2026-10-27T17:00"
 print("ok")
