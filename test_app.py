@@ -168,6 +168,38 @@ assert app.feed_to_lib(x) and not app.feed_to_lib(x)
 assert (y["path"], y["name"], y["labels"], y["group"]) == (x["url"], "P", ["Mine"], "Papers"), y
 print("ok")
 
+# Related: Argo links an item to candidates it picks; keeps links you made, never re-adds one you removed
+assert app.clean_related('[{"i": 1, "why": " uses  its data "}, {"i": 1}, {"i": 9}, {"i": "x"}, {"i": 0}]', 3) == [(1, "uses its data"), (0, "")]
+assert app.clean_related(None, 3) == [] and len(app.clean_related(",".join('{"i": %d}' % i for i in range(9)), 9)) == 4
+t = {**app.blank(), "title": "Ptychography beamtime email", "body": "data for the ptychography paper", "sender": "Bob", "date": "", "eml": True}
+app.save([t])
+lib = app.load_lib()
+z = {**lib["items"][0], "id": "zzz", "name": "Ptycho analysis", "path": "/x", "peek": "ptychography code", "labels": []}
+lib["items"].append(z)
+app.save_lib(lib)
+cfg, app.config = app.config, lambda: {"argo_user": "x"}
+seen = []
+app.argo = lambda prompt, n, **kw: seen.append(prompt) or "None of the candidates fit: []"
+app.lib_relate("zzz")
+assert app.load_lib()["items"][1]["related"] == [] and "Ptychography beamtime email" in seen[0] and "Ptycho analysis" in seen[0]
+app.argo = lambda prompt, n, **kw: None  # Argo down: no "related" key, so retry_argo() tries it again
+lib = app.load_lib(); del lib["items"][1]["related"]; app.save_lib(lib)
+app.lib_relate("zzz")
+assert "related" not in app.load_lib()["items"][1]
+refs = lambda: [(r["ref"], r["by"]) for r in app.load_lib()["items"][1]["related"]]
+pick = lambda: next(i for i, l in enumerate(seen[-1].split("Candidates:\n")[1].splitlines()) if "beamtime email" in l)
+app.argo = lambda prompt, n, **kw: seen.append(prompt) or '[{"i": %d, "why": "its data"}]' % pick()
+app.lib_relate("zzz")
+assert refs() == [("task:" + t["id"], "argo")], refs()
+lib = app.load_lib()
+lib["items"][1]["related"] = [{"ref": "lib:" + y["id"], "why": "", "by": "me"}]  # yours stays
+lib["items"][1]["unlinked"] = ["task:" + t["id"]]                                  # removed: not added back
+app.save_lib(lib)
+app.lib_relate("zzz")
+assert refs() == [("lib:" + y["id"], "me")], refs()
+app.config = cfg
+print("ok")
+
 # coding agents: Claude Code hook events -> states; dead pids dropped; Codex threads from the Codex app's thread list
 import os, time as _t
 said = []
