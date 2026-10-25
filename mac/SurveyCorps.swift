@@ -11,6 +11,7 @@ let libURL = base.appendingPathComponent("library")
 let settingsURL = base.appendingPathComponent("settings")
 let leviURL = base.appendingPathComponent("levi")
 let petSize: CGFloat = 112  // pet panel size in points: a 96 pt pet plus room to hop and lean
+let sliver: CGFloat = 40    // how much of a tucked pet stays on screen, drawn as a tab
 
 // POST to app.py; done runs on the main thread with the body and status (0 = server unreachable).
 func post(_ path: String, _ body: Any? = nil, raw: Data? = nil, query: [URLQueryItem] = [],
@@ -463,6 +464,7 @@ class PetView: NSView {
     var agentsWaiting = false { didSet { if agentsWaiting != oldValue { needsDisplay = true } } }  // one needs you
     var hover = false { didSet { if hover != oldValue { needsDisplay = true } } }  // something dragged over it
     var busy = false { didSet { if busy != oldValue { animate() } } }
+    var tuckedInto: NSRectEdge? { didSet { if tuckedInto != oldValue { needsDisplay = true } } }  // the screen edge it's tucked into
     enum Anim { case hop, shake }  // hop: a drop worked or the pet speaks; shake: it didn't
     var anim: Anim?, animStart = Date(), ticker: Timer?
     func play(_ a: Anim) { anim = a; animStart = Date(); animate() }
@@ -478,6 +480,7 @@ class PetView: NSView {
     override func draw(_ r: NSRect) {
         // Fully transparent pixels let clicks fall through; a near-invisible fill makes the whole square clickable.
         NSColor.black.withAlphaComponent(0.01).setFill(); bounds.fill()
+        if let e = tuckedInto { return drawTab(e) }
         // pose: lean in while something is dragged over, hop / shake once, sway while busy
         let now = Date().timeIntervalSinceReferenceDate, t = Date().timeIntervalSince(animStart)
         var dx: CGFloat = 0, dy: CGFloat = 0, turn: CGFloat = 0, grow: CGFloat = hover ? 1.08 : 1
@@ -533,6 +536,41 @@ class PetView: NSView {
         badgeColor.setFill(); pill.fill(); NSColor.white.setStroke(); pill.lineWidth = 2; pill.stroke()
         text.draw(at: NSPoint(x: r.midX - text.size().width / 2, y: r.midY - text.size().height / 2))
     }
+    var tabLong: CGFloat { overdue > 0 || agents > 0 ? 72 : 40 }  // a tab's length along the edge: face, then count
+    func drawTab(_ e: NSRectEdge) {  // tucked: a tab in the sliver left showing, the pet's face and its count
+        let n = overdue > 0 ? overdue : agents, side = e == .minX || e == .maxX, long = tabLong
+        let a = e == .minX ? bounds.maxX - sliver : e == .minY ? bounds.maxY - sliver : 0  // where the on-screen strip starts
+        var tab = side ? NSRect(x: a + 1, y: bounds.midY - long / 2, width: sliver - 2, height: long)
+                       : NSRect(x: bounds.midX - long / 2, y: a + 1, width: long, height: sliver - 2)
+        switch e {  // run the tab off the screen edge, so only its inner corners are round
+        case .minX: tab.origin.x -= 12; tab.size.width += 12
+        case .maxX: tab.size.width += 12
+        case .minY: tab.origin.y -= 12; tab.size.height += 12
+        default: tab.size.height += 12
+        }
+        let shape = NSBezierPath(roundedRect: tab, xRadius: 14, yRadius: 14)
+        NSGraphicsContext.saveGraphicsState()
+        let sh = NSShadow(); sh.shadowBlurRadius = 3; sh.shadowOffset = NSSize(width: 0, height: -1)
+        sh.shadowColor = NSColor.black.withAlphaComponent(0.3); sh.set()
+        NSColor(white: 0.98, alpha: 1).setFill(); shape.fill()
+        NSGraphicsContext.restoreGraphicsState()
+        NSColor(white: 0, alpha: 0.15).setStroke(); shape.lineWidth = 1; shape.stroke()
+        // the face first (top of a side tab, left of a bottom/top one), the count after it
+        let c = side ? NSPoint(x: a + sliver / 2, y: bounds.midY + long / 2 - 20) : NSPoint(x: bounds.midX - long / 2 + 20, y: a + sliver / 2)
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(ovalIn: NSRect(x: c.x - 16, y: c.y - 16, width: 32, height: 32)).addClip()
+        let cg = NSGraphicsContext.current!.cgContext, k: CGFloat = 0.67  // the 64-unit pet at this scale: its head fills the circle
+        cg.translateBy(x: c.x - 32 * k, y: c.y - 43 * k)
+        drawPet(NSRect(x: 0, y: 0, width: 64 * k, height: 64 * k), scout: scout, librarian: librarian, levi: levi)
+        NSGraphicsContext.restoreGraphicsState()
+        guard n > 0 else { return }
+        let text = NSAttributedString(string: n > 99 ? "99+" : n > 9 && overdue == 0 ? "9+" : "\(n)", attributes: [
+            .font: NSFont.boldSystemFont(ofSize: n > 99 ? 10 : n > 9 ? 12 : 14), .foregroundColor: NSColor.white])
+        let d = side ? NSPoint(x: c.x, y: c.y - 33) : NSPoint(x: c.x + 33, y: c.y)
+        let dot = NSBezierPath(ovalIn: NSRect(x: d.x - 13, y: d.y - 13, width: 26, height: 26))
+        (overdue > 0 ? badgeColor : agentsWaiting ? NSColor.systemPurple : NSColor.systemGreen).setFill(); dot.fill()
+        text.draw(at: NSPoint(x: d.x - text.size().width / 2, y: d.y - text.size().height / 2))
+    }
     override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
     override func rightMouseDown(with e: NSEvent) { NSMenu.popUpContextMenu(makeMenu(), with: e, for: self) }
     override func mouseDown(with e: NSEvent) {
@@ -560,15 +598,15 @@ class PetView: NSView {
 func screenOf(_ r: NSRect) -> NSScreen {  // the screen a pet's rect is centered on (or the main one, if off every screen)
     NSScreen.screens.first { $0.frame.contains(NSPoint(x: r.midX, y: r.midY)) } ?? NSScreen.main!
 }
-// Pet at r tucked into an edge of its screen (frame f, visible v), a 28 pt sliver left showing: its nearer side, else
+// Pet at r tucked into an edge of its screen (frame f, visible v), a sliver left showing: its nearer side, else
 // the other side, else the bottom, else the top. An edge another screen touches (others) is skipped: the pet would
 // show up on that screen instead. Stays at r if every edge is shared.
 func tuckSpot(_ r: NSRect, _ f: NSRect, _ v: NSRect, _ others: [NSRect]) -> NSRect {
     let w = r.width, h = r.height, sides = [  // (tucked rect, a 1 pt strip just past that edge)
-        (NSRect(x: v.minX - w + 28, y: r.minY, width: w, height: h), NSRect(x: f.minX - 1, y: r.minY, width: 1, height: h)),
-        (NSRect(x: v.maxX - 28, y: r.minY, width: w, height: h), NSRect(x: f.maxX, y: r.minY, width: 1, height: h)),
-        (NSRect(x: r.minX, y: v.minY - h + 28, width: w, height: h), NSRect(x: r.minX, y: f.minY - 1, width: w, height: 1)),
-        (NSRect(x: r.minX, y: v.maxY - 28, width: w, height: h), NSRect(x: r.minX, y: f.maxY, width: w, height: 1))]
+        (NSRect(x: v.minX - w + sliver, y: r.minY, width: w, height: h), NSRect(x: f.minX - 1, y: r.minY, width: 1, height: h)),
+        (NSRect(x: v.maxX - sliver, y: r.minY, width: w, height: h), NSRect(x: f.maxX, y: r.minY, width: 1, height: h)),
+        (NSRect(x: r.minX, y: v.minY - h + sliver, width: w, height: h), NSRect(x: r.minX, y: f.minY - 1, width: w, height: 1)),
+        (NSRect(x: r.minX, y: v.maxY - sliver, width: w, height: h), NSRect(x: r.minX, y: f.maxY, width: w, height: 1))]
     let order = r.midX < v.midX ? [0, 1, 2, 3] : [1, 0, 2, 3]
     return order.map { sides[$0] }.first { side in !others.contains { $0.intersects(side.1) } }?.0 ?? r
 }
@@ -954,9 +992,25 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         }
         tucked = false; awaySince = Date(); settle()
     }
-    func spot(_ kind: String) -> NSRect {  // where the pet belongs now
-        let r = homeRect(kind), s = screenOf(r)
-        return tucked ? tuckSpot(r, s.frame, s.visibleFrame, NSScreen.screens.filter { $0 != s }.map(\.frame)) : r
+    func spots() -> [String: NSRect] {  // where each pet belongs now; tabs tucked into one edge close up into a column
+        var out = [String: NSRect]()
+        for k in pets.keys {
+            let r = homeRect(k), s = screenOf(r)
+            out[k] = tucked ? tuckSpot(r, s.frame, s.visibleFrame, NSScreen.screens.filter { $0 != s }.map(\.frame)) : r
+        }
+        let moved = out.keys.filter { out[$0] != homeRect($0) }
+        for (_, ks) in Dictionary(grouping: moved, by: { out[$0]!.minX != homeRect($0).minX ? "x\(out[$0]!.minX)" : "y\(out[$0]!.minY)" }) {
+            let side = out[ks[0]]!.minX != homeRect(ks[0]).minX  // a side edge: a column, top first; else a row, left first
+            let along = { (k: String) in side ? -out[k]!.midY : out[k]!.midX }
+            let row = ks.sorted { along($0) < along($1) }, len = { (k: String) in self.pets[k]!.view.tabLong }
+            var at = row.map(along).reduce(0, +) / CGFloat(row.count) - (row.map(len).reduce(0, +) + CGFloat(row.count - 1) * 6) / 2
+            for k in row {  // centered on where the pets were, 6 pt apart
+                let mid = at + len(k) / 2
+                if side { out[k]!.origin.y = -mid - petSize / 2 } else { out[k]!.origin.x = mid - petSize / 2 }
+                at += len(k) + 6
+            }
+        }
+        return out
     }
     func tick() {  // tucking: out while the mouse is within 50 pt or a bubble shows, back in after 3 s away
         let m = NSEvent.mouseLocation
@@ -967,8 +1021,14 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         if NSEvent.pressedMouseButtons == 0 && Date() > settleUntil { settle() }  // not mid-drag, not mid-slide
     }
     func settle(animate: Bool = true) {  // move any pet that isn't where spot() says
+        let to = spots()
+        for (k, p) in pets {  // tucked pets draw as a tab, on the side that's still on screen
+            let t = to[k]!, h = homeRect(k), v = screenOf(h).visibleFrame
+            p.view.tuckedInto = t == h ? nil : t.maxX <= v.minX + sliver + 1 ? .minX : t.minX >= v.maxX - sliver - 1 ? .maxX
+                                : t.maxY <= v.minY + sliver + 1 ? .minY : .maxY
+        }
         let off = pets.keys.filter { k in
-            let f = spot(k), p = pets[k]!.panel
+            let f = to[k]!, p = pets[k]!.panel
             return hypot(f.minX - p.frame.minX, f.minY - p.frame.minY) > 0.5 || p.alphaValue < 1
         }
         guard !off.isEmpty else { return }
@@ -976,7 +1036,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         NSAnimationContext.runAnimationGroup { c in
             c.duration = animate ? 0.25 : 0
             for k in off {
-                let f = spot(k), p = pets[k]!.panel
+                let f = to[k]!, p = pets[k]!.panel
                 if animate { p.animator().setFrame(f, display: true); p.animator().alphaValue = 1 }
                 else { p.setFrame(f, display: true); p.alphaValue = 1 }
             }
