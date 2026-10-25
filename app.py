@@ -2412,6 +2412,7 @@ details summary::-webkit-details-marker{display:none}details p{margin:6px 0 0;fo
 .acts{flex:none;display:flex;gap:2px;align-items:flex-start}
 .acts button{border:0;background:none;border-radius:6px;width:30px;height:28px;cursor:pointer;opacity:.35;font-size:14px}
 .c:hover .acts button{opacity:.8}.acts button:hover{background:var(--line);opacity:1}.acts .on{opacity:1!important}
+.acts .vote{opacity:1}.acts svg{display:block;margin:auto}.acts .vote.on{background:var(--line)}
 dialog.sheet{width:min(760px,calc(100vw - 32px));max-height:calc(100vh - 48px);border:1px solid var(--line);border-radius:14px;
   padding:0;background:var(--card);color:var(--text);box-shadow:0 24px 70px #0005}
 dialog.sheet::backdrop{background:#0006;backdrop-filter:blur(2px)}
@@ -2489,12 +2490,20 @@ const hue=s=>LB.hues[s]??[...s].reduce((h,c)=>(h*31+c.charCodeAt(0))%360,7);
 const post=b=>fetch('/api/feed/update',{method:'POST',body:JSON.stringify(b)}).then(load);
 function ago(s){if(!s)return 'never';const m=Math.round((Date.now()-new Date(s))/6e4);
   return m<1?'just now':m<60?m+' min ago':m<1440?Math.round(m/60)+' h ago':Math.round(m/1440)+' d ago'}
+// AoT-flavoured action icons: thumbs up/down with a Survey Corps cuff, journal (Library), slashed Titan eye (hide), order scroll (task)
+const SV=b=>`<svg viewBox="0 0 24 24" width=20 height=20>${b}</svg>`;
+const IC={
+  up:SV('<g transform="rotate(0 12 12)"><path d="M1 9h5v12H1z" fill="#3d6b3a" stroke="#22401f" stroke-width=".8"/><g transform="translate(1.3 12) scale(.18)"><path d="M11.5 21C8 18 4 14 1.5 4.5l3 2.5.3-2.8 2.7 3 .8-2.6 2.2 4z" fill="#fff"/><path d="M12.5 21C16 18 20 14 22.5 4.5l-3 2.5-.3-2.8-2.7 3-.8-2.6-2.2 4z" fill="#8fb0ff"/></g><path d="M23 10c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z" fill="#f2c49b" stroke="#9a6a45" stroke-width=".9"/></g>'),
+  down:SV('<g transform="rotate(180 12 12)"><path d="M1 9h5v12H1z" fill="#3d6b3a" stroke="#22401f" stroke-width=".8"/><g transform="translate(1.3 12) scale(.18)"><path d="M11.5 21C8 18 4 14 1.5 4.5l3 2.5.3-2.8 2.7 3 .8-2.6 2.2 4z" fill="#fff"/><path d="M12.5 21C16 18 20 14 22.5 4.5l-3 2.5-.3-2.8-2.7 3-.8-2.6-2.2 4z" fill="#8fb0ff"/></g><path d="M23 10c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z" fill="#f2c49b" stroke="#9a6a45" stroke-width=".9"/></g>'),
+  lib:SV('<path d="M5 19V5a2 2 0 0 1 2-2h12v16H7a2 2 0 0 0 0 4h12v-4" fill="#6b4528" stroke="#3e2a18" stroke-width="1.1" stroke-linejoin="round"/><path d="M7 19.6h11.5v1.6H7a.8.8 0 0 1 0-1.6z" fill="#f3e6c8"/><circle cx="12" cy="8" r="1.8" fill="none" stroke="#e0b44a" stroke-width="1.3"/><path d="M12 9.8v5M12 13.2h1.8M12 14.8h1.3" stroke="#e0b44a" stroke-width="1.3" stroke-linecap="round"/>'),
+  hide:SV('<path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z" fill="#fff" stroke="#3b3f45" stroke-width="1.3"/><circle cx="12" cy="12" r="3.2" fill="#3f8a5a"/><circle cx="12" cy="12" r="1.3" fill="#1b1b1b"/><path d="M5 19 19.5 4.5" stroke="#9aa4ad" stroke-width="2.4" stroke-linecap="round"/><path d="M3 21l2.3-2.3" stroke="#3b3f45" stroke-width="3.2" stroke-linecap="round"/>'),
+  task:SV('<path d="M5 4.5A1.5 1.5 0 0 1 6.5 3H17a2 2 0 0 1 2 2v9M15 21H7a2 2 0 0 1-2-2V4.5" fill="#efe0bb" stroke="#8a6a3a" stroke-width="1.1"/><path d="M8 8h8M8 11h8M8 14h4" stroke="#8a6a3a" stroke-width="1"/><circle cx="17.3" cy="17.3" r="4.4" fill="#2f7a46"/><path d="M17.3 15v4.6M15 17.3h4.6" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/>')};
 function card(x){
   const d=document.createElement('div');d.className='c'+(x.read?' read':'');
   d.innerHTML=`<div class=score></div><div class=body><a class=title target=_blank></a>
     <div class=meta><span class=src></span> · <span class=by></span><span class=chips></span><input class=addl list=labels placeholder="+ label" title="Labels are shared with Task Manager and the Library"></div><div class=why></div>
     <details><summary>Details</summary><p></p></details></div>
-    <div class=acts><button title="More like this">👍</button><button title="Less like this">👎</button><button title="Move to the Library">📚</button><button title="Hide (doesn't affect ranking)">✕</button><button title="Add to Task Manager as a reading task">📌</button></div>`;
+    <div class=acts><button class=vote title="More like this">${IC.up}</button><button class="vote dn" title="Less like this">${IC.down}</button><button title="Move to the Library">${IC.lib}</button><button title="Hide (doesn't affect ranking)">${IC.hide}</button><button title="Add to Task Manager as a reading task">${IC.task}</button></div>`;
   const $=s=>d.querySelector(s);
   const sc=$('.score');sc.textContent=x.score==null?'·':Math.round(x.score);
   sc.title=x.score==null?'Not ranked yet (Argo unreachable?)':'Score '+x.score;
