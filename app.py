@@ -1401,6 +1401,16 @@ def lib_enrich(item_id):
 
 
 RELATE_ROUND = 20  # retry_argo: at most this many items get their links found per round
+_lib_waiting = (None, 0)  # (library.json mtime, count)
+
+
+def lib_waiting():
+    """Library items retry_argo() still has to do: a summary Argo missed, or links not found yet. Cached on the mtime."""
+    global _lib_waiting
+    m = LIB.stat().st_mtime if LIB.exists() else 0
+    if _lib_waiting[0] != m:  # save_lib replaces the file atomically, so reading without lib_lock is safe
+        _lib_waiting = (m, sum(1 for x in load_lib()["items"] if x.get("retry") or "related" not in x))
+    return _lib_waiting[1]
 
 
 def clean_related(text, n):
@@ -1648,6 +1658,7 @@ class H(BaseHTTPRequestHandler):
                 working = sorted(k for k, n in busy.items() if n > 0)
             self.reply(200, json.dumps({"configured": argo_on(), "argo": argo_ok, "checked": argo_at, "busy": working,
                                         "retry_minutes": config().get("retry_minutes", 10),
+                                        "lib_waiting": lib_waiting() if argo_on() else 0,
                                         "rev": DB.stat().st_mtime if DB.exists() else 0,
                                         "lib_rev": LIB.stat().st_mtime if LIB.exists() else 0}).encode())
         elif self.path.startswith("/api/pets"):  # /api/pets?after=<last bubble id seen>
@@ -2283,13 +2294,14 @@ let st={busy:[]}, rev=0;
 async function load(){
   [all,st,LB]=await Promise.all(['/api/todos','/api/status','/api/labels'].map(u=>fetch(u).then(r=>r.json())));rev=st.rev;render();pill()}
 function pill(){  // Argo status in the header: off / reachable / unavailable / working
-  const work=st.busy.filter(x=>x!=='check'), checking=st.busy.includes('check'), waiting=all.filter(t=>t.retry&&!t.done).length;
+  const work=st.busy.filter(x=>x!=='check'), checking=st.busy.includes('check'), tw=all.filter(t=>t.retry&&!t.done).length, waiting=tw+st.lib_waiting;
   const ago=st.checked?Math.round(Date.now()/6e4-st.checked/60):null;
   argo.className='pill'+(!st.configured?'':work.length||checking?' busy':st.argo?' ok':st.argo===false?' down':'');
   const dot=document.createElement('span');dot.className='dot';
   argo.replaceChildren(dot,!st.configured?'Argo off':work.length?`Argo working${work.length>1?` on ${work.length}`:''}…`
     :checking?'Checking Argo…':st.argo===false?'Argo unavailable'+(waiting?` · ${waiting} waiting`:''):'Argo');
-  rt.hidden=!st.configured||!waiting;
+  rt.hidden=!st.configured||!waiting;rt.textContent=`Retry now · ${waiting}`;
+  rt.title=`Retry the work Argo missed, now: ${tw} task${tw===1?'':'s'}, ${st.lib_waiting} Library item${st.lib_waiting===1?'':'s'} (summaries or links)`;
   argo.title=!st.configured?'LLM features are off. Set "argo_user" in data/config.json to turn them on.'
     :(st.argo===false?'Argo is down, or you are off VPN. Waiting work retries '+(st.retry_minutes?'every '+st.retry_minutes+' min':'only when you press Retry now')+'.':st.argo?'Argo is reachable.':'Not checked yet.')
     +(ago!=null?` Last contact ${ago<1?'just now':ago<60?ago+' min ago':Math.round(ago/60)+' h ago'}.`:'')+' Click to check now.';
@@ -2896,7 +2908,7 @@ main h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(-
 .rchip:hover{border-color:var(--accent)}.rchip i{flex:none;width:7px;height:7px;border-radius:50%;background:hsl(var(--h) 70% 50%)}
 .rchip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.rchip.argo{border-style:dashed}
 .rchip b{display:none;font-weight:400;opacity:.6}.rchip:hover b{display:inline}.rchip b:hover{opacity:1;color:var(--red)}
-.rel .addl{width:0}.c:hover .rel .addl{width:70px}.rel .find{display:none;padding:0 4px;font-size:12px}.c:hover .rel .find{display:inline}
+.rel .addl{width:0}.c:hover .rel .addl{width:70px}.c .rel .addl:focus{width:min(340px,100%)}  /* the suggestion list is as wide as this */.rel .find{display:none;padding:0 4px;font-size:12px}.c:hover .rel .find{display:inline}
 #focusbar{display:flex;align-items:center;gap:8px;margin:10px 0 4px;padding:8px 12px;border-radius:10px;background:color-mix(in srgb,var(--accent) 10%,var(--card));font-size:12.5px}
 #focusbar[hidden]{display:none}#focusbar span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #mapbox{position:relative;margin-top:8px}#mapbox[hidden]{display:none}
@@ -2913,6 +2925,7 @@ main h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(-
 <div id=drop>Drop files, folders or links to add them</div><div id=toast></div>
 <header>
   <div class=top><h1>Library</h1><span id=stats></span><button id=argo class=pill></button>
+    <button id=rt class=pill hidden>Retry now</button>
     <button class=btn id=addbtn title="Add folders, files or docs">+ Add</button></div>
   <div class=bar>
     <input id=q type=search placeholder="Search, or ask Argo in plain words and press Enter: “slides from my last beamtime talk”  ( / )">
@@ -3006,6 +3019,7 @@ function mini(x){  // a task, email or found file, in the Library's label view a
     const r=el('b',0,'×');r.title='Remove label';r.onclick=e=>{e.stopPropagation();up(x.labels.filter(y=>y!==l))};c.append(r);m.append(c)}
   if(x.kind!=='path'){const al=el('input','addl');al.setAttribute('list','labels');al.placeholder='+ label';al.onchange=()=>al.value.trim()&&up([...x.labels,al.value.trim()]);m.append(al)}
   m.append(sub);b.append(t,m);
+  if(byRef.has(x.ref)){const rel=el('div','rel');related(rel,x);b.append(rel)}  // tasks and emails, not files Argo found
   const side=el('div','side'),btn=(ic,title,f)=>{const e=el('button','icon');e.innerHTML=ic;e.title=title;e.onclick=f;side.append(e)};
   if(x.eml)btn(I.open,'Open in Outlook',()=>api(`/api/todo/${x.id}/open`));
   if(x.url)btn(I.open,'Open link',()=>t.click());
@@ -3101,19 +3115,21 @@ function card(x){
   return d;
 }
 function related(box,x){  // a card's "Related" row: click one to see what it connects to
-  const ls=links(x),me=refOf(x);
+  // tasks and emails hold no links: theirs are kept on the Library item at the other end
+  const ls=links(x),me=refOf(x),task=!!x.ref;
   const h=el('span','rl','Related');h.title='Show this and everything it connects to';h.onclick=()=>go('r:'+me);
   if(ls.length)box.append(h);
   for(const r of ls.slice(0,8)){const y=byRef.get(r.ref),c=el('span','rchip'+(r.by==='argo'?' argo':''));
     const i=el('i');i.style.setProperty('--h',hueOf(y));c.append(i,el('span',0,titleOf(y)));
     c.title=(r.why?r.why+'\n':'')+(r.by==='argo'?'Found by Argo':'Linked by you')+' · click to see what it connects to';c.onclick=()=>go('r:'+r.ref);
-    const b=el('b',0,'×');b.title='Not related';b.onclick=e=>{e.stopPropagation();api(`/api/library/item/${x.id}/unlink`,{ref:r.ref})};c.append(b);box.append(c)}
+    const b=el('b',0,'×');b.title='Not related';b.onclick=e=>{e.stopPropagation();task?api(`/api/library/item/${r.ref.slice(4)}/unlink`,{ref:me}):api(`/api/library/item/${x.id}/unlink`,{ref:r.ref})};c.append(b);box.append(c)}
   if(ls.length>8)box.append(el('span','rl',`+${ls.length-8} more`));
-  const al=el('input','addl');al.setAttribute('list','refs');al.placeholder='+ link';al.title='Link it to another item, task or email (type its name)';
-  al.onchange=()=>{const v=al.value.trim(),y=[...byRef.values()].find(y=>titleOf(y)===v&&refOf(y)!==me);
-    if(y)api(`/api/library/item/${x.id}/link`,{ref:refOf(y)});else if(v)toast('No item, task or email has that name')};
+  const al=el('input','addl');al.setAttribute('list','refs');al.placeholder='+ link';al.title=task?'Link it to a Library item (type its name)':'Link it to another item, task or email (type its name)';
+  al.onchange=()=>{const v=al.value.trim(),y=[...byRef.values()].find(y=>titleOf(y)===v&&refOf(y)!==me&&!(task&&y.ref));
+    if(y)task?api(`/api/library/item/${y.id}/link`,{ref:me}):api(`/api/library/item/${x.id}/link`,{ref:refOf(y)});
+    else if(v)toast(task?'No Library item has that name':'No item, task or email has that name')};
   box.append(al);
-  if(st.configured){const f=el('button','linkbtn find','✨ Find links');f.title='Ask Argo again what this connects to (keeps the links you made)';
+  if(st.configured&&!task){const f=el('button','linkbtn find','✨ Find links');f.title='Ask Argo again what this connects to (keeps the links you made)';
     f.onclick=()=>api(`/api/library/item/${x.id}/relate`).then(()=>toast('Argo is looking for what this connects to…'));box.append(f)}
 }
 function render(){
@@ -3152,7 +3168,9 @@ function render(){
 async function load(){[lib,st,tasks]=await Promise.all(['/api/library','/api/status','/api/labeled'].map(u=>fetch(u).then(r=>r.json())));
   others=tasks.filter(x=>x.labels.length);index();rev=st.lib_rev;trev=st.rev;render();pill()}
 function pill(){  // Argo status, as in Task Manager
-  const work=st.busy.filter(x=>x!=='check'),waiting=lib.items.filter(x=>x.retry).length;
+  const work=st.busy.filter(x=>x!=='check'),waiting=st.lib_waiting;
+  rt.hidden=!st.configured||!waiting;rt.textContent=`Retry now · ${waiting}`;
+  rt.title=`Retry the work Argo missed, now: ${waiting} item${waiting===1?'':'s'} still need a summary or links (links go 20 items at a time)`;
   argo.className='pill'+(!st.configured?'':work.length||st.busy.includes('check')?' busy':st.argo?' ok':st.argo===false?' down':'');
   argo.replaceChildren(el('span','dot'),!st.configured?'Argo off':work.length?'Argo working…':st.argo===false?'Argo unavailable'+(waiting?` · ${waiting} waiting`:''):'Argo');
   argo.title=!st.configured?'LLM features are off. Set "argo_user" in data/config.json to turn them on.'
@@ -3165,6 +3183,7 @@ async function tick(){
   if((st.lib_rev!==rev||st.rev!==trev)&&document.activeElement===document.body&&!document.querySelector('.c details[open]')&&!dragId)load();
 }
 argo.onclick=()=>{fetch('/api/argo/check',{method:'POST'}).then(tick);setTimeout(tick,150)};
+rt.onclick=()=>{rt.disabled=true;fetch('/api/argo/retry',{method:'POST'}).then(()=>{rt.disabled=false;tick();load()});setTimeout(tick,150)};
 setInterval(tick,2000);
 // ---- map: labels and items as a force-directed graph; lines are "has this label" and Related links ----
 // ponytail: plain O(n²) forces, fine for a few hundred nodes; Barnes-Hut if Libraries get into the thousands
