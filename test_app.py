@@ -262,7 +262,8 @@ assert (info["cwd"], info["title"]) == ("/h/TomoX", "Radiation damage"), info  #
 app.remote = {"me@a.x": [{"id": "rt", "mtime": _t.time(), **info}], "me@b.x": [{"id": "rt", "mtime": _t.time(), **info}]}
 assert [(a["tool"], a["where"], a["state"], a["open"]) for a in app.agents() if "@" in a["tool"]] == [
     ("Claude Code @a", "Radiation damage", "working", "vscode://vscode-remote/ssh-remote+me@a.x/h/TomoX")]
-app.agent_event({"session_id": "rt", "cwd": "/h/talks", "hook_event_name": "Stop"}, "cc", 1, "me@a.x"); _t.sleep(0.2)
+said.clear(); app.agent_event({"session_id": "rt", "cwd": "/h/talks", "hook_event_name": "Stop"}, "cc", 1, "me@a.x"); _t.sleep(0.2)
+assert said == [("Claude Code @a", "Finished in Radiation damage (talks)")], said  # the bubble names the session too
 assert [(a["where"], a["host"], a["dir"], a["open"]) for a in app.agents() if "@" in a["tool"]] == [
     ("Radiation damage", "a", "/h/TomoX", "vscode://vscode-remote/ssh-remote+me@a.x/h/TomoX")]  # hooked: title from the log
 # a permission prompt answered (or auto mode switched on) fires no hook: the log moving on means it works again
@@ -294,7 +295,8 @@ print("ok")
 # Claude sessions without hooks (the desktop app's) come from their transcripts; closed ones and hooked ones don't repeat
 d = app.CLAUDE / "proj"; d.mkdir()
 (d / "desk.jsonl").write_text(json.dumps({"type": "user", "cwd": "/x/proj", "entrypoint": "claude-desktop"}) + "\n"
-                              + json.dumps({"type": "custom-title", "customTitle": "My chat"}) + "\n")
+                              + json.dumps({"type": "custom-title", "customTitle": "My chat"}) + "\n"
+                              + json.dumps({"type": "ai-title", "aiTitle": "Claude's guess"}) + "\n")  # re-written after a rename
 (d / "oneshot.jsonl").write_text(json.dumps({"type": "user", "cwd": "/x/p", "entrypoint": "sdk-cli"}) + "\n")
 (d / "gone.jsonl").write_text(json.dumps({"type": "user", "cwd": "/x/old", "entrypoint": "cli"}) + "\n")
 iso = lambda secs_ago: datetime.utcfromtimestamp(_t.time() - secs_ago).isoformat() + "Z"

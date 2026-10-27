@@ -492,6 +492,9 @@ def agent_event(e, tool="cc", pid=0, host=""):
     if ev in ("Stop", "Notification") and e.get("transcript_path") and not host:
         a["cached_until"] = cache_expiry(Path(e["transcript_path"])) or a.get("cached_until", 0)
     if ev in ("Stop", "Notification"):
+        title = next((r["title"] for rs in remote.values() for r in rs if r["id"] == sid), "") if host else \
+            transcript_info(Path(e["transcript_path"]))["title"] if e.get("transcript_path") else ""
+        where = f"{title} ({where})" if title else where
         text = f"Finished in {where}" if ev == "Stop" else f"Needs you in {where}: {flat(str(e.get('message') or ''), 90)}"
         threading.Thread(target=say, args=("levi", a.get("tool", "Claude Code"), text), daemon=True).start()
 
@@ -500,7 +503,7 @@ def transcript_info(transcript):
     """{"cwd", "title", "entry", "last", "cached_until"} from the tail of a Claude Code transcript. last: the newest
     timestamped entry (the desktop app also rewrites a file's metadata when you only open it, so mtime isn't activity).
     cached_until: when its prompt cache runs out = last API call + the TTL that call wrote (1 h or 5 min); 0 if unknown."""
-    out = {"cwd": "", "title": "", "entry": "", "last": 0, "cached_until": 0}
+    out, ai = {"cwd": "", "title": "", "entry": "", "last": 0, "cached_until": 0}, ""
     try:
         with transcript.open("rb") as f:
             head = f.read(65536).decode(errors="ignore")  # cwd: where it started (a session can cd away later)
@@ -511,7 +514,7 @@ def transcript_info(transcript):
     for line in reversed(lines):
         try:
             d = json.loads(line)
-            out["title"] = out["title"] or d.get("customTitle") or d.get("aiTitle") or ""  # yours, else Claude's
+            out["title"], ai = out["title"] or d.get("customTitle") or "", ai or d.get("aiTitle") or ""  # your rename beats Claude's title, which it re-writes after
             out["cwd"], out["entry"] = out["cwd"] or d.get("cwd") or "", out["entry"] or d.get("entrypoint") or ""
             if not out["last"] and d.get("timestamp"):
                 out["last"] = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
@@ -523,6 +526,7 @@ def transcript_info(transcript):
             continue
         if all(out.values()):
             break
+    out["title"] = out["title"] or ai
     start = re.search(r'"cwd":\s*("(?:[^"\\]|\\.)*")', head)
     out["cwd"] = json.loads(start[1]) if start else out["cwd"]
     return out
