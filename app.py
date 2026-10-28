@@ -2200,7 +2200,8 @@ textarea:focus,.askm:focus{border-color:var(--accent)}
 .more{font-size:11px;color:var(--muted);padding:0 5px}
 .askm{width:100%;box-sizing:border-box;background:var(--bg);border:1px solid transparent;border-radius:8px;padding:7px 10px;outline:none}
 details .askm{border-color:color-mix(in srgb,var(--accent) 35%,transparent)}
-.rbox{display:flex;gap:6px;margin-top:6px}.rbox[hidden]{display:none}.rbox .askm{margin:0;flex:1}
+.rbox{display:flex;gap:6px;margin-top:6px;align-items:flex-end}.rbox[hidden]{display:none}
+.rbox .askm{margin:0;flex:1;font:inherit;resize:vertical;min-height:5.5em;max-height:60vh;line-height:1.4}.rgo,.rno{height:32px}
 .rgo,.rno{border:0;border-radius:8px;padding:0 12px;background:var(--accent);color:#fff;cursor:pointer;white-space:nowrap}
 .rno{background:var(--line);color:var(--text)}
 .askans{white-space:pre-wrap;margin-top:6px;padding:6px 10px;border-left:3px solid var(--accent);font-size:13px}
@@ -2267,7 +2268,7 @@ function item(t){
   d.innerHTML=`<input type=checkbox class=cb title="Mark done">
     <div class=main><input class=title type=text spellcheck=false>
       <div class=meta><span class=argoing>✨ Argo is working on this…</span><span class=info></span><span class=chips></span><input class=addl list=labels placeholder="+ label"></div>
-      <div class=rbox hidden><input class=askm placeholder="Reply instructions (optional, e.g. &quot;decline politely&quot;), then Enter"><button class=rgo>Draft in Outlook</button><button class=rno>Cancel</button></div>
+      <div class=rbox hidden><textarea class=askm rows=4 placeholder="Reply instructions or the points to make (optional, e.g. &quot;decline politely&quot;). ⌘Enter drafts, Esc cancels."></textarea><button class=rgo>Draft in Outlook</button><button class=rno>Cancel</button></div>
 </div>
     <div class=side><button class=due></button><input type=datetime-local hidden>
       <button class="icon r" title="Draft a reply with Argo">${REPLY}</button><button class="icon o" title="Open in Outlook">${MAIL}</button><button class="icon x" title="Delete">${TRASH}</button></div>
@@ -2288,9 +2289,10 @@ function item(t){
   db.onclick=()=>{db.hidden=true;du.hidden=false;du.focus();try{du.showPicker()}catch{}};
   du.onblur=()=>{if(du.value===t.due){du.hidden=true;db.hidden=false}};
   const r=$('.r'); r.hidden=!t.eml;
-  const rb=$('.rbox'),ri=$('.rbox input');
+  const rb=$('.rbox'),ri=$('.rbox textarea');
+  ri.oninput=()=>{ri.style.height='auto';ri.style.height=ri.scrollHeight+2+'px'};
   r.onclick=()=>{if(r.disabled)return;rb.hidden=!rb.hidden;if(!rb.hidden)ri.focus()};
-  ri.onkeydown=e=>{if(e.key==='Enter')draft();if(e.key==='Escape'){rb.hidden=true;ri.blur()}};
+  ri.onkeydown=e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)){e.preventDefault();draft()}if(e.key==='Escape'){rb.hidden=true;ri.blur()}};
   $('.rgo').onclick=()=>draft(); $('.rno').onclick=()=>rb.hidden=true;
   const draft=async()=>{if(r.disabled)return;const how=ri.value.trim();rb.hidden=true;ri.blur();
     r.disabled=true;r.classList.add('busy');toast('Drafting a reply…');
