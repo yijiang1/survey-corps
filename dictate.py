@@ -30,7 +30,7 @@ def tell(**d):
     """Report to Survey Corps. Returns its reply, or {} when it isn't running."""
     req = urllib.request.Request(APP, json.dumps(d).encode(), {"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=25) as r:
+        with urllib.request.urlopen(req, timeout=120) as r:  # tidying a 5-minute take can take Argo ~45 s
             return json.load(r)
     except Exception:
         return {}

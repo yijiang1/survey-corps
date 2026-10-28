@@ -549,7 +549,9 @@ def dictated(raw, secs=0, vocab=""):
         dictation["state"] = "tidying"
         hint = f"Speech recognition often mishears these words; put them back where they were meant: {vocab}\n\n" if vocab else ""
         # only what's inside the last <clean> is typed, so the model's asides never are; no tag -> the raw transcript
-        found = re.findall(r"<clean>(.*?)</clean>", argo(TIDY + hint + f"<text>\n{raw}\n</text>", 1000, timeout=15,
+        # room for the tidied text (about 4 characters a token, doubled) and time to write it: a 5-minute take is ~4500 characters
+        found = re.findall(r"<clean>(.*?)</clean>", argo(TIDY + hint + f"<text>\n{raw}\n</text>", 500 + len(raw) // 2,
+                                                         timeout=15 + len(raw) // 150,
                                                          tag="dictate", model=config().get("dictate_model") or DICTATE_MODEL)
                            or "", re.S)
         text = found[-1].strip() if found and found[-1].strip() else raw
