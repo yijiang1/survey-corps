@@ -1032,6 +1032,28 @@ def link_item(url):
             "text": flat((meta.get("og:description") or meta.get("description") or [""])[0])}
 
 
+def link_text(url, src):
+    """More for Argo to summarise than link_item's meta tags: a video's full description, a repo's README, or the start
+    of a page's text. "" if there's nothing more (or the fetch fails)."""
+    try:
+        m = re.match(r"https?://(?:www\.)?github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?(?:[/?#].*)?$", url)
+        if src == "GitHub" and m:
+            return flat(fetch(f"https://api.github.com/repos/{m.group(1)}/{m.group(2)}/readme",
+                              {"Accept": "application/vnd.github.raw"}).decode("utf-8", "replace"), 3000)
+        page = fetch(url, BROWSER).decode("utf-8", "replace")
+    except Exception:
+        return ""
+    if src == "YouTube":  # ponytail: no transcript, YouTube's caption endpoint needs a token now
+        m = re.search(r'"shortDescription":("(?:[^"\\]|\\.)*")', page)
+        return flat(json.loads(m.group(1)), 3000) if m else ""
+    text = lambda s: flat(html.unescape(re.sub(r"<[^>]+>", " ", s)), 3000)
+    data = re.findall(r'(?is)<script[^>]*application/ld\+json[^>]*>(.*?)</script>', page)  # schema.org: author, date, type
+    heads = [h for h in map(text, re.findall(r"(?is)<h[1-3]\b[^>]*>(.*?)</h[1-3]>", page)) if h][:20]
+    page = re.sub(r"(?is)<(script|style|noscript|svg|nav|header|footer|form)\b.*?</\1>|<!--.*?-->", " ", page)
+    return "\n".join(filter(None, [flat(" ".join(data), 1500) and "Structured data: " + flat(" ".join(data), 1500),
+                                   heads and "Headings: " + " | ".join(heads), "Text: " + text(page)]))
+
+
 def score_one(item_id):
     """Background: Argo's score and one-line reason for a single (manually added) item."""
     cfg = {**SCOUT, **config()}
@@ -1380,12 +1402,14 @@ def lib_enrich(item_id):
     if not x or not argo_on():
         return
     kind = f"{x['src']} link" if x.get("src") else "local folder" if x["folder"] else "local file"
+    more = link_text(x["path"], x["src"]) if x.get("src") in ("YouTube", "GitHub", "Link") else ""  # fetched here, off the lock
+    more = f"\n\n{ {'YouTube': 'Video description', 'GitHub': 'README'}.get(x.get('src'), 'Page text')}:\n{more}" if more else ""
     reply = argo(f"Below is a {kind} I keep in my library of projects, files and docs. "
                  'Reply with ONLY a JSON object {"summary": "...", "labels": [...]}.\n'
                  "- summary: one plain line (max 20 words) saying what it is.\n"
                  f"- labels: up to 3 short labels for the projects or topics it belongs to (1-2 words, Title Case). Existing labels: {json.dumps(known)}. Reuse one "
                  "whenever it fits; invent a new one only if none does.\n\n"
-                 f"{'Link' if x.get('src') else 'Path'}: {x['path']}\nName: {x['name']}\n\n{x['peek']}", 600, tag="lib:" + item_id)
+                 f"{'Link' if x.get('src') else 'Path'}: {x['path']}\nName: {x['name']}\n\n{x['peek']}{more}", 600, tag="lib:" + item_id)
     with lib_lock:
         lib = load_lib()
         cur = next((y for y in lib["items"] if y["id"] == item_id), None)
