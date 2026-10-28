@@ -370,4 +370,11 @@ srv.shutdown()
 assert app.default_due({"date": "Tue, 20 Oct 2026 09:14:00 -0500", "added": "2026-10-24T10:00"}).startswith("2026-10-23T17:00")
 assert app.default_due({"date": "Tue Oct 20, 2026 9:14 AM", "added": "2026-10-24T10:00"}) == "2026-10-23T17:00"  # screenshot-style
 assert app.default_due({"date": "yesterday", "added": "2026-10-24T10:00"}) == "2026-10-27T17:00"
+# dictation: only Argo's last <clean> block is typed (its asides never are); the raw transcript when it has none
+app.argo_ok, app.argo = True, lambda *a, **kw: "<clean>Sent the slide.</clean>\nWait, keep the tense:\n<clean>Send the slides.</clean>"
+assert app.dictated("um send the uh slides") == "Send the slides." and app.dictation["log"][0]["raw"] == "um send the uh slides"
+app.argo = lambda *a, **kw: "Here is the cleaned text: Send the slides."
+assert app.dictated("um send the slides") == "um send the slides"
+app.argo = lambda *a, **kw: None
+assert app.dictated("hello") == "hello" and app.dictation["state"] == "ready"
 print("ok")

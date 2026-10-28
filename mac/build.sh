@@ -19,6 +19,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>Push-to-talk dictation (Settings → Dictation).</string>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>
 EOF
@@ -52,6 +53,15 @@ done
 ICON="AppIcon-$(shasum "$B/icon.png" | cut -c1-8)"  # new name per image: macOS caches icons by file and ignores a changed one
 iconutil -c icns "$B/AppIcon.iconset" -o "$APP/Contents/Resources/$ICON.icns"
 plutil -replace CFBundleIconFile -string "$ICON" "$APP/Contents/Info.plist"
+fi
+
+# Signed with a fixed self-made certificate (if you made one), macOS keeps the app's permissions (Microphone,
+# Accessibility, Input Monitoring, Screen Recording) across rebuilds; ad-hoc signing loses them every build.
+# Make it once: Keychain Access → Certificate Assistant → Create a Certificate…, name "Survey Corps Signing",
+# Identity Type "Self Signed Root", Certificate Type "Code Signing".
+SIGN="Survey Corps Signing"
+if security find-certificate -c "$SIGN" >/dev/null 2>&1; then
+  codesign --force --deep -s "$SIGN" "$APP" && echo "Signed with \"$SIGN\""
 fi
 
 mkdir -p ~/Applications

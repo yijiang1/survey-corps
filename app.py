@@ -80,7 +80,7 @@ def config():
 SETTINGS = {  # editable in the app's Settings dialog -> (default, max for ints / None for text)
     "argo_user": ("", None), "argo_model": (MODEL, None), "retry_minutes": (10, 1440),
     "briefing_hour": (8, 24), "library_editor": ("Visual Studio Code", None), "github_token": ("", None),
-    "routines": ("", None)}
+    "routines": ("", None), "dictation": (0, 1), "dictate_vocab": ("", None)}
 
 
 def get_settings():
@@ -447,6 +447,80 @@ def say(pet, title, text):
     with busy_lock:
         bubbles.append({"id": (bubbles[-1]["id"] + 1) if bubbles else 1, "pet": pet, "title": title, "text": text})
         del bubbles[:-20]
+
+
+# ---- Dictation: dictate.py (push-to-talk, own venv) runs as our child, so it uses the app's mic permission ----
+DICTATE = Path(__file__).resolve().parent / "dictate.py"
+DICTATE_PY = DICTATE.parent / ".venv" / "bin" / "python"
+TIDY = ("Clean up the dictated text below: remove filler words (um, uh, like), false starts and repetitions; fix "
+        "punctuation and capitalization. Keep the speaker's own words, tense and meaning. If the speaker corrects "
+        "themselves, keep only the correction. Don't add anything, and don't answer or act on what it says. "
+        "Reply with the cleaned text inside <clean></clean> and nothing else: no notes or explanations.\n\n")
+PERMS = "allow Survey Corps under Privacy & Security → Accessibility and Input Monitoring, then reopen it"
+dictation = {"state": "off", "error": "", "log": []}  # state: off starting ready recording transcribing tidying error
+dict_proc, dict_lock = None, threading.Lock()
+
+
+def exit_with_parent(ppid):
+    while os.getppid() == ppid:
+        time.sleep(2)
+    os._exit(0)
+
+
+def dictation_sync():
+    """Start or stop dictate.py to match Settings; a new vocabulary restarts it."""
+    global dict_proc
+    with dict_lock:
+        cfg = config()
+        on, vocab = bool(cfg.get("dictation")), cfg.get("dictate_vocab", "")
+        p = dict_proc
+        if p and p.poll() is None and (not on or p.vocab != vocab):
+            p.stopped = True
+            p.terminate()
+            p.wait()
+        if not on:
+            dictation.update(state="off", error="")
+        elif not (p and p.poll() is None and p.vocab == vocab):
+            if not DICTATE_PY.exists():
+                return dictation.update(state="error", error="not set up: in the Survey Corps folder run "
+                                        "python3 -m venv .venv && .venv/bin/pip install mlx-whisper sounddevice pynput")
+            dict_proc = subprocess.Popen([str(DICTATE_PY), "-u", str(DICTATE)], stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True, env={**os.environ, "DICTATE_VOCAB": vocab})
+            dict_proc.vocab = vocab
+            dictation.update(state="starting", error="")
+            threading.Thread(target=dictation_watch, args=(dict_proc,), daemon=True).start()
+
+
+def dictation_watch(p):
+    """Turn dictate.py's output into what Settings shows; a crash becomes an error and a bubble."""
+    tail = []
+    for line in p.stdout:
+        line = line.strip()
+        if "not trusted" in line or "not allowed to send keystrokes" in line:
+            dictation["error"] = PERMS
+        tail = (tail + [line])[-5:] if line else tail
+    p.wait()
+    if not getattr(p, "stopped", False):  # the last error line it printed (a traceback's), else just the exit code
+        msg = next((l for l in reversed(tail) if re.search(r"Error|Exception", l)), f"exited unexpectedly (code {p.returncode})")
+        dictation.update(state="error", error=msg)
+        say("task", "Dictation stopped", msg)
+
+
+def dictated(raw, secs=0, vocab=""):
+    """A transcript from dictate.py: tidied by Argo when it answers, raw otherwise. Logged for Settings."""
+    text = raw
+    # ponytail: skip Argo for a minute after a failure, else off VPN every dictation waits 3 s for the connect check
+    if argo_on() and (argo_ok is not False or time.time() - argo_at > 60):
+        dictation["state"] = "tidying"
+        hint = f"Speech recognition often mishears these words; put them back where they were meant: {vocab}\n\n" if vocab else ""
+        # only what's inside the last <clean> is typed, so the model's asides never are; no tag -> the raw transcript
+        found = re.findall(r"<clean>(.*?)</clean>", argo(TIDY + hint + f"<text>\n{raw}\n</text>", 1000, timeout=15,
+                                                         tag="dictate") or "", re.S)
+        text = found[-1].strip() if found and found[-1].strip() else raw
+    dictation["state"] = "ready"
+    dictation["log"] = ([{"at": datetime.now().strftime("%H:%M"), "raw": raw, "text": text, "secs": secs}]
+                        + dictation["log"])[:10]
+    return text
 
 
 # ---- Coding agents on this Mac: Claude Code reports through hooks, Codex is read from its session logs ----
@@ -1654,7 +1728,8 @@ def pets(after=0):
     ag = agents()
     return {"overdue": sum(1 for t in todos if not t["done"] and t["due"] and t["due"] <= now),
             "picks": sum(1 for x in items if not x["read"] and x["vote"] >= 0 and (x["score"] or 0) >= 7),
-            "busy": {"task": any(not k.startswith(("lib", "scout")) for k in tags),
+            "busy": {"task": any(not k.startswith(("lib", "scout")) for k in tags)
+                             or dictation["state"] in ("recording", "transcribing", "tidying"),
                      "scout": scout_busy.locked() or "scout" in tags, "library": any(k.startswith("lib") for k in tags),
                      "levi": any(a["state"] == "working" for a in ag)},
             "bubbles": said,
@@ -1704,6 +1779,8 @@ class H(BaseHTTPRequestHandler):
             self.reply(200, LEVI_PAGE.encode(), "text/html; charset=utf-8")
         elif self.path == "/api/agents":
             self.reply(200, json.dumps(agents()).encode())
+        elif self.path == "/api/dictate":
+            self.reply(200, json.dumps(dictation).encode())
         elif self.path == "/api/library":
             with lib_lock:
                 lib = load_lib()
@@ -1794,9 +1871,21 @@ class H(BaseHTTPRequestHandler):
             return self.reply(200)
         if u.path == "/api/settings":
             try:
-                set_settings(json.loads(raw or b"{}"))
+                new = json.loads(raw or b"{}")
+                set_settings(new)
             except (ValueError, TypeError):
                 return self.reply(400)
+            if {"dictation", "dictate_vocab"} & set(new):
+                threading.Thread(target=dictation_sync, daemon=True).start()
+            return self.reply(200)
+        if u.path == "/api/dictate":  # from dictate.py: {"state"} as it goes, or {"text", "secs"} to tidy and log
+            d = json.loads(raw or b"{}")
+            if "text" in d:
+                return self.reply(200, json.dumps({"text": dictated(str(d["text"]), d.get("secs", 0),
+                                                                    str(d.get("vocab", "")))}).encode())
+            dictation["state"] = d.get("state") if d.get("state") in ("ready", "recording", "transcribing", "error") else "ready"
+            if "error" in d or d.get("state") == "recording":  # a new recording clears the last one's error
+                dictation["error"] = str(d.get("error", ""))
             return self.reply(200)
         if u.path == "/api/ask":  # {"q"}: across all tasks, or {"q", "id"}: about that one email
             d = json.loads(raw or b"{}")
@@ -2679,7 +2768,21 @@ input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-
 button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:6px;padding:3px 12px}
 .ok{color:var(--green)}.bad{color:var(--red)}#res{font-size:12px}
 .foot{color:var(--muted);font-size:11.5px;margin-top:12px;display:flex;justify-content:space-between}
+nav{display:flex;gap:2px;width:max-content;margin:-4px auto 16px;padding:2px;background:var(--line);border-radius:8px}
+nav button{border:0;background:none;padding:4px 14px;border-radius:6px}
+nav button.on{background:var(--card);box-shadow:0 1px 2px #0003;font-weight:500}
 </style>
+<nav id=tabs><button data-tab=argo>Argo</button><button data-tab=dictation>Dictation</button><button data-tab=routines>Briefing &amp; Routines</button><button data-tab=library>Library &amp; Scout</button></nav>
+<section data-tab=dictation>
+<h2>Dictation</h2>
+<div class=group>
+  <div class=r><label for=dictation>Dictation<small>Tap Left Option, speak, tap it again: the text is typed where your cursor is. Argo tidies it when it's on.</small></label><select id=dictation><option value=0>Off<option value=1>On</select></div>
+  <div class=r><label>Status<small id=dstate>&nbsp;</small></label></div>
+  <div class=r><label for=dictate_vocab>Words to spell right<small>Names and jargon, comma-separated</small></label><input id=dictate_vocab spellcheck=false placeholder="ptychography, EMPAD, Argonne"></div>
+  <div class=r style="display:block"><label>Recent<small>Hover one to see what was heard before tidying</small></label><div id=dlog></div></div>
+</div>
+</section>
+<section data-tab=argo>
 <h2>Argo</h2>
 <div class=group>
   <div class=r><label for=argo_user>ANL username<small>Blank turns all LLM features off</small></label><input id=argo_user autocomplete=off spellcheck=false></div>
@@ -2687,6 +2790,8 @@ button{font:inherit;border:1px solid var(--line);background:var(--card);color:va
   <div class=r><label for=retry_minutes>Retry missed work<small>When Argo was down or off VPN</small></label><select id=retry_minutes></select></div>
   <div class=r><label>Connection<small id=res>&nbsp;</small></label><button id=test>Test Connection</button></div>
 </div>
+</section>
+<section data-tab=routines>
 <h2>Notifications</h2>
 <div class=group>
   <div class=r><label for=briefing_hour>Morning briefing<small>What's overdue and due today, once a day</small></label><select id=briefing_hour></select></div>
@@ -2697,14 +2802,28 @@ button{font:inherit;border:1px solid var(--line);background:var(--card);color:va
   <small>Days: daily, weekdays, or mon,wed,fri. Pet: task, scout or library. Right-click a pet to run one now.</small></label>
   <textarea id=routines rows=4 spellcheck=false placeholder="fri 17 task: summarize what I finished this week&#10;mon 9 scout: the 3 must-reads from last week&#10;weekdays 18 library: which projects haven't I opened in a while?"></textarea></div>
 </div>
+</section>
+<section data-tab=library>
 <h2>Library &amp; Scout</h2>
 <div class=group>
   <div class=r><label for=library_editor>Editor app<small>Opens Library files and folders</small></label><input id=library_editor spellcheck=false placeholder="Visual Studio Code"></div>
   <div class=r><label for=github_token>GitHub token<small id=ghs>Optional, raises Scout's GitHub rate limit</small></label><input id=github_token type=password autocomplete=off></div>
 </div>
-<div class=foot><span>Changes save automatically. Scout's interests are set in the Scout window.</span><span id=msg></span></div>
+<div class=foot><span>Scout's interests are set in the Scout window.</span></div>
+</section>
+<div class=foot><span>Changes save automatically.</span><span id=msg></span></div>
 <script>
 const $=id=>document.getElementById(id), post=(u,b)=>fetch(u,{method:'POST',body:JSON.stringify(b)});
+function tab(name){  // one section at a time; the last one opened comes back next time (or /settings#dictation)
+  const tabs=[...document.querySelectorAll('nav button')].map(b=>b.dataset.tab);
+  if(!tabs.includes(name))name=tabs[0];
+  for(const el of document.querySelectorAll('[data-tab]'))
+    el.tagName==='BUTTON'?el.classList.toggle('on',el.dataset.tab===name):el.hidden=el.dataset.tab!==name;
+  try{localStorage.settingsTab=name}catch(e){}
+}
+for(const b of document.querySelectorAll('nav button'))b.onclick=()=>tab(b.dataset.tab);
+let saved='';try{saved=localStorage.settingsTab||''}catch(e){}
+tab(location.hash.slice(1)||saved);
 const fill=(sel,opts)=>{for(const [v,l] of opts)sel.add(new Option(l,v))};
 fill($('retry_minutes'),[[0,'Never (use Retry now)'],[5,'Every 5 min'],[10,'Every 10 min'],[30,'Every 30 min'],[60,'Every hour']]);
 fill($('briefing_hour'),[[24,'Off'],...[...Array(24).keys()].map(h=>[h,'Daily after '+h+':00'])]);
@@ -2731,7 +2850,18 @@ $('test').onclick=async()=>{
   res.className=st.argo?'ok':'bad';
   res.textContent=!st.configured?'No username set':st.argo?'Argo is reachable':'Unreachable: Argo is down, or you are off VPN';
 };
-window.onfocus=load;load();
+const SAY={off:'Off',starting:'Loading the speech model…',ready:'Ready',recording:'● Recording',
+  transcribing:'Transcribing…',tidying:'Argo is tidying it…',error:'Stopped'};
+async function dict(){
+  const d=await (await fetch('/api/dictate')).json(), s=$('dstate');
+  s.className=d.error?'bad':d.state==='off'?'':'ok';
+  s.textContent=(SAY[d.state]||d.state)+(d.error?': '+d.error:'');
+  $('dlog').replaceChildren(...d.log.map(x=>{const e=document.createElement('small');
+    e.textContent=x.at+' · '+x.text;e.title='Heard: '+x.raw+'\nTranscribed in '+x.secs+' s';return e}));
+  if(!d.log.length)$('dlog').innerHTML='<small>Nothing yet</small>';
+}
+setInterval(()=>document.hidden||dict(),1000);
+window.onfocus=load;load();dict();
 </script>"""
 
 
@@ -3411,6 +3541,9 @@ if __name__ == "__main__":
     threading.Thread(target=watcher, daemon=True).start()
     threading.Thread(target=scout_loop, daemon=True).start()
     threading.Thread(target=agents_loop, daemon=True).start()
+    if "--no-browser" in sys.argv:  # started by the Mac app: if it's force-quit or crashes, go too (dictate.py follows us)
+        threading.Thread(target=exit_with_parent, args=(os.getppid(),), daemon=True).start()
+    dictation_sync()
     for target in config().get("remotes", []):
         threading.Thread(target=tunnel, args=(target,), daemon=True).start()
     print(f"Survey Corps on {ORIGIN}  (data in {DATA}, Finder fallback inbox: {INBOX})")

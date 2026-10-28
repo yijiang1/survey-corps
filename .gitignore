@@ -6,3 +6,5 @@ mac/build/
 mac/icon-source.png
 .DS_Store
 __pycache__/
+# dictate.py dependencies
+.venv/

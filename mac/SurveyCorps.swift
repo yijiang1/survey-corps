@@ -671,6 +671,79 @@ class BubbleView: NSView {
     override func mouseUp(with e: NSEvent) { bubble?.orderOut(nil); bubble?.onClick() }
 }
 
+func hudColor(_ v: Int, _ a: CGFloat = 1) -> NSColor {
+    NSColor(srgbRed: CGFloat(v >> 16 & 255) / 255, green: CGFloat(v >> 8 & 255) / 255, blue: CGFloat(v & 255) / 255, alpha: a)
+}
+
+// Pill at the bottom of the screen while dictating, in Survey Corps colours: a cloak-green pill with a gold edge,
+// a red signal flare while listening and a spinning gold ring while it transcribes and Argo tidies.
+class DictationHUD: NSPanel {
+    static let size = NSSize(width: 236, height: 44)
+    let flare = CALayer(), ring = CAShapeLayer()
+    let label = NSTextField(labelWithString: ""), hint = NSTextField(labelWithString: "")
+    var state = ""
+    init() {
+        super.init(contentRect: NSRect(origin: .zero, size: Self.size), styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered, defer: false)
+        level = .statusBar
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        backgroundColor = .clear; isOpaque = false; hasShadow = true; ignoresMouseEvents = true
+        let bg = CloakView(frame: NSRect(origin: .zero, size: Self.size))
+        bg.wantsLayer = true
+        flare.frame = CGRect(x: 17, y: 16, width: 12, height: 12); flare.cornerRadius = 6
+        flare.backgroundColor = hudColor(0xe8452c).cgColor
+        flare.shadowColor = hudColor(0xff7a45).cgColor; flare.shadowOffset = .zero; flare.shadowOpacity = 1
+        let glow = CABasicAnimation(keyPath: "shadowRadius")  // the flare flickers like a burning signal round
+        glow.fromValue = 3; glow.toValue = 9; glow.duration = 0.55; glow.autoreverses = true; glow.repeatCount = .infinity
+        flare.add(glow, forKey: "glow")
+        ring.frame = CGRect(x: 13, y: 12, width: 20, height: 20)
+        ring.path = CGPath(ellipseIn: CGRect(x: 2, y: 2, width: 16, height: 16), transform: nil)
+        ring.fillColor = nil; ring.strokeColor = hudColor(0xe0b44a).cgColor; ring.lineWidth = 2.4
+        ring.strokeEnd = 0.7; ring.lineCap = .round
+        let spin = CABasicAnimation(keyPath: "transform.rotation")
+        spin.fromValue = 0; spin.toValue = -2 * Double.pi; spin.duration = 0.9; spin.repeatCount = .infinity
+        ring.add(spin, forKey: "spin")
+        bg.layer!.addSublayer(flare); bg.layer!.addSublayer(ring)
+        label.frame = NSRect(x: 44, y: 21, width: Self.size.width - 56, height: 16)
+        hint.frame = NSRect(x: 44, y: 7, width: Self.size.width - 56, height: 14)
+        hint.font = .systemFont(ofSize: 10.5); hint.textColor = hudColor(0xf3e6c8, 0.72)
+        for v in [label, hint] { bg.addSubview(v) }
+        contentView = bg
+    }
+    var hideTimer: Timer?
+    // s: dictate.py's state from /api/dictate, or "down" when the backend stopped answering; detail: its error
+    func update(_ s: String, _ detail: String = "") {
+        guard s != state else { return }
+        state = s
+        hideTimer?.invalidate()
+        let lines = ["recording": ("Listening", "Tap ⌥ Left Option again to finish"),
+                     "transcribing": ("Transcribing", "Decoding the report…"),
+                     "tidying": ("Argo is tidying", "Fixing words and punctuation…"),
+                     "error": ("Dictation stopped", detail.isEmpty ? "See Settings → Dictation" : detail),
+                     "down": ("Backend down", "Quit and reopen Survey Corps")]
+        guard let (title, sub) = lines[s] else { return orderOut(nil) }
+        let alert = s == "error" || s == "down"  // an amber flare, shown for 8 s: there's nothing to wait for
+        label.attributedStringValue = NSAttributedString(string: title.uppercased(), attributes: [  // like a written order
+            .font: NSFont.systemFont(ofSize: 12, weight: .bold), .kern: 1.6, .foregroundColor: hudColor(alert ? 0xf5c451 : 0xf3e6c8)])
+        hint.stringValue = sub
+        hint.lineBreakMode = .byTruncatingTail
+        flare.backgroundColor = hudColor(alert ? 0xe8a12c : 0xe8452c).cgColor
+        flare.isHidden = !(s == "recording" || alert); ring.isHidden = !flare.isHidden
+        if alert { hideTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { [weak self] _ in self?.orderOut(nil) } }
+        let v = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame  // the screen you're working on
+        setFrameOrigin(NSPoint(x: v.midX - frame.width / 2, y: v.minY + 40))
+        orderFrontRegardless()
+    }
+}
+
+class CloakView: NSView {  // the pill: Survey Corps cloak green with a gold edge
+    override func draw(_ r: NSRect) {
+        let p = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: bounds.height / 2 - 1, yRadius: bounds.height / 2 - 1)
+        NSGradient(starting: hudColor(0x3f6b4a), ending: hudColor(0x1d3a27))!.draw(in: p, angle: -90)
+        hudColor(0xe0b44a).setStroke(); p.lineWidth = 1.5; p.stroke()
+    }
+}
+
 class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     var window: NSWindow!, feedWindow: NSWindow!, libWindow: NSWindow!, settingsWindow: NSWindow!, leviWindow: NSWindow!
     var pets: [String: (panel: NSPanel, view: PetView, window: NSWindow?)] = [:]  // "task", "scout", "library", "levi"
@@ -800,6 +873,22 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [unowned self] _ in self.poll() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.poll() }
+        let hud = DictationHUD()  // polled on its own, faster than the pets: it should light up as you start talking
+        var misses = 0  // polls in a row the backend didn't answer
+        Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
+            URLSession.shared.dataTask(with: base.appendingPathComponent("api/dictate")) { data, _, _ in
+                let d = json(data)
+                DispatchQueue.main.async {
+                    if d.isEmpty {  // 1 s of silence while dictation was on = the backend died (not just starting up)
+                        misses += 1
+                        if misses == 5 && !["", "off", "down"].contains(hud.state) { hud.update("down") }
+                        return
+                    }
+                    misses = 0
+                    hud.update(d["state"] as? String ?? "", d["error"] as? String ?? "")
+                }
+            }.resume()
+        }
     }
 
     // Everything the pets show comes from one call: badges, who's busy, new speech bubbles.
