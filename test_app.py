@@ -394,4 +394,11 @@ app.argo = lambda *a, **kw: "Here is the cleaned text: Send the slides."
 assert app.dictated("um send the slides") == "um send the slides"
 app.argo = lambda *a, **kw: None
 assert app.dictated("hello") == "hello" and app.dictation["state"] == "ready"
+# corrections from Recent: "heard → meant" lines (-> works too) go to Argo's prompt; junk lines are skipped
+fixes = {"argo_user": "x", "dictate_fixes": "Taichi → PtyChi\nno arrow here\n  empad -> EMPAD \n → x"}
+assert app.dict_fixes(fixes) == [("Taichi", "PtyChi"), ("empad", "EMPAD")], app.dict_fixes(fixes)
+prompts, cfg = [], app.config
+app.config, app.argo = lambda: fixes, lambda p, *a, **kw: prompts.append(p) or "<clean>PtyChi</clean>"
+assert app.dictated("Taichi") == "PtyChi" and 'wrote "Taichi" for "PtyChi"' in prompts[0], prompts
+app.config = cfg
 print("ok")

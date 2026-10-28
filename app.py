@@ -92,7 +92,7 @@ SETTINGS = {  # editable in the app's Settings dialog -> (default, max for ints 
     "argo_user": ("", None), "argo_model": (MODEL, None), "retry_minutes": (10, 1440),
     "briefing_hour": (8, 24), "library_editor": ("Visual Studio Code", None), "github_token": ("", None),
     "routines": ("", None), "dictation": (0, 1), "dictate_vocab": ("", None),
-    "dictate_model": (DICTATE_MODEL, None), "dictate_mute": (1, 1)}
+    "dictate_model": (DICTATE_MODEL, None), "dictate_mute": (1, 1), "dictate_fixes": ("", None)}
 
 
 def get_settings():
@@ -477,12 +477,20 @@ def exit_with_parent(ppid):
     os._exit(0)
 
 
+def dict_fixes(cfg):
+    """Corrections made from Recent, one "heard → meant" per line -> [(heard, meant)]."""
+    pairs = (re.split(r"\s*(?:→|->)\s*", line.strip(), maxsplit=1) for line in cfg.get("dictate_fixes", "").splitlines())
+    return [(h, m) for h, m in (p for p in pairs if len(p) == 2) if h and m]
+
+
 def dictation_sync():
     """Start or stop dictate.py to match Settings; a new vocabulary restarts it."""
     global dict_proc
     with dict_lock:
         cfg = config()
-        on, vocab = bool(cfg.get("dictation")), cfg.get("dictate_vocab", "")
+        # Whisper gets the words to spell right plus what each correction meant
+        words = [cfg.get("dictate_vocab", "")] + [m for _, m in dict_fixes(cfg)]
+        on, vocab = bool(cfg.get("dictation")), ", ".join(dict.fromkeys(w for w in words if w))
         p = dict_proc
         if p and p.poll() is None and (not on or p.vocab != vocab):
             p.stopped = True
@@ -548,6 +556,10 @@ def dictated(raw, secs=0, vocab=""):
     if argo_on() and (argo_ok is not False or time.time() - argo_at > 60):
         dictation["state"] = "tidying"
         hint = f"Speech recognition often mishears these words; put them back where they were meant: {vocab}\n\n" if vocab else ""
+        fixes = dict_fixes(config())
+        if fixes:  # from Recent: what it has misheard before
+            hint += ("It has made these mistakes before; fix them when the context fits:\n"
+                     + "".join(f"- wrote \"{h}\" for \"{m}\"\n" for h, m in fixes) + "\n")
         # only what's inside the last <clean> is typed, so the model's asides never are; no tag -> the raw transcript
         # room for the tidied text (about 4 characters a token, doubled) and time to write it: a 5-minute take is ~4500 characters
         found = re.findall(r"<clean>(.*?)</clean>", argo(TIDY + hint + f"<text>\n{raw}\n</text>", 500 + len(raw) // 2,
@@ -1905,7 +1917,7 @@ class H(BaseHTTPRequestHandler):
                 set_settings(new)
             except (ValueError, TypeError):
                 return self.reply(400)
-            if {"dictation", "dictate_vocab"} & set(new):
+            if {"dictation", "dictate_vocab", "dictate_fixes"} & set(new):
                 threading.Thread(target=dictation_sync, daemon=True).start()
             return self.reply(200)
         if u.path == "/api/dictate":  # from dictate.py: {"state"} as it goes, or {"text", "secs"} to tidy and log
@@ -2803,6 +2815,7 @@ button{font:inherit;border:1px solid var(--line);background:var(--card);color:va
 .foot{color:var(--muted);font-size:11.5px;margin-top:12px;display:flex;justify-content:space-between}
 nav{display:flex;gap:2px;width:max-content;margin:-4px auto 16px;padding:2px;background:var(--line);border-radius:8px}
 nav button{border:0;background:none;padding:4px 14px;border-radius:6px}
+#dlog{-webkit-user-select:text;cursor:text}#dfix{margin-top:8px;display:flex;gap:6px;align-items:center}#dfix[hidden]{display:none}
 nav button.on{background:var(--card);box-shadow:0 1px 2px #0003;font-weight:500}
 </style>
 <nav id=tabs><button data-tab=argo>Argo</button><button data-tab=dictation>Dictation</button><button data-tab=routines>Briefing &amp; Routines</button><button data-tab=library>Library &amp; Scout</button></nav>
@@ -2814,7 +2827,10 @@ nav button.on{background:var(--card);box-shadow:0 1px 2px #0003;font-weight:500}
   <div class=r><label for=dictate_vocab>Words to spell right<small>Names and jargon, comma-separated</small></label><input id=dictate_vocab spellcheck=false placeholder="ptychography, EMPAD, Argonne"></div>
   <div class=r><label for=dictate_mute>Mute sound while recording<small>So a video or music playing aloud isn't picked up. It's put back when you stop.</small></label><select id=dictate_mute><option value=1>On<option value=0>Off</select></div>
   <div class=r><label for=dictate_model>Argo model for tidying<small>A small, fast one is plenty. Other features use the model in the Argo tab.</small></label><input id=dictate_model spellcheck=false placeholder=claudehaiku55></div>
-  <div class=r style="display:block"><label>Recent<small>Hover one to see what was heard before tidying</small></label><div id=dlog></div></div>
+  <div class=r style="display:block"><label>Recent<small>Hover one to see what was heard before tidying. Select a wrong word to correct it.</small></label><div id=dlog></div>
+  <div id=dfix hidden><small>“<b id=dheard></b>” should be</small><input id=dmeant spellcheck=false style="flex:1"><button id=dsave>Save</button></div></div>
+  <div class=r style="display:block"><label for=dictate_fixes>Corrections<small>One per line, <b>heard → meant</b>. Argo fixes these in later dictations, and Whisper is told the right spelling.</small></label>
+  <textarea id=dictate_fixes rows=3 spellcheck=false placeholder="Taichi → PtyChi"></textarea></div>
 </div>
 </section>
 <section data-tab=argo>
@@ -2887,14 +2903,30 @@ $('test').onclick=async()=>{
 };
 const SAY={off:'Off',starting:'Loading the speech model…',ready:'Ready',recording:'● Recording',
   transcribing:'Transcribing…',tidying:'Argo is tidying it…',error:'Stopped'};
+let shown='';
 async function dict(){
   const d=await (await fetch('/api/dictate')).json(), s=$('dstate');
   s.className=d.error?'bad':d.state==='off'?'':'ok';
   s.textContent=(SAY[d.state]||d.state)+(d.error?': '+d.error:'');
+  if(JSON.stringify(d.log)===shown)return;  // redrawing would drop a selection being made
+  shown=JSON.stringify(d.log);
   $('dlog').replaceChildren(...d.log.map(x=>{const e=document.createElement('small');
     e.textContent=x.at+' · '+x.text;e.title='Heard: '+x.raw+'\nTranscribed in '+x.secs+' s';return e}));
   if(!d.log.length)$('dlog').innerHTML='<small>Nothing yet</small>';
 }
+$('dlog').onmouseup=()=>{  // select a misheard word in Recent -> "heard → meant" in Corrections
+  const w=getSelection().toString().trim().replace(/^\d\d:\d\d · /,'');
+  if(!w||w.length>60)return;
+  $('dheard').textContent=w;$('dmeant').value='';$('dfix').hidden=false;$('dmeant').focus();
+};
+$('dmeant').onchange=null;
+$('dmeant').onkeydown=e=>{if(e.key==='Enter')$('dsave').click();if(e.key==='Escape')$('dfix').hidden=true};
+$('dsave').onclick=()=>{
+  const h=$('dheard').textContent, m=$('dmeant').value.trim(), t=$('dictate_fixes');
+  if(!m||m===h)return;
+  t.value=[...t.value.split('\n').filter(l=>l.trim()&&!l.startsWith(h+' →')),h+' → '+m].join('\n');
+  save({dictate_fixes:t.value});$('dfix').hidden=true;
+};
 setInterval(()=>document.hidden||dict(),1000);
 window.onfocus=load;load();dict();
 </script>"""
