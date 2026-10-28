@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Survey Corps: local todo list fed by emails dragged from Outlook. Run: python3 app.py"""
 from collections import Counter
-import base64, html, inspect, json, os, re, socket, sqlite3, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+import base64, html, inspect, json, os, re, signal, socket, sqlite3, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email import message_from_bytes, policy
@@ -82,7 +82,7 @@ SETTINGS = {  # editable in the app's Settings dialog -> (default, max for ints 
     "argo_user": ("", None), "argo_model": (MODEL, None), "retry_minutes": (10, 1440),
     "briefing_hour": (8, 24), "library_editor": ("Visual Studio Code", None), "github_token": ("", None),
     "routines": ("", None), "dictation": (0, 1), "dictate_vocab": ("", None),
-    "dictate_model": (DICTATE_MODEL, None)}
+    "dictate_model": (DICTATE_MODEL, None), "dictate_mute": (1, 1)}
 
 
 def get_settings():
@@ -466,6 +466,7 @@ dict_proc, dict_lock = None, threading.Lock()
 def exit_with_parent(ppid):
     while os.getppid() == ppid:
         time.sleep(2)
+    mute_for_dictation(False)  # quit mid-recording: don't leave the Mac muted
     os._exit(0)
 
 
@@ -482,15 +483,36 @@ def dictation_sync():
             p.wait()
         if not on:
             dictation.update(state="off", error="")
+            mute_for_dictation(False)
         elif not (p and p.poll() is None and p.vocab == vocab):
             if not DICTATE_PY.exists():
                 return dictation.update(state="error", error="not set up: in the Survey Corps folder run "
                                         "python3 -m venv .venv && .venv/bin/pip install mlx-whisper sounddevice pynput")
             dict_proc = subprocess.Popen([str(DICTATE_PY), "-u", str(DICTATE)], stdout=subprocess.PIPE,
                                          stderr=subprocess.STDOUT, text=True, env={**os.environ, "DICTATE_VOCAB": vocab})
-            dict_proc.vocab = vocab
+            dict_proc.vocab, dict_proc.started = vocab, time.time()
             dictation.update(state="starting", error="")
             threading.Thread(target=dictation_watch, args=(dict_proc,), daemon=True).start()
+
+
+def osa(script):
+    return subprocess.run(["osascript", "-e", script], capture_output=True, text=True).stdout.strip()
+
+
+muted_by_us = False  # we muted the Mac's sound for a recording, and owe it an unmute
+
+
+def mute_for_dictation(recording):
+    """Mute the Mac's sound while recording (Settings → Dictation), so a playing video isn't transcribed too.
+    Puts it back after, and leaves it alone if it was already muted."""
+    global muted_by_us
+    if recording and not muted_by_us and config().get("dictate_mute", 1):
+        if osa("output muted of (get volume settings)") == "false":
+            osa("set volume output muted true")
+            muted_by_us = True
+    elif not recording and muted_by_us:
+        osa("set volume output muted false")
+        muted_by_us = False
 
 
 def dictation_watch(p):
@@ -505,6 +527,10 @@ def dictation_watch(p):
     if not getattr(p, "stopped", False):  # the last error line it printed (a traceback's), else just the exit code
         msg = next((l for l in reversed(tail) if re.search(r"Error|Exception", l)), f"exited unexpectedly (code {p.returncode})")
         dictation.update(state="error", error=msg)
+        mute_for_dictation(False)  # it may have died mid-recording
+        if time.time() - p.started > 30:  # it had been working: start it again (not when it dies on startup: no loop)
+            threading.Timer(3, dictation_sync).start()
+            msg += ". Restarting it."
         say("task", "Dictation stopped", msg)
 
 
@@ -1887,6 +1913,7 @@ class H(BaseHTTPRequestHandler):
                 return self.reply(200, json.dumps({"text": dictated(str(d["text"]), d.get("secs", 0),
                                                                     str(d.get("vocab", "")))}).encode())
             dictation["state"] = d.get("state") if d.get("state") in ("ready", "recording", "transcribing", "error") else "ready"
+            mute_for_dictation(dictation["state"] == "recording")
             if "error" in d or d.get("state") == "recording":  # a new recording clears the last one's error
                 dictation["error"] = str(d.get("error", ""))
             return self.reply(200)
@@ -2782,6 +2809,7 @@ nav button.on{background:var(--card);box-shadow:0 1px 2px #0003;font-weight:500}
   <div class=r><label for=dictation>Dictation<small>Tap Left Option, speak, tap it again: the text is typed where your cursor is. Argo tidies it when it's on.</small></label><select id=dictation><option value=0>Off<option value=1>On</select></div>
   <div class=r><label>Status<small id=dstate>&nbsp;</small></label></div>
   <div class=r><label for=dictate_vocab>Words to spell right<small>Names and jargon, comma-separated</small></label><input id=dictate_vocab spellcheck=false placeholder="ptychography, EMPAD, Argonne"></div>
+  <div class=r><label for=dictate_mute>Mute sound while recording<small>So a video or music playing aloud isn't picked up. It's put back when you stop.</small></label><select id=dictate_mute><option value=1>On<option value=0>Off</select></div>
   <div class=r><label for=dictate_model>Argo model for tidying<small>A small, fast one is plenty. Other features use the model in the Argo tab.</small></label><input id=dictate_model spellcheck=false placeholder=claudehaiku55></div>
   <div class=r style="display:block"><label>Recent<small>Hover one to see what was heard before tidying</small></label><div id=dlog></div></div>
 </div>
@@ -3547,6 +3575,8 @@ if __name__ == "__main__":
     threading.Thread(target=agents_loop, daemon=True).start()
     if "--no-browser" in sys.argv:  # started by the Mac app: if it's force-quit or crashes, go too (dictate.py follows us)
         threading.Thread(target=exit_with_parent, args=(os.getppid(),), daemon=True).start()
+        # the app quits us with SIGTERM: unmute first if a recording was going
+        signal.signal(signal.SIGTERM, lambda *_: (mute_for_dictation(False), os._exit(0)))
     dictation_sync()
     for target in config().get("remotes", []):
         threading.Thread(target=tunnel, args=(target,), daemon=True).start()

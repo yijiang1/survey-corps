@@ -377,6 +377,14 @@ assert app.dictation["log"][0]["text"] == "Send the slides."
 asked = []
 app.argo = lambda *a, **kw: asked.append(kw.get("model")) or "<clean>ok</clean>"
 assert app.dictated("ok") == "ok" and asked == [app.DICTATE_MODEL], asked  # its own model, not the app-wide one
+# mute while recording: only if the sound was on, and put back after; already muted -> left alone
+sound, cmds = {"muted": "false"}, []
+app.osa = lambda s: cmds.append(s) or (sound["muted"] if s.startswith("output muted") else "")
+app.mute_for_dictation(True); app.mute_for_dictation(True); app.mute_for_dictation(False)
+assert [c for c in cmds if c.startswith("set")] == ["set volume output muted true", "set volume output muted false"], cmds
+sound["muted"], cmds[:] = "true", []
+app.mute_for_dictation(True); app.mute_for_dictation(False)
+assert not [c for c in cmds if c.startswith("set")], cmds
 app.argo = lambda *a, **kw: "Here is the cleaned text: Send the slides."
 assert app.dictated("um send the slides") == "um send the slides"
 app.argo = lambda *a, **kw: None

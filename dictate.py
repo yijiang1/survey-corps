@@ -7,7 +7,7 @@ Setup, in this folder: python3 -m venv .venv && .venv/bin/pip install mlx-whispe
     .venv/bin/python dictate.py            # run by hand (permissions then belong to your terminal app)
     .venv/bin/python dictate.py some.wav   # transcribe one file
 """
-import json, os, subprocess, sys, threading, time, urllib.request
+import json, os, queue, subprocess, sys, threading, time, urllib.request
 
 import mlx_whisper
 import numpy as np
@@ -78,14 +78,49 @@ def toggle():
     if not recording:
         chunks.clear()
         recording, take = True, take + 1
+        mic_jobs.put("start")
         threading.Thread(target=tell, kwargs={"state": "recording"}).start()
         cap = threading.Timer(MAX_SECS, time_up, args=(take,))
         cap.daemon = True
         cap.start()
     else:
         recording = False
-        audio = np.concatenate(chunks)[:, 0] if chunks else np.zeros(0, dtype=np.float32)
-        threading.Thread(target=handle_safely, args=(audio,)).start()
+        mic_jobs.put("stop")  # the mic thread closes the mic, then hands the audio on
+
+
+mic_jobs, mic_busy = queue.Queue(), 0.0  # "start" / "stop" for mic_thread; when its current job began (0 = idle)
+
+
+def mic_thread():
+    """Opens the mic for each recording and closes it after, so macOS shows its mic icon only while you dictate.
+    Only this thread touches the audio stream: stopping it from the hotkey listener's thread deadlocked CoreAudio."""
+    global mic_busy
+    stream = None
+    while True:
+        job = mic_jobs.get()
+        mic_busy = time.time()
+        try:
+            if job == "start" and stream is None:
+                stream = sd.InputStream(samplerate=RATE, channels=1, dtype="float32", callback=on_audio)
+                stream.start()
+            elif job == "stop" and stream is not None:
+                stream.stop(); stream.close(); stream = None
+                audio = np.concatenate(chunks)[:, 0] if chunks else np.zeros(0, dtype=np.float32)
+                threading.Thread(target=handle_safely, args=(audio,)).start()
+        except Exception as e:  # no input device, device unplugged mid-recording...
+            stream = None
+            print(f"microphone error: {type(e).__name__}: {e}", flush=True)
+            tell(state="error", error=f"microphone: {e}")
+        mic_busy = 0.0
+
+
+def mic_watchdog():
+    while True:
+        time.sleep(1)
+        if mic_busy and time.time() - mic_busy > 5:  # CoreAudio hung (it has before): start over rather than freeze
+            print("Error: the microphone stopped responding, restarting dictation", flush=True)
+            tell(state="error", error="the microphone stopped responding; restarting dictation")
+            os._exit(1)  # Survey Corps starts us again
 
 
 def time_up(t):
@@ -136,10 +171,8 @@ if __name__ == "__main__":
         sys.exit()
     threading.Thread(target=exit_with_parent, daemon=True).start()
     transcribe(np.zeros(RATE, dtype=np.float32))  # load the model up front
-    # ponytail: the mic stays open (macOS shows its mic dot while dictation is on); starting and stopping it
-    # from the hotkey thread deadlocked CoreAudio. On-demand needs its own audio thread if the dot bothers.
-    mic = sd.InputStream(samplerate=RATE, channels=1, dtype="float32", callback=on_audio)  # keep a reference
-    mic.start()
+    for f in (mic_thread, mic_watchdog):
+        threading.Thread(target=f, daemon=True).start()
     tell(state="ready")
     print("Ready. Tap Left Option to dictate.", flush=True)
     with keyboard.Listener(on_press=on_press, on_release=on_release) as l:
