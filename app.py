@@ -21,6 +21,7 @@ DB = DATA / "todos.json"
 CONFIG = DATA / "config.json"  # optional: {"argo_user": "<ANL username>", "argo_model": "claudesonnet55"}
 ARGO = "https://apps.inside.anl.gov/argoapi/v1/chat/completions"
 MODEL, BACKUP = "claudesonnet55", "claudesonnet5"  # default Argo model, and the one tried when it errors
+DICTATE_MODEL = "claudehaiku55"  # tidying dictation: as good as Sonnet in our tests and ~30% faster
 BRIEFED = DATA / "briefed"  # date of the last morning briefing
 RAN = DATA / "routines_ran.json"  # {routine line: date it last ran}
 lock = threading.Lock()
@@ -80,7 +81,8 @@ def config():
 SETTINGS = {  # editable in the app's Settings dialog -> (default, max for ints / None for text)
     "argo_user": ("", None), "argo_model": (MODEL, None), "retry_minutes": (10, 1440),
     "briefing_hour": (8, 24), "library_editor": ("Visual Studio Code", None), "github_token": ("", None),
-    "routines": ("", None), "dictation": (0, 1), "dictate_vocab": ("", None)}
+    "routines": ("", None), "dictation": (0, 1), "dictate_vocab": ("", None),
+    "dictate_model": (DICTATE_MODEL, None)}
 
 
 def get_settings():
@@ -114,9 +116,9 @@ def argo_on():
     return bool(config().get("argo_user"))
 
 
-def argo(prompt, max_tokens, timeout=120, tag="", image=None):
-    """Ask the lab's Argo LLM (with an optional image file it can see). Returns the reply text, or None if unconfigured,
-    down or unreachable (e.g. no VPN)."""
+def argo(prompt, max_tokens, timeout=120, tag="", image=None, model=None):
+    """Ask the lab's Argo LLM (with an optional image file it can see), using model or else the one in Settings.
+    Returns the reply text, or None if unconfigured, down or unreachable (e.g. no VPN)."""
     global argo_ok, argo_at
     cfg = config()
     if not cfg.get("argo_user"):
@@ -129,7 +131,7 @@ def argo(prompt, max_tokens, timeout=120, tag="", image=None):
         return None
     content = prompt if not image else [{"type": "text", "text": prompt},
                                         {"type": "image_url", "image_url": {"url": data_url(image)}}]
-    models = list(dict.fromkeys([cfg.get("argo_model") or MODEL, BACKUP]))
+    models = list(dict.fromkeys([model or cfg.get("argo_model") or MODEL, BACKUP]))
     with busy_lock:
         busy[tag] += 1
     try:
@@ -515,7 +517,8 @@ def dictated(raw, secs=0, vocab=""):
         hint = f"Speech recognition often mishears these words; put them back where they were meant: {vocab}\n\n" if vocab else ""
         # only what's inside the last <clean> is typed, so the model's asides never are; no tag -> the raw transcript
         found = re.findall(r"<clean>(.*?)</clean>", argo(TIDY + hint + f"<text>\n{raw}\n</text>", 1000, timeout=15,
-                                                         tag="dictate") or "", re.S)
+                                                         tag="dictate", model=config().get("dictate_model") or DICTATE_MODEL)
+                           or "", re.S)
         text = found[-1].strip() if found and found[-1].strip() else raw
     dictation["state"] = "ready"
     dictation["log"] = ([{"at": datetime.now().strftime("%H:%M"), "raw": raw, "text": text, "secs": secs}]
@@ -2779,6 +2782,7 @@ nav button.on{background:var(--card);box-shadow:0 1px 2px #0003;font-weight:500}
   <div class=r><label for=dictation>Dictation<small>Tap Left Option, speak, tap it again: the text is typed where your cursor is. Argo tidies it when it's on.</small></label><select id=dictation><option value=0>Off<option value=1>On</select></div>
   <div class=r><label>Status<small id=dstate>&nbsp;</small></label></div>
   <div class=r><label for=dictate_vocab>Words to spell right<small>Names and jargon, comma-separated</small></label><input id=dictate_vocab spellcheck=false placeholder="ptychography, EMPAD, Argonne"></div>
+  <div class=r><label for=dictate_model>Argo model for tidying<small>A small, fast one is plenty. Other features use the model in the Argo tab.</small></label><input id=dictate_model spellcheck=false placeholder=claudehaiku55></div>
   <div class=r style="display:block"><label>Recent<small>Hover one to see what was heard before tidying</small></label><div id=dlog></div></div>
 </div>
 </section>

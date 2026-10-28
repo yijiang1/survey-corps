@@ -373,6 +373,10 @@ assert app.default_due({"date": "yesterday", "added": "2026-10-24T10:00"}) == "2
 # dictation: only Argo's last <clean> block is typed (its asides never are); the raw transcript when it has none
 app.argo_ok, app.argo = True, lambda *a, **kw: "<clean>Sent the slide.</clean>\nWait, keep the tense:\n<clean>Send the slides.</clean>"
 assert app.dictated("um send the uh slides") == "Send the slides." and app.dictation["log"][0]["raw"] == "um send the uh slides"
+assert app.dictation["log"][0]["text"] == "Send the slides."
+asked = []
+app.argo = lambda *a, **kw: asked.append(kw.get("model")) or "<clean>ok</clean>"
+assert app.dictated("ok") == "ok" and asked == [app.DICTATE_MODEL], asked  # its own model, not the app-wide one
 app.argo = lambda *a, **kw: "Here is the cleaned text: Send the slides."
 assert app.dictated("um send the slides") == "um send the slides"
 app.argo = lambda *a, **kw: None
