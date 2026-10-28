@@ -756,12 +756,13 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         if settingsWindow == nil {
             settingsWeb = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
             settingsWeb.navigationDelegate = self
-            settingsWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 540),
-                                      styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            settingsWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 800),
+                                      styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             settingsWindow.title = "Settings"
             settingsWindow.contentView = settingsWeb
             settingsWindow.center()
-            settingsWindow.setFrameAutosaveName("settings")
+            settingsWindow.contentMinSize = NSSize(width: 520, height: 400)
+            settingsWindow.setFrameAutosaveName("settings-v2")  // new name: the old one remembers the old, smaller size
             settingsWindow.isReleasedWhenClosed = false
             settingsWeb.load(URLRequest(url: settingsURL))
         }
