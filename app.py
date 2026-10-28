@@ -56,13 +56,23 @@ def email_text(msg):
     return re.sub(r"\s*\n\s*\n\s*", "\n\n", text).strip()
 
 
+def first_json(text):
+    """The first JSON object in a model's reply, or None. Not a greedy {.*}: a reply with two objects (or a stray brace
+    in its prose) would span them all and fail to parse."""
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\{", text or ""):
+        try:
+            d = dec.raw_decode(text, m.start())[0]
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            return d
+    return None
+
+
 def clean_suggestion(text, now):
     """Pull {"labels", "due", "title", "actions"} out of the model's reply, dropping anything malformed or already past."""
-    m = re.search(r"\{.*\}", text, re.S)
-    try:
-        d = json.loads(m.group(0)) if m else {}
-    except ValueError:
-        return {}
+    d = first_json(text) or {}
     labels = [str(x).strip() for x in d.get("labels") or [] if str(x).strip()][:3]
     due = str(d.get("due") or "")
     try:
@@ -281,11 +291,8 @@ def make_todo(raw, name):
 
 def clean_shot(text):
     """{"title", "sender", "date", "text"} from the model's reply; None if it isn't that JSON."""
-    try:
-        d = json.loads(re.search(r"\{.*\}", text, re.S).group())
-    except (AttributeError, ValueError):
-        return None
-    if not isinstance(d, dict):
+    d = first_json(text)
+    if d is None:
         return None
     return {k: str(d.get(k) or "").strip()[:3000 if k == "text" else 200] for k in ("title", "sender", "date", "text")}
 
@@ -1487,11 +1494,7 @@ def feed_to_lib(x):
 
 def clean_lib_suggestion(text):
     """{"summary", "labels"} from the model's reply."""
-    m = re.search(r"\{.*\}", text or "", re.S)
-    try:
-        d = json.loads(m.group(0)) if m else {}
-    except ValueError:
-        return {}
+    d = first_json(text) or {}
     labels = [str(x).strip() for x in d.get("labels") or [] if 0 < len(str(x).strip()) <= 24][:3]
     return {"summary": flat(str(d.get("summary") or ""), 300), "labels": labels}
 
@@ -1702,11 +1705,7 @@ def lib_ask(q, steps=6):
             + "\n\nWhat you did so far:\n" + ("\n\n".join(log) or "(nothing yet)"), 700, timeout=60, tag="lib:ask")
         if reply is None:
             return None
-        m = re.search(r"\{.*\}", reply, re.S)
-        try:
-            d = json.loads(m.group(0)) if m else {}
-        except ValueError:
-            d = {}
+        d = first_json(reply) or {}
         if "answer" in d or last or not d:
             refs = [str(r) for r in d.get("refs") or []] if d else []
             answer = str(d.get("answer") or "") if d else reply.strip()

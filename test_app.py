@@ -120,6 +120,11 @@ assert r["answer"] == "Bob sent it." and [x["ref"] for x in r["refs"]] == ["task
 assert r["steps"][0] == "Searched “beamtime proposal”" and "draft due" in seen[2] and "Beamtime proposal" in seen[1]
 app.argo = lambda prompt, n, **kw: None
 assert app.lib_ask("x?") is None
+# a reply repeating its action (seen from Argo) is still that action, not shown as the answer
+turns = iter(['<invoke name="json">\n```json\n{"spotlight": "zzqq"}\n```\nOops.\n{"spotlight": "zzqq"}', '{"answer": "none", "refs": []}'])
+app.argo = lambda prompt, n, **kw: next(turns)
+assert app.lib_ask("ptycho papers?") == {"answer": "none", "refs": [], "steps": ["Spotlight “zzqq”"]}
+assert app.first_json('x {bad} {"a": 1} {"b": 2}') == {"a": 1} and app.first_json("no json [1]") is None
 print("ok")
 
 # links in the Library: read by Scout's link reader, deduped by address; a bad link is skipped with why
