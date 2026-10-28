@@ -51,9 +51,14 @@ def paste(text):
 chunks, recording, take = [], False, 0  # take: which recording this is, so a cap timer only stops its own
 
 
+live = threading.Event()  # set by a recording's first real (not silent) audio
+
+
 def on_audio(data, *_):
     if recording:
         chunks.append(data.copy())
+        if data.any():
+            live.set()
 
 
 tapped, combo = 0.0, False
@@ -78,8 +83,8 @@ def toggle():
     if not recording:
         chunks.clear()
         recording, take = True, take + 1
-        mic_jobs.put("start")
-        threading.Thread(target=tell, kwargs={"state": "recording"}).start()
+        live.clear()
+        mic_jobs.put("start")  # the mic thread reports "recording" once sound really comes in
         cap = threading.Timer(MAX_SECS, time_up, args=(take,))
         cap.daemon = True
         cap.start()
@@ -101,8 +106,14 @@ def mic_thread():
         mic_busy = time.time()
         try:
             if job == "start" and stream is None:
+                sd._terminate(); sd._initialize()  # 5 ms: use macOS's mic now (e.g. AirPods connected since we started)
                 stream = sd.InputStream(samplerate=RATE, channels=1, dtype="float32", callback=on_audio)
                 stream.start()
+                # AirPods send ~1 s of pure silence while switching to call mode: the pill turns red (and the
+                # sound mutes) only when real sound arrives, so you know when to talk. 2 s cap: a mic that's
+                # not allowed stays silent, and stopping then reports that.
+                live.wait(2)
+                tell(state="recording")
             elif job == "stop" and stream is not None:
                 stream.stop(); stream.close(); stream = None
                 audio = np.concatenate(chunks)[:, 0] if chunks else np.zeros(0, dtype=np.float32)
