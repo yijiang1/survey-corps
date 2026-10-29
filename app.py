@@ -538,6 +538,8 @@ def dictation_watch(p):
         if "not trusted" in line or "not allowed to send keystrokes" in line:
             dictation["error"] = PERMS
         tail = (tail + [line])[-5:] if line else tail
+        if line:  # its last lines, for /api/dictate: what happened to a take that typed nothing ("too quiet"...)
+            dictation["out"] = (dictation.get("out", []) + [time.strftime("%H:%M:%S ") + line])[-20:]
     p.wait()
     if not getattr(p, "stopped", False):  # the last error line it printed (a traceback's), else just the exit code
         msg = next((l for l in reversed(tail) if re.search(r"Error|Exception", l)), f"exited unexpectedly (code {p.returncode})")
@@ -1925,7 +1927,7 @@ class H(BaseHTTPRequestHandler):
             if "text" in d:
                 return self.reply(200, json.dumps({"text": dictated(str(d["text"]), d.get("secs", 0),
                                                                     str(d.get("vocab", "")))}).encode())
-            dictation["state"] = d.get("state") if d.get("state") in ("ready", "recording", "transcribing", "error") else "ready"
+            dictation["state"] = d.get("state") if d.get("state") in ("ready", "recording", "transcribing", "error", "quiet") else "ready"
             mute_for_dictation(dictation["state"] == "recording")
             if "error" in d or d.get("state") == "recording":  # a new recording clears the last one's error
                 dictation["error"] = str(d.get("error", ""))
@@ -2902,7 +2904,7 @@ $('test').onclick=async()=>{
   res.textContent=!st.configured?'No username set':st.argo?'Argo is reachable':'Unreachable: Argo is down, or you are off VPN';
 };
 const SAY={off:'Off',starting:'Loading the speech model…',ready:'Ready',recording:'● Recording',
-  transcribing:'Transcribing…',tidying:'Argo is tidying it…',error:'Stopped'};
+  transcribing:'Transcribing…',tidying:'Argo is tidying it…',error:'Stopped',quiet:'Too quiet, nothing typed'};
 let shown='';
 async function dict(){
   const d=await (await fetch('/api/dictate')).json(), s=$('dstate');

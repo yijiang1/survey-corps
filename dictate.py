@@ -150,7 +150,8 @@ def handle(audio):
                                          "Privacy & Security → Microphone, then reopen it")
     if level < MIN_LEVEL:
         print(f"[level {level:.3f}] too quiet, skipped", flush=True)
-        return tell(state="ready")
+        # say so: usually macOS switched to a mic you aren't using (AirPods in their case)
+        return tell(state="quiet", error="heard on " + sd.query_devices(kind="input")["name"])
     tell(state="transcribing")
     t = time.time()
     raw = transcribe(audio)

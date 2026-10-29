@@ -720,9 +720,10 @@ class DictationHUD: NSPanel {
                      "transcribing": ("Transcribing", "Decoding the report…"),
                      "tidying": ("Argo is tidying", "Fixing words and punctuation…"),
                      "error": ("Dictation stopped", detail.isEmpty ? "See Settings → Dictation" : detail),
-                     "down": ("Backend down", "Quit and reopen Survey Corps")]
+                     "down": ("Backend down", "Quit and reopen Survey Corps"),
+                     "quiet": ("Too quiet, skipped", detail.isEmpty ? "Check which mic is on" : detail.prefix(1).uppercased() + detail.dropFirst())]
         guard let (title, sub) = lines[s] else { return orderOut(nil) }
-        let alert = s == "error" || s == "down"  // an amber flare, shown for 8 s: there's nothing to wait for
+        let alert = ["error", "down", "quiet"].contains(s)  // an amber flare, shown for 8 s: there's nothing to wait for
         label.attributedStringValue = NSAttributedString(string: title.uppercased(), attributes: [  // like a written order
             .font: NSFont.systemFont(ofSize: 12, weight: .bold), .kern: 1.6, .foregroundColor: hudColor(alert ? 0xf5c451 : 0xf3e6c8)])
         hint.stringValue = sub
