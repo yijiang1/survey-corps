@@ -1457,8 +1457,8 @@ def lib_link(url):
     return link_item(url)
 
 
-def lib_add(paths, split=False, group=""):
-    """Add paths (each subfolder of them instead, with split). Returns (items added, paths skipped with why)."""
+def lib_add(paths, split=False, group="", labels=()):
+    """Add paths (each subfolder of them instead, with split), with any labels you gave (Argo then leaves labels alone). Returns (items added, paths skipped with why)."""
     want, skipped = [], []
     for raw in filter(str.strip, paths):
         r = raw.strip().strip("'\"")  # Finder's "Copy as Pathname" may come quoted
@@ -1484,7 +1484,7 @@ def lib_add(paths, split=False, group=""):
             if (link["url"] if link else str(p.resolve())) in have:
                 skipped.append(f"{link['title'] if link else p.name}: already in the Library")
             else:
-                new.append(lib_item(p, group, link))
+                new.append({**lib_item(p, group, link), "labels": sorted(set(labels))})
                 have.add(new[-1]["path"])
         lib["items"] = new + lib["items"]
         if group and group not in lib["groups"]:
@@ -1983,7 +1983,8 @@ class H(BaseHTTPRequestHandler):
             return self.reply(200, json.dumps({"title": x["title"], "existing": existed}).encode())
         if u.path == "/api/library/add":  # {"paths": [...], "split": bool, "group": ""}
             d = json.loads(raw or b"{}")
-            new, skipped = lib_add(d.get("paths") or [], bool(d.get("split")), str(d.get("group") or "").strip())
+            labels = [l for l in (str(x).strip()[:24] for x in d.get("labels") or []) if l]
+            new, skipped = lib_add(d.get("paths") or [], bool(d.get("split")), str(d.get("group") or "").strip(), labels)
             return self.reply(200, json.dumps({"added": [x["name"] for x in new], "skipped": skipped}).encode())
         if u.path == "/api/library/ask":  # agentic search across everything
             res = lib_ask(json.loads(raw or b"{}").get("q", ""))
@@ -3112,7 +3113,7 @@ dialog#adddlg{width:min(580px,calc(100vw - 32px))}
 .sheet textarea{background:var(--bg);border:1px solid var(--line);font-size:12.5px;font-family:ui-monospace,Menlo,monospace}
 .sheet textarea:focus{box-shadow:0 0 0 3px #0a84ff26}
 .opt{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:12.5px;color:var(--muted)}.opt label{display:flex;gap:6px;align-items:center}
-.opt select{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:3px 6px}
+.opt select,.opt input:not([type]){background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:3px 6px}.opt label:has(#a_labels){flex:1 1 100%}.opt #a_labels{flex:1;color:var(--text);font:inherit}
 .alog{font-size:12.5px;margin-top:8px;overflow-wrap:anywhere}.alog.bad{color:var(--red)}
 .zone{display:flex;align-items:center;gap:14px;margin-top:14px;padding:14px 16px;border:1.5px dashed var(--line);border-radius:12px;background:var(--bg)}
 .zone[hidden]{display:none}.zone small{display:block;color:var(--muted);font-size:12px;margin-top:6px}
@@ -3184,7 +3185,8 @@ main h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(-
     <div class=lbl><b>Or paste paths and links</b><small>one per line · ⌥⌘C in Finder copies a path</small></div>
     <textarea id=a_paths rows=3 placeholder="~/Research/Projects/ptychography&#10;https://arxiv.org/abs/…  ·  YouTube  ·  GitHub  ·  any page or PDF"></textarea>
     <div class=opt><label><input type=checkbox id=a_split> Add each subfolder as its own item</label>
-      <label>Type <select id=a_grp></select></label></div><div id=a_log></div></div>
+      <label>Type <select id=a_grp></select></label>
+      <label>Labels <input id=a_labels list=labels placeholder="Argo picks if empty · comma-separated"></label></div><div id=a_log></div></div>
   <div class=pf><span class=msg></span><button type=button class=btn id=a_close>Close</button><button class="btn primary" id=a_save>Add</button></div>
 </form></dialog>
 <dialog id=mdlg class=sheet><form id=mform>
@@ -3546,7 +3548,7 @@ function openManage(){drawManage();mdlg.showModal()}
 mform.onsubmit=e=>{e.preventDefault();mdlg.close()};
 mdlg.addEventListener('focusout',()=>setTimeout(()=>{if(mdlg.open&&!mdlg.contains(document.activeElement))drawManage()}));
 // ---- add ----
-addbtn.onclick=()=>{a_paths.value='';a_log.replaceChildren();a_save.disabled=false;
+addbtn.onclick=()=>{a_paths.value='';a_labels.value='';a_log.replaceChildren();a_save.disabled=false;
   a_grp.replaceChildren(new Option('Automatic',''),...lib.groups.map(g=>new Option(g)));adddlg.showModal();a_paths.focus()};
 a_close.onclick=()=>adddlg.close();
 const picker=window.webkit?.messageHandlers?.choose;  // only in the Mac app
@@ -3563,7 +3565,7 @@ function added(j){
 aform.onsubmit=async e=>{
   e.preventDefault();const paths=a_paths.value.split('\n').filter(s=>s.trim());if(!paths.length)return;
   a_save.disabled=true;a_log.replaceChildren(el('div','alog','Reading…'));
-  const r=await fetch('/api/library/add',{method:'POST',body:JSON.stringify({paths,split:a_split.checked,group:a_grp.value})});
+  const r=await fetch('/api/library/add',{method:'POST',body:JSON.stringify({paths,split:a_split.checked,group:a_grp.value,labels:a_labels.value.split(',').map(s=>s.trim()).filter(Boolean)})});
   const j=await r.json();a_log.replaceChildren(...added(j));a_save.disabled=false;load();
   if(!j.skipped.length){a_paths.value='';setTimeout(()=>adddlg.close(),1200)}
 };
