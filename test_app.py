@@ -300,6 +300,7 @@ print("ok")
 # Claude sessions without hooks (the desktop app's) come from their transcripts; closed ones and hooked ones don't repeat
 d = app.CLAUDE / "proj"; d.mkdir()
 (d / "desk.jsonl").write_text(json.dumps({"type": "user", "cwd": "/x/proj", "entrypoint": "claude-desktop"}) + "\n"
+                              + json.dumps({"type": "system", "subtype": "stop_hook_summary"}) + "\n"
                               + json.dumps({"type": "custom-title", "customTitle": "My chat"}) + "\n"
                               + json.dumps({"type": "ai-title", "aiTitle": "Claude's guess"}) + "\n")  # re-written after a rename
 (d / "oneshot.jsonl").write_text(json.dumps({"type": "user", "cwd": "/x/p", "entrypoint": "sdk-cli"}) + "\n")
@@ -307,10 +308,13 @@ d = app.CLAUDE / "proj"; d.mkdir()
 iso = lambda secs_ago: datetime.utcfromtimestamp(_t.time() - secs_ago).isoformat() + "Z"
 (d / "opened.jsonl").write_text(json.dumps({"type": "user", "timestamp": iso(3 * 86400), "cwd": "/x/o", "entrypoint": "claude-desktop"}) + "\n"
                                 + json.dumps({"type": "cost-state"}) + "\n")  # only opened today: fresh mtime, old activity
-(d / "ten.jsonl").write_text(json.dumps({"type": "user", "timestamp": iso(600), "cwd": "/x/ten", "entrypoint": "claude-desktop"}) + "\n")
+(d / "ten.jsonl").write_text(json.dumps({"type": "user", "timestamp": iso(600), "cwd": "/x/ten", "entrypoint": "claude-desktop"}) + "\n"
+                             + json.dumps({"type": "system", "subtype": "stop_hook_summary", "timestamp": iso(600)}) + "\n")
+(d / "long.jsonl").write_text(json.dumps({"type": "user", "timestamp": iso(900), "cwd": "/x/long", "entrypoint": "claude-desktop"}) + "\n"
+                              + json.dumps({"type": "api-request", "timestamp": iso(480)}) + "\n")  # 8 min writing a long reply
 app.cc.clear(); app.cc_ended.add("gone")
-assert [(a["where"], a["state"], a["mins"]) for a in app.agents() if a["tool"] != "Codex"] == [("My chat", "working", 0), ("ten", "idle", 10)]
-assert [a["state"] for a in app.agents(now=_t.time() + 120) if a["tool"] == "Claude app"] == ["idle", "idle"]
+assert [(a["where"], a["state"], a["mins"]) for a in app.agents() if a["tool"] != "Codex"] == [("My chat", "working", 0), ("long", "working", 8), ("ten", "idle", 10)]
+assert [a["state"] for a in app.agents(now=_t.time() + 120) if a["tool"] == "Claude app"] == ["working", "idle", "idle"]
 print("ok")
 
 # cache warning: once per cache period, only in the last 5 minutes

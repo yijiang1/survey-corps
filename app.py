@@ -626,10 +626,11 @@ def agent_event(e, tool="cc", pid=0, host=""):
 
 
 def transcript_info(transcript):
-    """{"cwd", "title", "entry", "last", "cached_until"} from the tail of a Claude Code transcript. last: the newest
+    """{"cwd", "title", "entry", "last", "cached_until", "turn"} from the tail of a Claude Code transcript. last: the newest
     timestamped entry (the desktop app also rewrites a file's metadata when you only open it, so mtime isn't activity).
-    cached_until: when its prompt cache runs out = last API call + the TTL that call wrote (1 h or 5 min); 0 if unknown."""
-    out, ai = {"cwd": "", "title": "", "entry": "", "last": 0, "cached_until": 0}, ""
+    cached_until: when its prompt cache runs out = last API call + the TTL that call wrote (1 h or 5 min); 0 if unknown.
+    turn: "mid" while a turn runs (the log can sit still for minutes while Claude writes a long reply), else "end"."""
+    out, ai = {"cwd": "", "title": "", "entry": "", "last": 0, "cached_until": 0, "turn": ""}, ""
     try:
         with transcript.open("rb") as f:
             head = f.read(65536).decode(errors="ignore")  # cwd: where it started (a session can cd away later)
@@ -644,6 +645,10 @@ def transcript_info(transcript):
             out["cwd"], out["entry"] = out["cwd"] or d.get("cwd") or "", out["entry"] or d.get("entrypoint") or ""
             if not out["last"] and d.get("timestamp"):
                 out["last"] = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
+            if not out["turn"] and d.get("type") in ("user", "assistant", "api-request", "system"):
+                end = d.get("subtype") == "stop_hook_summary" or (d.get("message") or {}).get("stop_reason") == "end_turn" \
+                    or "[Request interrupted" in line
+                out["turn"] = "end" if end else "mid" if d["type"] != "system" else ""
             if not out["cached_until"] and d.get("type") == "assistant" and d["message"].get("usage"):
                 made = d["message"]["usage"].get("cache_creation") or {}
                 ttl = 300 if made.get("ephemeral_5m_input_tokens") and not made.get("ephemeral_1h_input_tokens") else 3600
@@ -810,8 +815,9 @@ def agents(now=None):
         if sid in cc or sid in cc_ended or t["entry"].startswith("sdk") or age > WINDOW:
             continue  # tracked by hooks, closed, `claude -p` and scripted runs, or only opened, not used
         dk = desktop_session(sid) if t["entry"] == "claude-desktop" else {}
+        # ponytail: a turn silent 30 min reads idle (crashed, or stuck on a prompt the log doesn't show); hooks know better
         out.append(row(now, remote_tool(host) if host else "Claude app" if t["entry"] == "claude-desktop" else "Claude Code",
-                       dk.get("title") or t["title"] or Path(t["cwd"]).name or "?", "working" if age < 60 else "idle", age,
+                       dk.get("title") or t["title"] or Path(t["cwd"]).name or "?", "working" if age < 60 or (t.get("turn") == "mid" and age < 1800) else "idle", age,
                        remote_open(host, t["cwd"]) if host else f"claude://claude.ai/epitaxy/{dk['id']}" if dk else "",
                        host, t["cwd"], sid, t["cached_until"]))
     for tid, name, cwd, rollout, ms in codex_threads(now - WINDOW):
