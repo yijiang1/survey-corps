@@ -415,11 +415,27 @@ def ask(q):
                 f"If they don't contain the answer, say so.\n\nQuestion: {q}\n\n{ctx}", 2000, timeout=90, tag="ask")
 
 
-def ask_mail(t, q):
-    """Answer a question about one saved email."""
-    return argo(f"Today is {datetime.now():%A %Y-%m-%d}. Answer my question about the email below. Be brief and plain text. "
-                f"If the email doesn't say, say so.\n\nQuestion: {q}\n\nFrom: {t['sender']}\nDate: {t['date']}\n"
-                f"Subject: {t['title']}\n\n{t['body']}", 1500, timeout=90, tag=t["id"])
+def ask_one(what, q, ctx, tag):
+    """Answer a question about one task, email or Library item, from its text."""
+    return argo(f"Today is {datetime.now():%A %Y-%m-%d}. Answer my question about the {what} below. Be brief and plain text. "
+                f"If it doesn't say, say so (you may add general knowledge, marked as such).\n\nQuestion: {q}\n\n{ctx}",
+                1500, timeout=90, tag=tag)
+
+
+def ask_task(t, q):
+    ctx = "\n".join(f"{k}: {v}" for k, v in [("From", t["sender"]), ("Date", t["date"]), ("Subject" if t["eml"] else "Task", t["title"]),
+                                             ("Due", t["due"]), ("Status", "done" if t["done"] else "open"),
+                                             ("Labels", ", ".join(t.get("labels", []))), ("Action items", "; ".join(t.get("actions", []))),
+                                             ("My notes", t["note"])] if v)
+    return ask_one("email" if t["eml"] else "task", q, ctx + "\n\n" + t["body"], t["id"])
+
+
+def ask_lib(x, q):
+    # ponytail: first 30k chars of a file/folder (a link: its README/description/page start); chunk if long papers miss answers
+    text = "\n".join(filter(None, [x["peek"], link_text(x["path"], x["src"])])) if x.get("src") else peek(x["path"], 30000) or x["peek"]
+    ctx = "\n".join(f"{k}: {v}" for k, v in [("Name", x["name"]), ("Type", x["group"]), ("Where", x["path"]),
+                                             ("Labels", ", ".join(x["labels"])), ("Summary", x["summary"]), ("My notes", x["note"])] if v)
+    return ask_one("item from my library", q, ctx + "\n\nContents:\n" + text, x["id"])
 
 
 def briefing():
@@ -593,9 +609,9 @@ def agent_event(e, tool="cc", pid=0, host=""):
     host: "user@host" when the hook ran on a remote machine (through tunnel()); its pid and transcript aren't ours."""
     where = Path(e.get("cwd") or "?").name
     if tool == "codex":
-        src = codex_query("select thread_source from threads where id = ?", (str(e.get("thread-id")),))
-        if src and src[0][0] != "user":
-            return  # Codex's own Guardian review of an approval, which finishes right after your prompt; not your thread
+        src = codex_query("select (select thread_source from threads where id = ?)", (str(e.get("thread-id")),))
+        if src and src[0][0] != "user":  # [] only if the list is unreadable; None: a thread it doesn't list
+            return  # Codex's own Guardian review of an approval, or the unlisted turn that names your new thread; not yours
         if e.get("type") == "agent-turn-complete":
             msg = flat(str(e.get("last-assistant-message") or ""), 90)
             threading.Thread(target=say, args=("levi", "Codex", f"Finished in {where}" + (f": {msg}" if msg else "")), daemon=True).start()
@@ -1400,33 +1416,33 @@ def save_lib(lib):
     tmp.replace(LIB)
 
 
-def peek(p):
-    """A few KB that say what a path is (for search and for Argo): a folder's listing + README, or a file's text."""
+def peek(p, n=3000):
+    """A few KB (n chars) that say what a path is (for search and for Argo): a folder's listing + README, or a file's text."""
     p = Path(p)
     try:
         if p.is_dir():
             kids = sorted((x for x in p.iterdir() if not x.name.startswith(".")), key=lambda x: x.name.lower())
             readme = next((x for x in kids if x.name.lower().startswith("readme") and x.is_file()), None)
             return ("Contains: " + ", ".join(x.name + "/" * x.is_dir() for x in kids[:60]) + " …" * (len(kids) > 60)
-                    + ("\n\n" + peek(readme) if readme else ""))[:3000]
+                    + ("\n\n" + peek(readme, n) if readme else ""))[:n]
         ext = p.suffix.lower()[1:]
         if ext in TEXT_EXT:
             with open(p, errors="replace") as f:
-                return f.read(3000)
+                return f.read(n)
         if ext in ("docx", "doc", "rtf", "rtfd", "odt", "webarchive"):
             out = subprocess.run(["textutil", "-convert", "txt", "-stdout", p], capture_output=True, timeout=30).stdout
-            return out.decode("utf-8", "replace")[:3000]
+            return out.decode("utf-8", "replace")[:n]
         if ext == "pdf":  # PDFKit through JavaScript for Automation: no compiler or extra package needed
             out = subprocess.run(["osascript", "-l", "JavaScript", "-e", 'function run(a){ObjC.import("Quartz");'
                                   'const d=$.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(a[0]));'
-                                  'return d.isNil()?"":d.string.js.slice(0,3000)}', p], capture_output=True, timeout=30).stdout
+                                  'return d.isNil()?"":d.string.js.slice(0,+a[1])}', p, str(n)], capture_output=True, timeout=30).stdout
             if out.strip():
-                return out.decode("utf-8", "replace").strip()[:3000]
+                return out.decode("utf-8", "replace").strip()[:n]
         # the rest (and scanned PDFs without a text layer): Spotlight's title/authors only
         out = subprocess.run(["mdls", "-name", "kMDItemTitle", "-name", "kMDItemAuthors", "-name", "kMDItemDescription", p],
                              capture_output=True, timeout=10).stdout.decode("utf-8", "replace")
         lines = re.sub(r"\s*kMDItem(\w+) = ", r"\n\1: ", " ".join(out.split())).splitlines()  # "Title: ...", "Authors: ..."
-        return "\n".join(" ".join(re.sub(r'[()"]', "", l).split()) for l in lines if l.strip() and "(null)" not in l)[:3000]
+        return "\n".join(" ".join(re.sub(r'[()"]', "", l).split()) for l in lines if l.strip() and "(null)" not in l)[:n]
     except Exception:
         return ""
 
@@ -1938,13 +1954,16 @@ class H(BaseHTTPRequestHandler):
             if "error" in d or d.get("state") == "recording":  # a new recording clears the last one's error
                 dictation["error"] = str(d.get("error", ""))
             return self.reply(200)
-        if u.path == "/api/ask":  # {"q"}: across all tasks, or {"q", "id"}: about that one email
+        if u.path == "/api/ask":  # {"q"}: across all tasks, {"q", "id"}: about that one task, {"q", "lib"}: one Library item
             d = json.loads(raw or b"{}")
             with lock:
                 t = next((x for x in load() if x["id"] == d.get("id")), None)
-            if d.get("id") and not t:
+            with lib_lock:
+                x = next((x for x in load_lib()["items"] if x["id"] == d.get("lib")), None)
+            if d.get("id") and not t or d.get("lib") and not x:
                 return self.reply(404)
-            answer = ((ask_mail(t, d.get("q", "")) if t else ask(d.get("q", ""))) or "").replace("**", "")  # plain-text box
+            q = str(d.get("q", ""))
+            answer = ((ask_task(t, q) if t else ask_lib(x, q) if x else ask(q)) or "").replace("**", "")  # plain-text box
             return self.reply(200, json.dumps({"answer": answer}).encode()) if answer else self.reply(503)
         if u.path.startswith("/api/reply/"):
             with lock:
@@ -2332,7 +2351,7 @@ function item(t){
     }
     $('.meta').after(a);
   }
-  const am=$('details .askm'),aa=$('.askans'); $('.askw').hidden=!t.body;
+  const am=$('details .askm'),aa=$('.askans'); 
   am.onkeydown=async e=>{const v=am.value.trim();if(e.key!=='Enter'||!v)return;
     aa.hidden=false;aa.textContent='Asking Argo…';
     const res=await fetch('/api/ask',{method:'POST',body:JSON.stringify({q:v,id:t.id})}).catch(()=>({}));
@@ -3085,6 +3104,9 @@ details summary{display:inline-block;font-size:12px;color:var(--muted);cursor:po
 details summary::-webkit-details-marker{display:none}
 details summary::before{content:"›";display:inline-block;margin-right:5px;transition:transform .15s}
 details[open] summary::before{transform:rotate(90deg)}
+.c .askm{display:block;width:100%;box-sizing:border-box;margin-top:6px;background:var(--bg);border:1px solid color-mix(in srgb,var(--accent) 35%,transparent);border-radius:8px;padding:7px 10px;outline:none;font:inherit;font-size:13px}
+.c .askm[hidden]{display:none}.c .askm:focus{border-color:var(--accent)}
+.c .askans{white-space:pre-wrap;margin-top:6px;padding:6px 10px;border-left:3px solid var(--accent);font-size:13px}
 textarea,.pathin{width:100%;background:var(--bg);border:1px solid transparent;border-radius:8px;padding:8px 10px;outline:none}
 textarea{resize:vertical;margin-top:6px}textarea:focus,.pathin:focus{border-color:var(--accent)}.pathin{margin-top:6px;font-size:12px}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 ui-monospace,Menlo,monospace;max-height:260px;overflow:auto;
@@ -3317,7 +3339,8 @@ function card(x){
     <div class=meta><span class=argoing>✨ Argo is reading this…</span><select class=grp title="Type (set automatically; change it any time)"></select><span class=chips></span>
       <input class=addl list=labels placeholder="+ label"><span class=path></span></div>
     <div class=why></div><div class=rel></div><details><summary>Notes &amp; contents</summary><textarea rows=2 placeholder="Notes…"></textarea>
-      <input class=pathin spellcheck=false title="Path on disk (fix it here if you moved the item)"><pre></pre></details></div>
+      <input class=pathin spellcheck=false title="Path on disk (fix it here if you moved the item)">
+      <input class=askm placeholder="✨ Ask Argo about this, e.g. What's the main result? (press Enter)"><div class=askans hidden></div><pre></pre></details></div>
     <div class=side><button class=icon data-a=open title="Open">${I.open}</button><button class=icon data-a=reveal title="Show in Finder">${I.reveal}</button>
       <button class=icon data-a=edit title="Open in ${lib.editor}">${I.edit}</button><button class=icon data-a=terminal title="Open in Terminal">${I.term}</button>
       <button class=icon data-a=copy title="Copy path">${I.copy}</button><button class="icon x" title="Remove from Library (the file stays on disk)">${I.x}</button></div>`;
@@ -3345,6 +3368,11 @@ function card(x){
     why.append(x.summary.slice(i))}else why.remove();
   related($('.rel'),x);
   const n=$('textarea');n.value=x.note;n.onchange=()=>up({note:n.value});
+  const am=$('.askm'),aa=$('.askans');am.hidden=!st.configured;
+  am.onkeydown=async e=>{const v=am.value.trim();if(e.key!=='Enter'||!v)return;
+    aa.hidden=false;aa.textContent='Asking Argo…';
+    const res=await fetch('/api/ask',{method:'POST',body:JSON.stringify({q:v,lib:x.id})}).catch(()=>({}));
+    aa.textContent=res.ok?(await res.json()).answer:'Argo is unavailable right now (down, or not on VPN). Try again later.'};
   const pi=$('.pathin');pi.value=x.path;pi.onchange=()=>pi.value.trim()&&up({path:pi.value});
   if(x.peek)$('pre').textContent=x.peek;else $('pre').remove();
   $('summary').textContent='Notes & contents'+(x.note?' ✎':'');

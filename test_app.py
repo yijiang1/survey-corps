@@ -100,8 +100,14 @@ app.say("scout", "Scout", "2 new picks")
 assert app.pets()["bubbles"][-1]["text"] == "2 new picks" and app.pets(after=app.bubbles[-1]["id"])["bubbles"] == []
 seen = []
 app.argo = lambda prompt, n, **kw: seen.append(prompt) or "Friday."
-assert app.ask_mail({**app.blank(), "title": "Beamtime", "body": "Slot is Friday", "sender": "Bob", "date": ""}, "when?") == "Friday."
-assert "Question: when?" in seen[-1] and "Slot is Friday" in seen[-1]
+assert app.ask_task({**app.blank(), "title": "Beamtime", "body": "Slot is Friday", "sender": "Bob", "date": "", "eml": True}, "when?") == "Friday."
+assert "Question: when?" in seen[-1] and "Slot is Friday" in seen[-1] and "email" in seen[-1]
+app.ask_task({**app.blank(), "title": "Fix the GUI", "note": "use Qt", "sender": "", "date": "", "body": "", "eml": False}, "how?")  # a plain task: its notes count
+assert "Task: Fix the GUI" in seen[-1] and "My notes: use Qt" in seen[-1]
+doc = Path(tempfile.mkdtemp()) / "plan.md"
+doc.write_text("intro\n" + "x" * 5000 + "\nThe budget is $40k.")
+app.ask_lib(app.lib_item(doc), "budget?")  # reads past the 3000-char peek
+assert "$40k" in seen[-1] and "Name: plan.md" in seen[-1]
 print("ok")
 
 # shared labels: renaming cascades; agentic search runs tools then resolves refs, never leaking hidden paths
@@ -234,13 +240,14 @@ ev("Stop")
 _t.sleep(0.2)  # bubbles are said from a thread
 assert app.cc["s1"]["state"] == "idle" and said == [("Claude Code", "Needs you in proj: Claude needs your permission to use Bash"),
                                                     ("Claude Code", "Finished in proj")], said
-app.agent_event({"type": "agent-turn-complete", "cwd": "/y/cdx", "last-assistant-message": "Done."}, "codex"); _t.sleep(0.2)
+app.agent_event({"type": "agent-turn-complete", "thread-id": "t1", "cwd": "/y/cdx", "last-assistant-message": "Done."}, "codex"); _t.sleep(0.2)
 assert said[-1] == ("Codex", "Finished in cdx: Done.")
 n = len(said)
 app.agent_event({"type": "agent-turn-complete", "thread-id": "t2", "cwd": "/y/cdx", "last-assistant-message": "ok"}, "codex")
+app.agent_event({"type": "agent-turn-complete", "thread-id": "tx", "cwd": "/y/cdx", "last-assistant-message": '{"title":"x"}'}, "codex")
 app.agent_event({"type": "agent-turn-complete", "thread-id": "t1", "cwd": "/y/cdx", "last-assistant-message": "Built."}, "codex")
 _t.sleep(0.2)
-assert said[n:] == [("Codex", "Finished in cdx: Built.")], said[n:]  # t2 is Codex's own Guardian review: silent
+assert said[n:] == [("Codex", "Finished in cdx: Built.")], said[n:]  # t2 (Codex's Guardian review) and tx (its unlisted title turn): silent
 ev("SessionEnd")
 assert "s1" not in app.cc and [a["tool"] for a in app.agents()] == ["Codex"]
 assert app.agents(now=_t.time() + 120)[0]["state"] == "idle" and app.agents(now=_t.time() + 13 * 3600) == []
