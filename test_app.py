@@ -413,3 +413,9 @@ app.config, app.argo = lambda: fixes, lambda p, *a, **kw: prompts.append(p) or "
 assert app.dictated("Taichi") == "PtyChi" and 'wrote "Taichi" for "PtyChi"' in prompts[0], prompts
 app.config = cfg
 print("ok")
+
+import urllib.error
+assert app.short_error(urllib.error.HTTPError("u", 403, "x", {}, None)) == "rate-limited"
+assert app.short_error(urllib.error.URLError("[Errno 8] nodename")) == "no connection"
+assert app.short_error(TimeoutError("The read operation timed out")) == "timed out"
+print("ok")

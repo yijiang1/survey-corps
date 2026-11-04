@@ -1251,6 +1251,17 @@ def rank(items, cfg, liked, disliked):
     return clean_scores(argo(prompt, 100 * len(items) + 200, tag="scout"), known)
 
 
+def short_error(e):
+    """A few words on why a fetch failed, for the Scout warning line."""
+    if isinstance(e, urllib.error.HTTPError):
+        return "rate-limited" if e.code in (403, 429) else f"HTTP {e.code}"
+    if "timed out" in str(e):
+        return "timed out"
+    if isinstance(e, urllib.error.URLError):
+        return "no connection"
+    return str(e)[:60]
+
+
 def run_scout():
     """Fetch every source, keep the unseen items, then score anything not scored yet (in batches)."""
     if not scout_busy.acquire(blocking=False):
@@ -1279,8 +1290,8 @@ def run_scout():
                 ok += 1
             except Exception as e:
                 arxiv_down = is_arxiv
-                errors.append(f"arXiv unavailable ({e}); skipped arXiv this round, will retry next check" if is_arxiv
-                              else f"{name}: {e}")
+                errors.append(f"arXiv unavailable ({short_error(e)}); skipped arXiv this round, will retry next check" if is_arxiv
+                              else f"{name}: {short_error(e)}")
             if is_arxiv:
                 time.sleep(3)  # arXiv API asks for 3 s between calls
         offline = bool(jobs) and not ok  # nothing reachable: no network, or a background wake while the Mac sleeps
@@ -1288,10 +1299,12 @@ def run_scout():
             errors = ["Offline: couldn't reach arXiv, GitHub or YouTube (no network, or the Mac was asleep); "
                       "will retry in a few minutes"]
         for src in ("YouTube", "GitHub"):  # one line per source, not one per channel / search term
-            names = [e.split(": ", 1)[0][len(src) + 1:] for e in errors if e.startswith(src + " ")]
-            if names:
+            failed = [e[len(src) + 1:].split(": ", 1) for e in errors if e.startswith(src + " ")]
+            if failed:
+                why = {r for _, r in failed}
+                names = ", ".join(n for n, _ in failed) + f" ({why.pop()})" if len(why) == 1 else ", ".join(f"{n} ({r})" for n, r in failed)
                 errors = [e for e in errors if not e.startswith(src + " ")] + [
-                    f"{src}: couldn't load {', '.join(names)}; will retry next check"]
+                    f"{src}: couldn't load {names}; will retry next check"]
         with feed_lock:
             f = load_feed()
             seen = set(f["seen"])
