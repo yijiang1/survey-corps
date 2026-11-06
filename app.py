@@ -126,9 +126,9 @@ def argo_on():
     return bool(config().get("argo_user"))
 
 
-def argo(prompt, max_tokens, timeout=120, tag="", image=None, model=None):
-    """Ask the lab's Argo LLM (with an optional image file it can see), using model or else the one in Settings.
-    Returns the reply text, or None if unconfigured, down or unreachable (e.g. no VPN)."""
+def argo(prompt, max_tokens, timeout=120, tag="", image=None, model=None, grow=False):
+    """Ask the lab's Argo LLM (with an optional image file it can see; grow: see data_url), using model or else the one
+    in Settings. Returns the reply text, or None if unconfigured, down or unreachable (e.g. no VPN)."""
     global argo_ok, argo_at
     cfg = config()
     if not cfg.get("argo_user"):
@@ -140,7 +140,7 @@ def argo(prompt, max_tokens, timeout=120, tag="", image=None, model=None):
         argo_ok, argo_at = False, time.time()
         return None
     content = prompt if not image else [{"type": "text", "text": prompt},
-                                        {"type": "image_url", "image_url": {"url": data_url(image)}}]
+                                        {"type": "image_url", "image_url": {"url": data_url(image, grow)}}]
     models = list(dict.fromkeys([model or cfg.get("argo_model") or MODEL, BACKUP]))
     with busy_lock:
         busy[tag] += 1
@@ -167,12 +167,23 @@ def argo(prompt, max_tokens, timeout=120, tag="", image=None, model=None):
     return text
 
 
-def data_url(path):
-    """A screenshot as a data: URL, shrunk to the 1568 px Claude reads anyway (so big Retina shots stay small)."""
-    small = Path(str(path) + ".send.jpg")
-    if subprocess.run(["sips", "-Z", "1568", "-s", "format", "jpeg", str(path), "--out", str(small)],
-                      capture_output=True).returncode == 0:
-        data, mime = small.read_bytes(), "image/jpeg"
+def data_url(path, grow=False):
+    """A screenshot as a data: URL, shrunk to the 1568 px Claude reads anyway (so big Retina shots stay small).
+    grow: also enlarge a smaller one to 1568 px, as PNG. A schedule's thin grid lines and small day numbers read far
+    better that way: on a 906 px run calendar, Sonnet 5.5 got 36/36 blocks' dates right enlarged, 29/36 as it was."""
+    small = Path(str(path) + (".send.png" if grow else ".send.jpg"))
+    try:
+        size = ["-Z", "1568"]
+        if grow:
+            dims = subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(path)], capture_output=True, text=True).stdout
+            w, h = (int(x) for x in re.findall(r"pixel(?:Width|Height): (\d+)", dims)[:2])
+            size = ["--resampleWidth" if w >= h else "--resampleHeight", "1568"]
+        ok = subprocess.run(["sips", *size, "-s", "format", "png" if grow else "jpeg", str(path), "--out", str(small)],
+                            capture_output=True).returncode == 0
+    except (OSError, ValueError):  # no sips (not a Mac), or it couldn't read the size
+        ok = False
+    if ok:
+        data, mime = small.read_bytes(), "image/png" if grow else "image/jpeg"
         small.unlink()
     else:  # no sips (not a Mac): send it as is
         data, mime = Path(path).read_bytes(), IMAGE.get(Path(path).suffix.lower(), "image/png")
@@ -344,6 +355,99 @@ def summarize(t):
             if not cur["note"]:
                 cur["note"] = text.strip()
         save(todos)
+
+
+# ---- Calendar events: multi-day blocks (beamtimes, people away) read from a schedule screenshot. Not tasks: nothing to
+# tick off, never overdue. The page shows what Argo read for the user to check and fix before anything is saved.
+EVENTS = DATA / "events.json"  # [{"id", "title", "start", "end" (YYYY-MM-DD, inclusive), "kind", "src", "added"}]
+KINDS = ("beamtime", "no-beamtime")
+SCHEDULE_MODEL = "claudesonnet55"  # on a run calendar: 8/12 blocks right per try, vs 3-5 for claudeopus48, 3-8 for gpt56sol
+
+
+def load_events():
+    return json.loads(EVENTS.read_text()) if EVENTS.exists() else []
+
+
+def save_events(evs):
+    tmp = EVENTS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(evs, indent=1, ensure_ascii=False))
+    tmp.replace(EVENTS)
+
+
+def clean_event(e):
+    """{"title", "start", "end", "kind"} from an event Argo read or the user edited; None if it has no title or dates."""
+    if not isinstance(e, dict):
+        return None
+    title = str(e.get("title") or "").strip()[:80]
+    try:
+        days = sorted(datetime.strptime(str(e.get(k) or e.get("start")), "%Y-%m-%d").date() for k in ("start", "end"))
+    except ValueError:
+        return None
+    if not title or (days[1] - days[0]).days > 366:
+        return None
+    return {"title": title, "start": str(days[0]), "end": str(days[1]), "kind": e.get("kind") if e.get("kind") in KINDS else "no-beamtime"}
+
+
+def clean_schedule(text):
+    """{"name", "events"} from the model's reply; events without a title or readable dates are dropped."""
+    d = first_json(text) or {}
+    evs = [x for x in map(clean_event, d.get("events") or []) if x]
+    return {"name": str(d.get("name") or "").strip()[:80], "events": evs}
+
+
+def read_schedule(path):
+    """Argo's vision model reads a schedule screenshot (a beamtime run calendar...) into {"name", "events"};
+    None if Argo didn't answer. Listing each block's days before its start/end is what keeps the edges right."""
+    reply = argo(
+        f"This is a screenshot of a schedule (e.g. a beamtime or facility run calendar laid out as a grid of days). "
+        f"Today is {datetime.now():%A %Y-%m-%d}.\n"
+        'Reply with ONLY a JSON object {"name": "...", "events": [{"title": "...", "days": [...], "start": "YYYY-MM-DD", '
+        '"end": "YYYY-MM-DD", "kind": "..."}]}.\n'
+        '- name: the schedule\'s own title if shown (e.g. "Run 2026-3"), else "".\n'
+        "- events: every labelled block, one per label. A block is the outlined box or shaded band its label sits in; "
+        "it covers whole days.\n"
+        '  - title: the label exactly as written (keep "?" and "#2"); drop dates written inside it ("Jeff out 9/24-25" -> "Jeff out").\n'
+        "  - days: before giving start and end, list the day numbers of every row (or column) that lies INSIDE the box's "
+        "border, in order. Look at where the top and bottom border lines fall: a row the border runs below is inside, a row "
+        "below the border is outside. Ignore where the label text sits; it is usually centred, not aligned to the edges.\n"
+        "  - start, end: the first and last of those days, with month and year. If the label itself gives dates, use those. "
+        "Work out the year from the schedule's title or headers, else the year that puts the dates closest to today.\n"
+        '  - kind: "beamtime" for an experiment or user group\'s allocation, "no-beamtime" for anything else (a person '
+        "being out, maintenance, holds, surveys, shutdowns).\n"
+        "- Skip unlabelled colour fills, legends and weekend shading. Include annotations outside the grid that point at a day.",
+        4000, timeout=180, tag="schedule", image=path, model=SCHEDULE_MODEL, grow=True)
+    return None if reply is None else clean_schedule(reply)
+
+
+def edit_events(evs, d):
+    """Apply one change from the page: {"add": [...], "src", "replace"}, {"update": {"id", ...}} or {"delete": id}.
+    Adding skips blocks already there; replace first drops what an earlier import of the same schedule (src) added."""
+    if "add" in d:
+        src = str(d.get("src") or "").strip()[:80]
+        if d.get("replace") and src:
+            evs[:] = [e for e in evs if e.get("src") != src]
+        have = {(e["title"], e["start"], e["end"]) for e in evs}
+        for e in filter(None, map(clean_event, d["add"])):
+            if (e["title"], e["start"], e["end"]) not in have:
+                have.add((e["title"], e["start"], e["end"]))
+                evs.append({"id": uuid.uuid4().hex[:12], **e, "src": src, "added": datetime.now().isoformat(timespec="minutes")})
+    elif "update" in d:
+        cur = next((e for e in evs if e["id"] == d["update"].get("id")), None)
+        new = cur and clean_event({**cur, **d["update"]})
+        if new:
+            cur.update(new)
+    elif "delete" in d:
+        evs[:] = [e for e in evs if e["id"] != d["delete"]]
+
+
+def beamtime_tasks():
+    """Every beamtime event gets one ordinary task, labelled Beamtime and due on its first day (matched by "event" id)."""
+    todos, have = load(), {t.get("event") for t in load()}
+    new = [{**blank(), "title": e["title"], "sender": "", "date": "", "eml": False, "labels": ["Beamtime"], "event": e["id"],
+            "due": e["start"] + "T09:00", "body": f"Beamtime {e['start']} to {e['end']}" + (f" (from {e['src']})" if e.get("src") else "")}
+           for e in load_events() if e["kind"] == "beamtime" and e["id"] not in have]
+    if new:
+        save(new + todos)
 
 
 def retry_argo():
@@ -1830,6 +1934,9 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/api/todos":
             with lock:
                 self.reply(200, json.dumps(load()).encode())
+        elif self.path == "/api/events":
+            with lock:
+                self.reply(200, json.dumps(load_events()).encode())
         elif self.path == "/api/settings":
             self.reply(200, json.dumps(get_settings()).encode())
         elif self.path.startswith("/api/shot/"):  # a screenshot task's image
@@ -1841,7 +1948,7 @@ class H(BaseHTTPRequestHandler):
             self.reply(200, json.dumps({"configured": argo_on(), "argo": argo_ok, "checked": argo_at, "busy": working,
                                         "retry_minutes": config().get("retry_minutes", 10),
                                         "lib_waiting": lib_waiting() if argo_on() else 0,
-                                        "rev": DB.stat().st_mtime if DB.exists() else 0,
+                                        "rev": max((f.stat().st_mtime for f in (DB, EVENTS) if f.exists()), default=0),
                                         "lib_rev": LIB.stat().st_mtime if LIB.exists() else 0}).encode())
         elif self.path.startswith("/api/pets"):  # /api/pets?after=<last bubble id seen>
             after = int(parse_qs(urlparse(self.path).query).get("after", ["0"])[0] or 0)
@@ -2112,6 +2219,25 @@ class H(BaseHTTPRequestHandler):
                             x["labels"] = sorted({str(l).strip()[:40] for l in patch["labels"] if str(l).strip()})
                 save_feed(f)
             return self.reply(200)
+        if u.path == "/api/schedule/read":  # ?name=x.png + a schedule screenshot -> {"name", "events"} to review; nothing saved
+            ext = Path(parse_qs(u.query).get("name", [""])[0]).suffix.lower()
+            if ext not in IMAGE:
+                return self.reply(400)
+            SHOTS.mkdir(parents=True, exist_ok=True)
+            f = SHOTS / f"schedule-{uuid.uuid4().hex[:12]}{ext}"
+            f.write_bytes(raw)
+            try:
+                s = read_schedule(f)
+            finally:
+                f.unlink(missing_ok=True)
+            return self.reply(503) if s is None else self.reply(200, json.dumps(s).encode())
+        if u.path == "/api/events":  # see edit_events
+            with lock:
+                evs = load_events()
+                edit_events(evs, json.loads(raw or b"{}"))
+                save_events(evs)
+                beamtime_tasks()
+            return self.reply(200)
         parts = u.path.strip("/").split("/")  # api/drop | api/todo/<id>/<action>
         with lock:
             todos = load()
@@ -2248,11 +2374,39 @@ textarea:focus,.askm:focus{border-color:var(--accent)}
 .dow{background:var(--bg);padding:4px 8px;font-size:11px;color:var(--muted);text-transform:uppercase}
 .day{background:var(--card);min-height:96px;padding:4px;cursor:pointer;overflow:hidden}
 .day.out{background:var(--bg)}.day.out .dn{opacity:.5}.day.sel{box-shadow:inset 0 0 0 2px var(--accent)}.day.over{background:var(--hover)}
-.dn{font-size:12px;color:var(--muted);margin:0 2px 2px}.day.today .dn{background:var(--accent);color:#fff;border-radius:9px;padding:0 6px;display:inline-block}
+.dn{font-size:12px;line-height:18px;height:18px;color:var(--muted);margin:0 2px 2px}.day.today .dn{background:var(--accent);color:#fff;border-radius:9px;padding:0 6px;width:fit-content}
 .ev{font-size:11.5px;border-radius:4px;padding:1px 5px;margin:2px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:grab;
   background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 65% var(--chipL))}
 .ev.late{background:var(--redbg);color:var(--red);font-weight:600}.ev.done{text-decoration:line-through;opacity:.55}
 .more{font-size:11px;color:var(--muted);padding:0 5px}
+.band{font-size:11px;font-weight:600;height:17px;line-height:17px;margin:2px -4px;padding:0 6px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;background:hsl(var(--h) 60% 50% / .32);color:hsl(var(--h) 65% var(--chipL))}
+.band.s{margin-left:0;border-radius:4px 0 0 4px}.band.e{margin-right:0;border-radius:0 4px 4px 0}.band.s.e{border-radius:4px}
+.band.no-beamtime,.band.away,.band.other{background:repeating-linear-gradient(-45deg,color-mix(in srgb,var(--muted) 20%,transparent) 0 4px,transparent 4px 8px);color:var(--muted)}
+.band.gap{background:none}
+.evrow{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--line);border-left:4px solid hsl(var(--h) 60% 50%);
+  border-radius:10px;padding:6px 8px 6px 12px;margin:6px 0}.evrow:hover .icon{opacity:1}
+.evrow .title{flex:1}.evrow small{color:var(--muted);white-space:nowrap}
+.evrow input[type=date],.evrow select,#stab input,#stab select{font:inherit;font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:2px 5px}
+dialog.sheet{width:min(1100px,calc(100vw - 32px));max-height:calc(100vh - 48px);border:1px solid var(--line);border-radius:14px;
+  padding:0;background:var(--card);color:var(--text);box-shadow:0 24px 70px #0005}
+dialog.sheet::backdrop{background:#0006;backdrop-filter:blur(2px)}
+dialog.sheet form{display:flex;flex-direction:column;max-height:calc(100vh - 50px);margin:0}
+.ph{padding:18px 22px 4px}.ph h3{margin:0;font-size:17px}.ph p{margin:3px 0 0;color:var(--muted);font-size:12.5px}
+.pb{padding:10px 22px 18px;overflow:auto;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start}
+@media (max-width:760px){.pb{grid-template-columns:1fr}}
+.pf{display:flex;gap:8px;align-items:center;padding:12px 22px;border-top:1px solid var(--line)}.pf label{flex:1;font-size:12.5px;color:var(--muted)}
+.btn{border:1px solid var(--line);border-radius:8px;background:var(--card);padding:6px 12px;cursor:pointer}.btn:hover{background:var(--hover)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}.btn.primary:disabled{opacity:.45;cursor:default}
+#spick{grid-column:1/-1;border:2px dashed var(--line);border-radius:12px;padding:40px 20px;text-align:center;color:var(--muted)}
+#spick.over{border-color:var(--accent);color:var(--accent)}#spick a{color:var(--accent);cursor:pointer;text-decoration:underline}
+#simg{width:100%;border:1px solid var(--line);border-radius:8px;cursor:zoom-in}#simg.big{position:fixed;inset:24px;width:auto;height:auto;
+  max-width:calc(100vw - 48px);max-height:calc(100vh - 48px);margin:auto;z-index:20;cursor:zoom-out;box-shadow:0 24px 70px #0008;background:var(--card)}
+#smsg{font-size:12.5px;margin-bottom:8px}#smsg.bad{color:var(--red)}
+#stab{width:100%;border-collapse:collapse;font-size:12.5px}#stab td{padding:3px 3px;border-bottom:1px solid var(--line)}
+#stab th{text-align:left;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;padding:0 3px 4px}
+#stab input[type=text]{width:100%;min-width:90px}#stab tr.off td:not(:first-child){opacity:.4}#stab small{color:var(--muted)}
+#sname{font:inherit;width:100%;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 7px;margin-bottom:8px}
 .askm{width:100%;box-sizing:border-box;background:var(--bg);border:1px solid transparent;border-radius:8px;padding:7px 10px;outline:none}
 details .askm{border-color:color-mix(in srgb,var(--accent) 35%,transparent)}
 .rbox{display:flex;gap:6px;margin-top:6px;align-items:flex-end}.rbox[hidden]{display:none}
@@ -2296,6 +2450,17 @@ details .askm{border-color:color-mix(in srgb,var(--accent) 35%,transparent)}
 </header>
 <datalist id=labels></datalist>
 <main><div id=ans hidden></div><div id=cal hidden></div><div id=list></div><details id=donebox><summary id=donehdr></summary><div id=donelist></div></details></main>
+<dialog id=sdlg class=sheet><form method=dialog>
+  <div class=ph><h3>Import a schedule</h3><p>A screenshot of a beamtime or run calendar. Argo reads each labelled block into a calendar entry;
+    check the dates against the picture before adding them. The image is sent to Argo and not kept.</p></div>
+  <div class=pb><div id=spick>Paste a screenshot (⌘V), drop one here, or <a>choose a file</a><input type=file accept="image/*" hidden></div>
+    <img id=simg hidden title="Click to enlarge">
+    <div><div id=smsg></div><datalist id=srcs></datalist>
+      <input id=sname list=srcs placeholder="Schedule name (e.g. Run 2026-3)" title="Entries imported under the same name can be replaced by a newer version of the schedule" hidden>
+      <table id=stab hidden><thead><tr><th></th><th>Label</th><th>From</th><th>To</th><th>Kind</th></tr></thead><tbody></tbody></table></div></div>
+  <div class=pf><label id=srep hidden><input type=checkbox checked> Replace the <span></span> already imported under this name</label>
+    <span style="flex:1"></span><button class=btn value=cancel>Cancel</button><button class="btn primary" id=sadd disabled>Add to calendar</button></div>
+</form></dialog>
 <script>
 const api=(p,b)=>fetch(p,{method:'POST',body:typeof b==='string'||b instanceof Blob?b:JSON.stringify(b)}).then(load);
 const nowStr=()=>new Date(Date.now()-new Date().getTimezoneOffset()*6e4).toISOString().slice(0,16);
@@ -2419,10 +2584,10 @@ function linkify(el,text){
 }
 let LB={all:[],hues:{}};  // shared labels: names from all three windows, colours picked in the Library
 const hue=s=>LB.hues[s]??[...s].reduce((h,c)=>(h*31+c.charCodeAt(0))%360,7);
-let all=[], view=localStorage.view||'list', cm=new Date(), sel='', dragId=null;
+let all=[], EV=[], view=localStorage.view||'list', cm=new Date(), sel='', dragId=null;
 cm.setDate(1);
 const ymd=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-function renderCal(shown){
+function renderCal(shown,evs){
   const el=(tag,cls,txt)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e};
   const by={};for(const t of shown.filter(t=>t.due).sort((a,b)=>a.due.localeCompare(b.due)))(by[t.due.slice(0,10)]||=[]).push(t);
   const y=cm.getFullYear(),m=cm.getMonth(),lead=new Date(y,m,1).getDay(),days=new Date(y,m+1,0).getDate();
@@ -2430,13 +2595,32 @@ function renderCal(shown){
   const hd=el('div','calhd'),title=el('h3',0,new Date(y,m,1).toLocaleDateString([],{month:'long',year:'numeric'}));
   const undated=shown.filter(t=>!t.due&&!t.done).length;
   hd.append(title,...(undated?[el('small',0,`${undated} without a due date`)]:[]));
+  const ib=el('button',0,'Import schedule…');ib.title='Read a beamtime or run calendar screenshot into the calendar with Argo';ib.onclick=openSchedule;
+  hd.append(ib);
   for(const [l,n] of [['‹',-1],['Today',0],['›',1]]){const b=el('button',0,l);b.onclick=()=>go(n);hd.append(b)}
+  // multi-day events as bands; within a week each keeps one lane so it lines up across the days
+  const cells=Math.ceil((lead+days)/7)*7, lanes=[];
+  evs=[...evs].sort((a,b)=>a.start.localeCompare(b.start)||b.end.localeCompare(a.end));
+  for(let w=0;w<cells/7;w++){
+    const a=ymd(new Date(y,m,1-lead+w*7)),b=ymd(new Date(y,m,7-lead+w*7)),ends=[],rows=[];
+    for(const e of evs.filter(e=>e.start<=b&&e.end>=a)){
+      let k=ends.findIndex(x=>x<e.start);if(k<0)k=ends.length;ends[k]=e.end;(rows[k]||=[]).push(e)}
+    lanes.push(rows.slice(0,3));
+  }
+  const evHue=e=>e.kind==='beamtime'?hue('Beamtime'):210;
   const grid=el('div','grid');
   for(const d of ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'])grid.append(el('div','dow',d));
   const today=ymd(new Date());
-  for(let i=0;i<Math.ceil((lead+days)/7)*7;i++){
+  for(let i=0;i<cells;i++){
     const d=new Date(y,m,1-lead+i),k=ymd(d),c=el('div','day'+(d.getMonth()!==m?' out':'')+(k===today?' today':'')+(k===sel?' sel':''));
     c.append(el('div','dn',d.getDate()));
+    for(const row of lanes[Math.floor(i/7)]){
+      const e=row.find(e=>e.start<=k&&e.end>=k);
+      if(!e){c.append(el('div','band gap','\u00a0'));continue}
+      const b=el('div',`band ${e.kind}${e.start===k?' s':''}${e.end===k?' e':''}`,e.start===k||d.getDay()===0?e.title:'\u00a0');
+      b.style.setProperty('--h',evHue(e));b.title=`${e.title}\n${shortDate(e.start+'T00:00')} – ${shortDate(e.end+'T00:00')}`+(e.src?`\nfrom ${e.src}`:'');
+      c.append(b);
+    }
     const ts=by[k]||[];
     for(const t of ts.slice(0,3)){
       const e=el('div','ev'+(t.done?' done':'')+(!t.done&&t.due<=nowStr()?' late':''),t.title);
@@ -2454,10 +2638,67 @@ function renderCal(shown){
     grid.append(c);
   }
   const out=[hd,grid];
-  if(sel){const ts=by[sel]||[];out.push(el('h2',0,new Date(sel+'T00:00').toLocaleDateString([],{weekday:'long',month:'long',day:'numeric'})),
-    ...(ts.length?ts.map(item):[el('div','empty','Nothing due this day.')]))}
+  if(sel){const ts=by[sel]||[],es=evs.filter(e=>e.start<=sel&&e.end>=sel);
+    out.push(el('h2',0,new Date(sel+'T00:00').toLocaleDateString([],{weekday:'long',month:'long',day:'numeric'})),
+    ...es.map(e=>evRow(e,evHue(e))),...(ts.length?ts.map(item):[el('div','empty','Nothing due this day.')]))}
   cal.replaceChildren(...out);
 }
+function kindSel(v){const s=document.createElement('select');s.append(new Option('beamtime','beamtime'),new Option('no beamtime','no-beamtime'));s.value=v==='beamtime'?v:'no-beamtime';return s}
+function evRow(e,h){  // an imported block on the selected day: rename, move or remove it
+  const r=document.createElement('div');r.className='evrow';r.style.setProperty('--h',h);
+  const t=document.createElement('input');t.className='title';t.value=e.title;t.onkeydown=ev=>{if(ev.key==='Enter')t.blur()};
+  const [a,b]=[e.start,e.end].map(v=>{const i=document.createElement('input');i.type='date';i.value=v;return i});
+  const k=kindSel(e.kind),src=document.createElement('small');src.textContent=e.src||'';
+  const x=document.createElement('button');x.className='icon x';x.title='Remove from the calendar';x.innerHTML=TRASH;
+  t.onchange=a.onchange=b.onchange=k.onchange=()=>api('/api/events',{update:{id:e.id,title:t.value,start:a.value,end:b.value,kind:k.value}});
+  x.onclick=()=>confirm(`Remove "${e.title}" from the calendar?`)&&api('/api/events',{delete:e.id});
+  r.append(t,a,'–',b,k,src,x);return r;
+}
+// Import schedule: a screenshot of a run calendar -> Argo reads its labelled blocks -> the user checks them -> saved as events
+let sched=null;
+const spick=document.getElementById('spick'),sfile=spick.querySelector('input'),srepN=srep.querySelector('span'),srepC=srep.querySelector('input');
+function openSchedule(){sched=null;spick.hidden=false;simg.hidden=true;simg.classList.remove('big');stab.hidden=sname.hidden=srep.hidden=true;
+  smsg.textContent='';smsg.className='';sadd.disabled=true;sdlg.showModal()}
+spick.querySelector('a').onclick=()=>sfile.click();
+sfile.onchange=()=>{if(sfile.files[0])readSchedule(sfile.files[0]);sfile.value=''};
+spick.ondragover=e=>{e.preventDefault();spick.classList.add('over')};spick.ondragleave=()=>spick.classList.remove('over');
+simg.onclick=()=>simg.classList.toggle('big');
+async function readSchedule(f){
+  if(!f.type.startsWith('image/'))return toast('That is not an image.');
+  spick.hidden=true;stab.hidden=sname.hidden=srep.hidden=true;sadd.disabled=true;simg.src=URL.createObjectURL(f);simg.hidden=false;
+  smsg.className='';smsg.textContent='✨ Argo is reading the schedule… (about 20 s)';
+  const r=await fetch('/api/schedule/read?name=s.'+(f.type.split('/')[1]||'png'),{method:'POST',body:f}).catch(()=>({}));
+  const fail=m=>{smsg.className='bad';smsg.textContent=m;spick.hidden=false};
+  if(!r.ok)return fail(r.status===400?'Use a PNG, JPEG, GIF or WebP image.':'Argo is unavailable right now (down, or not on VPN). Try again later.');
+  sched=await r.json();
+  if(!sched.events.length)return fail("Argo found no labelled blocks in this picture. Try a tighter crop of the schedule grid.");
+  smsg.textContent=`Argo read ${sched.events.length} block${sched.events.length>1?'s':''}. Check each date against the picture (click it to enlarge) and untick any you don't want.`;
+  const prev=[...new Set(EV.map(e=>e.src).filter(Boolean))];
+  srcs.replaceChildren(...prev.map(p=>new Option(p)));  // a re-read of the same schedule may title it a little differently
+  sname.value=prev.find(p=>sched.name&&(p.includes(sched.name)||sched.name.includes(p)))||sched.name;sname.hidden=false;sname.oninput();
+  stab.tBodies[0].replaceChildren(...sched.events.map(e=>{
+    const tr=document.createElement('tr'),td=(...n)=>{const c=document.createElement('td');c.append(...n);tr.append(c)};
+    const cb=document.createElement('input');cb.type='checkbox';cb.checked=true;cb.onchange=()=>{tr.classList.toggle('off',!cb.checked);count()};
+    const t=document.createElement('input');t.type='text';t.value=e.title;
+    const [a,b]=[e.start,e.end].map(v=>{const i=document.createElement('input');i.type='date';i.value=v;return i});
+    const k=kindSel(e.kind),dup=document.createElement('small');
+    if(EV.some(x=>x.title===e.title&&x.start===e.start&&x.end===e.end))dup.textContent=' already on the calendar';
+    td(cb);td(t,dup);td(a);td(b);td(k);
+    tr.get=()=>cb.checked&&{title:t.value,start:a.value,end:b.value,kind:k.value};return tr}));
+  stab.hidden=false;count();
+}
+function scheduleFile(b64,ext){  // the Mac app takes every file drop itself; one dropped on this sheet comes here
+  spick.classList.remove('over');if(!['png','jpg','jpeg','gif','webp'].includes(ext))return toast('That is not an image.');
+  readSchedule(new File([Uint8Array.from(atob(b64),c=>c.charCodeAt(0))],'s.'+ext,{type:ext==='jpg'?'image/jpeg':'image/'+ext}))}
+function count(){const n=[...stab.tBodies[0].rows].filter(r=>r.get()).length;sadd.disabled=!n;sadd.textContent=`Add ${n} to calendar`}
+sname.oninput=()=>{const n=EV.filter(e=>e.src&&e.src===sname.value.trim()).length;srep.hidden=!n;srepN.textContent=`${n} entr${n===1?'y':'ies'}`};
+sadd.onclick=async e=>{
+  e.preventDefault();const add=[...stab.tBodies[0].rows].map(r=>r.get()).filter(Boolean);if(!add.length)return;
+  sadd.disabled=true;const first=add.map(x=>x.start).sort()[0];
+  await api('/api/events',{add,src:sname.value.trim(),replace:!srep.hidden&&srepC.checked});
+  sdlg.close();cm=new Date(first+'T00:00');cm.setDate(1);view='cal';localStorage.view=view;render();
+  toast(`Added ${add.length} to the calendar`);
+};
 let lf='';  // label filter ('' = all), set by the label row under the search bar or by clicking a label
 function render(){
   const names=[...new Set(all.flatMap(t=>t.labels||[]))].sort();
@@ -2487,7 +2728,7 @@ function render(){
   }
   list.replaceChildren(...out); donelist.replaceChildren(...done.map(item));
   const isCal=view==='cal'; cal.hidden=!isCal; list.hidden=isCal; vl.className=isCal?'':'on'; vc.className=isCal?'on':'';
-  if(isCal)renderCal(shown);
+  if(isCal)renderCal(shown,lf?[]:EV.filter(e=>words.every(w=>e.title.toLowerCase().includes(w))));
   donebox.hidden=isCal||!done.length; donehdr.textContent=`Done · ${done.length}`;
   const openAll=all.filter(t=>!t.done), late=openAll.filter(t=>t.due&&t.due<=nowStr()).length;
   stats.textContent=`${openAll.length} open`+(late?` · ${late} overdue`:'');
@@ -2495,7 +2736,7 @@ function render(){
 }
 let st={busy:[]}, rev=0;
 async function load(){
-  [all,st,LB]=await Promise.all(['/api/todos','/api/status','/api/labels'].map(u=>fetch(u).then(r=>r.json())));rev=st.rev;render();pill()}
+  [all,st,LB,EV]=await Promise.all(['/api/todos','/api/status','/api/labels','/api/events'].map(u=>fetch(u).then(r=>r.json())));rev=st.rev;render();pill()}
 function pill(){  // Argo status in the header: off / reachable / unavailable / working
   const work=st.busy.filter(x=>x!=='check'), checking=st.busy.includes('check'), tw=all.filter(t=>t.retry&&!t.done).length, waiting=tw+st.lib_waiting;
   const ago=st.checked?Math.round(Date.now()/6e4-st.checked/60):null;
@@ -2559,11 +2800,12 @@ q.onkeydown=async e=>{
     load();answer(r.ok?(await r.json()).answer:'Argo is unavailable right now (down, or not on VPN). Try again later.');
   }
 };
-addEventListener('dragover',e=>{e.preventDefault();if(!dragId)drop.classList.add('over')});
+addEventListener('dragover',e=>{e.preventDefault();if(!dragId&&!sdlg.open)drop.classList.add('over')});
 addEventListener('dragleave',e=>{if(!e.relatedTarget)drop.classList.remove('over')});  // only when leaving the window
 addEventListener('drop',async e=>{
   e.preventDefault(); if(dragId)return; drop.classList.remove('over');
   const files=[...e.dataTransfer.files];
+  if(sdlg.open){spick.classList.remove('over');if(files[0])readSchedule(files[0]);return}  // the import sheet takes it
   for(const f of files) await fetch('/api/drop?name='+encodeURIComponent(f.name),{method:'POST',body:f});
   const txt=!files.length&&(e.dataTransfer.getData('text/plain')||e.dataTransfer.getData('text/uri-list'));
   if(txt) await fetch('/api/drop?name=drop.txt',{method:'POST',body:txt});
@@ -2574,6 +2816,7 @@ const shotBtn=document.getElementById('shot');shotBtn.hidden=!window.webkit?.mes
 shotBtn.onclick=()=>webkit.messageHandlers.shot.postMessage('');
 addEventListener('paste',async e=>{
   const f=[...e.clipboardData.files].find(f=>f.type.startsWith('image/'));if(!f)return;e.preventDefault();
+  if(sdlg.open)return readSchedule(f);
   toast('Reading the screenshot…');
   await fetch('/api/drop?name=paste.'+(f.type.split('/')[1]||'png'),{method:'POST',body:f});load();
 });
@@ -3656,6 +3899,7 @@ load();
 if __name__ == "__main__":
     for d in (MAILS, INBOX):
         d.mkdir(parents=True, exist_ok=True)
+    beamtime_tasks()  # beamtimes imported before they became tasks
     threading.Thread(target=watcher, daemon=True).start()
     threading.Thread(target=scout_loop, daemon=True).start()
     threading.Thread(target=agents_loop, daemon=True).start()
