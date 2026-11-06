@@ -98,7 +98,16 @@ class DropWebView: WKWebView {
             }
             return true
         }
-        receiveFiles(pb) { uploadEmail($0) { _ in self.evaluateJavaScript("drop.classList.remove('over');load()") } }
+        receiveFiles(pb) { url in
+            self.evaluateJavaScript("typeof sdlg != 'undefined' && sdlg.open") { open, _ in
+                if open as? Bool == true, let data = try? Data(contentsOf: url) {  // the Import schedule sheet takes it
+                    let ext = url.pathExtension.lowercased().filter(\.isLetter)
+                    self.evaluateJavaScript("scheduleFile('\(data.base64EncodedString())', '\(ext)')")
+                } else {
+                    uploadEmail(url) { _ in self.evaluateJavaScript("drop.classList.remove('over');load()") }
+                }
+            }
+        }
         return true
     }
 }
@@ -1218,6 +1227,14 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
     func webView(_ w: WKWebView, runJavaScriptTextInputPanelWithPrompt p: String, defaultText d: String?,
                  initiatedByFrame f: WKFrameInfo, completionHandler done: @escaping (String?) -> Void) {
         done(textPrompt(p, text: d ?? ""))
+    }
+
+    // Nor <input type=file> (Import schedule's "choose a file"): the standard Open panel
+    func webView(_ w: WKWebView, runOpenPanelWith p: WKOpenPanelParameters, initiatedByFrame f: WKFrameInfo,
+                 completionHandler done: @escaping ([URL]?) -> Void) {
+        let o = NSOpenPanel()
+        o.canChooseFiles = true; o.canChooseDirectories = p.allowsDirectories; o.allowsMultipleSelection = p.allowsMultipleSelection
+        o.beginSheetModal(for: w.window ?? window) { r in done(r == .OK ? o.urls : nil) }
     }
 }
 

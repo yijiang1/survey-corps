@@ -419,3 +419,32 @@ assert app.short_error(urllib.error.HTTPError("u", 403, "x", {}, None)) == "rate
 assert app.short_error(urllib.error.URLError("[Errno 8] nodename")) == "no connection"
 assert app.short_error(TimeoutError("The read operation timed out")) == "timed out"
 print("ok")
+# schedule screenshot -> calendar events: Argo's blocks are validated, re-imports of the same schedule replace or skip
+assert app.clean_schedule('ok {"name": " Run 2026-3 ", "events": [{"title": "CSE Batteries", "days": [11, 16], "start": "2026-11-11", '
+                          '"end": "2026-11-16", "kind": "beamtime"}, {"title": "Jeff out", "start": "2026-11-03", "end": "2026-11-02", '
+                          '"kind": "away"}, {"title": "Rad survey", "start": "2026-11-20", "kind": "bogus"}, {"title": "", "start": '
+                          '"2026-11-01"}, {"title": "No dates"}, {"title": "Year", "start": "2026-01-01", "end": "2027-06-01"}, "junk"]}') == {
+    "name": "Run 2026-3", "events": [
+        {"title": "CSE Batteries", "start": "2026-11-11", "end": "2026-11-16", "kind": "beamtime"},
+        {"title": "Jeff out", "start": "2026-11-02", "end": "2026-11-03", "kind": "away"},     # swapped into order
+        {"title": "Rad survey", "start": "2026-11-20", "end": "2026-11-20", "kind": "other"}]}  # one day; unknown kind
+assert app.clean_schedule("no json") == {"name": "", "events": []}
+evs = []
+app.edit_events(evs, {"add": [{"title": "A", "start": "2026-11-04", "end": "2026-11-05", "kind": "beamtime"},
+                              {"title": "B", "start": "2026-11-06", "end": "2026-11-08"}], "src": "Run 3"})
+app.edit_events(evs, {"add": [{"title": "A", "start": "2026-11-04", "end": "2026-11-05"}, {"title": "C", "start": "2026-12-01"}], "src": "Run 3"})
+assert [e["title"] for e in evs] == ["A", "B", "C"] and evs[0]["src"] == "Run 3" and evs[1]["kind"] == "other"  # A not added twice
+app.edit_events(evs, {"update": {"id": evs[1]["id"], "end": "2026-11-09", "kind": "away"}})
+app.edit_events(evs, {"update": {"id": evs[1]["id"], "start": "not a date"}})  # rejected, nothing changes
+assert (evs[1]["start"], evs[1]["end"], evs[1]["kind"]) == ("2026-11-06", "2026-11-09", "away")
+app.edit_events(evs, {"delete": evs[2]["id"]})
+app.edit_events(evs, {"add": [{"title": "Other run", "start": "2027-01-05"}], "src": "Run 1"})
+app.edit_events(evs, {"add": [{"title": "A2", "start": "2026-11-04", "end": "2026-11-06"}], "src": "Run 3", "replace": True})
+assert [(e["title"], e["src"]) for e in evs] == [("Other run", "Run 1"), ("A2", "Run 3")], evs
+seen = []
+app.argo = lambda prompt, n, **kw: seen.append(kw) or '{"name": "Run", "events": [{"title": "X", "start": "2026-11-04", "end": "2026-11-05"}]}'
+assert app.read_schedule(Path("s.png"))["events"][0]["end"] == "2026-11-05"
+assert seen[0]["grow"] and seen[0]["image"] == Path("s.png") and seen[0]["model"] == app.SCHEDULE_MODEL
+app.argo = lambda *a, **kw: None
+assert app.read_schedule(Path("s.png")) is None
+print("ok")
