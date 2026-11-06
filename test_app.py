@@ -422,22 +422,27 @@ print("ok")
 # schedule screenshot -> calendar events: Argo's blocks are validated, re-imports of the same schedule replace or skip
 assert app.clean_schedule('ok {"name": " Run 2026-3 ", "events": [{"title": "CSE Batteries", "days": [11, 16], "start": "2026-11-11", '
                           '"end": "2026-11-16", "kind": "beamtime"}, {"title": "Jeff out", "start": "2026-11-03", "end": "2026-11-02", '
-                          '"kind": "away"}, {"title": "Rad survey", "start": "2026-11-20", "kind": "bogus"}, {"title": "", "start": '
+                          '"kind": "no-beamtime"}, {"title": "Rad survey", "start": "2026-11-20", "kind": "bogus"}, {"title": "", "start": '
                           '"2026-11-01"}, {"title": "No dates"}, {"title": "Year", "start": "2026-01-01", "end": "2027-06-01"}, "junk"]}') == {
     "name": "Run 2026-3", "events": [
         {"title": "CSE Batteries", "start": "2026-11-11", "end": "2026-11-16", "kind": "beamtime"},
-        {"title": "Jeff out", "start": "2026-11-02", "end": "2026-11-03", "kind": "away"},     # swapped into order
-        {"title": "Rad survey", "start": "2026-11-20", "end": "2026-11-20", "kind": "other"}]}  # one day; unknown kind
+        {"title": "Jeff out", "start": "2026-11-02", "end": "2026-11-03", "kind": "no-beamtime"},     # swapped into order
+        {"title": "Rad survey", "start": "2026-11-20", "end": "2026-11-20", "kind": "no-beamtime"}]}  # one day; unknown kind
 assert app.clean_schedule("no json") == {"name": "", "events": []}
 evs = []
 app.edit_events(evs, {"add": [{"title": "A", "start": "2026-11-04", "end": "2026-11-05", "kind": "beamtime"},
                               {"title": "B", "start": "2026-11-06", "end": "2026-11-08"}], "src": "Run 3"})
 app.edit_events(evs, {"add": [{"title": "A", "start": "2026-11-04", "end": "2026-11-05"}, {"title": "C", "start": "2026-12-01"}], "src": "Run 3"})
-assert [e["title"] for e in evs] == ["A", "B", "C"] and evs[0]["src"] == "Run 3" and evs[1]["kind"] == "other"  # A not added twice
-app.edit_events(evs, {"update": {"id": evs[1]["id"], "end": "2026-11-09", "kind": "away"}})
+assert [e["title"] for e in evs] == ["A", "B", "C"] and evs[0]["src"] == "Run 3" and evs[1]["kind"] == "no-beamtime"  # A not added twice
+app.edit_events(evs, {"update": {"id": evs[1]["id"], "end": "2026-11-09", "kind": "no-beamtime"}})
 app.edit_events(evs, {"update": {"id": evs[1]["id"], "start": "not a date"}})  # rejected, nothing changes
-assert (evs[1]["start"], evs[1]["end"], evs[1]["kind"]) == ("2026-11-06", "2026-11-09", "away")
+assert (evs[1]["start"], evs[1]["end"], evs[1]["kind"]) == ("2026-11-06", "2026-11-09", "no-beamtime")
 app.edit_events(evs, {"delete": evs[2]["id"]})
+app.DB = Path(tempfile.mkdtemp()) / "todos.json"  # the reload above restored the real paths
+app.EVENTS = Path(tempfile.mkdtemp()) / "events.json"; app.save_events(evs)
+app.beamtime_tasks(); app.beamtime_tasks()  # one task per beamtime, however often it runs
+bt = [x for x in app.load() if x.get("event")]
+assert len(bt) == 1 and bt[0]["title"] == "A" and bt[0]["labels"] == ["Beamtime"] and bt[0]["due"] == "2026-11-04T09:00"
 app.edit_events(evs, {"add": [{"title": "Other run", "start": "2027-01-05"}], "src": "Run 1"})
 app.edit_events(evs, {"add": [{"title": "A2", "start": "2026-11-04", "end": "2026-11-06"}], "src": "Run 3", "replace": True})
 assert [(e["title"], e["src"]) for e in evs] == [("Other run", "Run 1"), ("A2", "Run 3")], evs

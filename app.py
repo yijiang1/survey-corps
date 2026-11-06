@@ -360,7 +360,7 @@ def summarize(t):
 # ---- Calendar events: multi-day blocks (beamtimes, people away) read from a schedule screenshot. Not tasks: nothing to
 # tick off, never overdue. The page shows what Argo read for the user to check and fix before anything is saved.
 EVENTS = DATA / "events.json"  # [{"id", "title", "start", "end" (YYYY-MM-DD, inclusive), "kind", "src", "added"}]
-KINDS = ("beamtime", "away", "other")
+KINDS = ("beamtime", "no-beamtime")
 SCHEDULE_MODEL = "claudesonnet55"  # on a run calendar: 8/12 blocks right per try, vs 3-5 for claudeopus48, 3-8 for gpt56sol
 
 
@@ -385,7 +385,7 @@ def clean_event(e):
         return None
     if not title or (days[1] - days[0]).days > 366:
         return None
-    return {"title": title, "start": str(days[0]), "end": str(days[1]), "kind": e.get("kind") if e.get("kind") in KINDS else "other"}
+    return {"title": title, "start": str(days[0]), "end": str(days[1]), "kind": e.get("kind") if e.get("kind") in KINDS else "no-beamtime"}
 
 
 def clean_schedule(text):
@@ -412,8 +412,8 @@ def read_schedule(path):
         "below the border is outside. Ignore where the label text sits; it is usually centred, not aligned to the edges.\n"
         "  - start, end: the first and last of those days, with month and year. If the label itself gives dates, use those. "
         "Work out the year from the schedule's title or headers, else the year that puts the dates closest to today.\n"
-        '  - kind: "beamtime" for an experiment or user group\'s allocation, "away" for a person being out, "other" for '
-        "anything else (maintenance, holds, surveys, shutdowns).\n"
+        '  - kind: "beamtime" for an experiment or user group\'s allocation, "no-beamtime" for anything else (a person '
+        "being out, maintenance, holds, surveys, shutdowns).\n"
         "- Skip unlabelled colour fills, legends and weekend shading. Include annotations outside the grid that point at a day.",
         4000, timeout=180, tag="schedule", image=path, model=SCHEDULE_MODEL, grow=True)
     return None if reply is None else clean_schedule(reply)
@@ -438,6 +438,16 @@ def edit_events(evs, d):
             cur.update(new)
     elif "delete" in d:
         evs[:] = [e for e in evs if e["id"] != d["delete"]]
+
+
+def beamtime_tasks():
+    """Every beamtime event gets one ordinary task, labelled Beamtime and due on its first day (matched by "event" id)."""
+    todos, have = load(), {t.get("event") for t in load()}
+    new = [{**blank(), "title": e["title"], "sender": "", "date": "", "eml": False, "labels": ["Beamtime"], "event": e["id"],
+            "due": e["start"] + "T09:00", "body": f"Beamtime {e['start']} to {e['end']}" + (f" (from {e['src']})" if e.get("src") else "")}
+           for e in load_events() if e["kind"] == "beamtime" and e["id"] not in have]
+    if new:
+        save(new + todos)
 
 
 def retry_argo():
@@ -2226,6 +2236,7 @@ class H(BaseHTTPRequestHandler):
                 evs = load_events()
                 edit_events(evs, json.loads(raw or b"{}"))
                 save_events(evs)
+                beamtime_tasks()
             return self.reply(200)
         parts = u.path.strip("/").split("/")  # api/drop | api/todo/<id>/<action>
         with lock:
@@ -2371,8 +2382,7 @@ textarea:focus,.askm:focus{border-color:var(--accent)}
 .band{font-size:11px;font-weight:600;height:17px;line-height:17px;margin:2px -4px;padding:0 6px;white-space:nowrap;overflow:hidden;
   text-overflow:ellipsis;background:hsl(var(--h) 60% 50% / .32);color:hsl(var(--h) 65% var(--chipL))}
 .band.s{margin-left:0;border-radius:4px 0 0 4px}.band.e{margin-right:0;border-radius:0 4px 4px 0}.band.s.e{border-radius:4px}
-.band.away{background:color-mix(in srgb,var(--muted) 24%,transparent);color:var(--muted)}
-.band.other{background:repeating-linear-gradient(-45deg,color-mix(in srgb,var(--muted) 20%,transparent) 0 4px,transparent 4px 8px);color:var(--muted)}
+.band.no-beamtime,.band.away,.band.other{background:repeating-linear-gradient(-45deg,color-mix(in srgb,var(--muted) 20%,transparent) 0 4px,transparent 4px 8px);color:var(--muted)}
 .band.gap{background:none}
 .evrow{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--line);border-left:4px solid hsl(var(--h) 60% 50%);
   border-radius:10px;padding:6px 8px 6px 12px;margin:6px 0}.evrow:hover .icon{opacity:1}
@@ -2597,7 +2607,7 @@ function renderCal(shown,evs){
       let k=ends.findIndex(x=>x<e.start);if(k<0)k=ends.length;ends[k]=e.end;(rows[k]||=[]).push(e)}
     lanes.push(rows.slice(0,3));
   }
-  const evHue=e=>e.kind==='beamtime'?hue(e.title):210;
+  const evHue=e=>e.kind==='beamtime'?hue('Beamtime'):210;
   const grid=el('div','grid');
   for(const d of ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'])grid.append(el('div','dow',d));
   const today=ymd(new Date());
@@ -2633,7 +2643,7 @@ function renderCal(shown,evs){
     ...es.map(e=>evRow(e,evHue(e))),...(ts.length?ts.map(item):[el('div','empty','Nothing due this day.')]))}
   cal.replaceChildren(...out);
 }
-function kindSel(v){const s=document.createElement('select');s.append(...['beamtime','away','other'].map(k=>new Option(k)));s.value=v;return s}
+function kindSel(v){const s=document.createElement('select');s.append(new Option('beamtime','beamtime'),new Option('no beamtime','no-beamtime'));s.value=v==='beamtime'?v:'no-beamtime';return s}
 function evRow(e,h){  // an imported block on the selected day: rename, move or remove it
   const r=document.createElement('div');r.className='evrow';r.style.setProperty('--h',h);
   const t=document.createElement('input');t.className='title';t.value=e.title;t.onkeydown=ev=>{if(ev.key==='Enter')t.blur()};
@@ -3889,6 +3899,7 @@ load();
 if __name__ == "__main__":
     for d in (MAILS, INBOX):
         d.mkdir(parents=True, exist_ok=True)
+    beamtime_tasks()  # beamtimes imported before they became tasks
     threading.Thread(target=watcher, daemon=True).start()
     threading.Thread(target=scout_loop, daemon=True).start()
     threading.Thread(target=agents_loop, daemon=True).start()
