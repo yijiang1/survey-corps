@@ -465,6 +465,7 @@ class PetView: NSView {
     var hover = false { didSet { if hover != oldValue { needsDisplay = true } } }  // something dragged over it
     var busy = false { didSet { if busy != oldValue { animate() } } }
     var tuckedInto: NSRectEdge? { didSet { if tuckedInto != oldValue { needsDisplay = true } } }  // the screen edge it's tucked into
+    var tabAt: CGFloat = 0 { didSet { if tabAt != oldValue { needsDisplay = true } } }  // where the on-screen strip starts
     enum Anim { case hop, shake }  // hop: a drop worked or the pet speaks; shake: it didn't
     var anim: Anim?, animStart = Date(), ticker: Timer?
     func play(_ a: Anim) { anim = a; animStart = Date(); animate() }
@@ -539,7 +540,7 @@ class PetView: NSView {
     var tabLong: CGFloat { overdue > 0 || agents > 0 ? 72 : 40 }  // a tab's length along the edge: face, then count
     func drawTab(_ e: NSRectEdge) {  // tucked: a tab in the sliver left showing, the pet's face and its count
         let n = overdue > 0 ? overdue : agents, side = e == .minX || e == .maxX, long = tabLong
-        let a = e == .minX ? bounds.maxX - sliver : e == .minY ? bounds.maxY - sliver : 0  // where the on-screen strip starts
+        let a = tabAt
         var tab = side ? NSRect(x: a + 1, y: bounds.midY - long / 2, width: sliver - 2, height: long)
                        : NSRect(x: bounds.midX - long / 2, y: a + 1, width: long, height: sliver - 2)
         switch e {  // run the tab off the screen edge, so only its inner corners are round
@@ -598,17 +599,13 @@ class PetView: NSView {
 func screenOf(_ r: NSRect) -> NSScreen {  // the screen a pet's rect is centered on (or the main one, if off every screen)
     NSScreen.screens.first { $0.frame.contains(NSPoint(x: r.midX, y: r.midY)) } ?? NSScreen.main!
 }
-// Pet at r tucked into an edge of its screen (frame f, visible v), a sliver left showing: its nearer side, else
-// the other side, else the bottom, else the top. An edge another screen touches (others) is skipped: the pet would
-// show up on that screen instead. Stays at r if every edge is shared.
-func tuckSpot(_ r: NSRect, _ f: NSRect, _ v: NSRect, _ others: [NSRect]) -> NSRect {
-    let w = r.width, h = r.height, sides = [  // (tucked rect, a 1 pt strip just past that edge)
-        (NSRect(x: v.minX - w + sliver, y: r.minY, width: w, height: h), NSRect(x: f.minX - 1, y: r.minY, width: 1, height: h)),
-        (NSRect(x: v.maxX - sliver, y: r.minY, width: w, height: h), NSRect(x: f.maxX, y: r.minY, width: 1, height: h)),
-        (NSRect(x: r.minX, y: v.minY - h + sliver, width: w, height: h), NSRect(x: r.minX, y: f.minY - 1, width: w, height: 1)),
-        (NSRect(x: r.minX, y: v.maxY - sliver, width: w, height: h), NSRect(x: r.minX, y: f.maxY, width: w, height: 1))]
-    let order = r.midX < v.midX ? [0, 1, 2, 3] : [1, 0, 2, 3]
-    return order.map { sides[$0] }.first { side in !others.contains { $0.intersects(side.1) } }?.0 ?? r
+// Pet at r tucked into the nearer side of its screen (frame f, visible v), a sliver left showing as a tab. If another
+// screen touches that side (others), sliding over would put the pet on that screen, so it stays against the edge instead.
+func tuckSpot(_ r: NSRect, _ f: NSRect, _ v: NSRect, _ others: [NSRect]) -> (NSRect, NSRectEdge) {
+    let left = r.midX < v.midX, strip = NSRect(x: left ? f.minX - 1 : f.maxX, y: r.minY, width: 1, height: r.height)
+    let shared = others.contains { $0.intersects(strip) }
+    let x = left ? (shared ? v.minX : v.minX - r.width + sliver) : (shared ? v.maxX - r.width : v.maxX - sliver)
+    return (NSRect(x: x, y: r.minY, width: r.width, height: r.height), left ? .minX : .maxX)
 }
 func onScreen(_ r: NSRect) -> NSPoint {  // r pulled back inside its screen, snapped to an edge within 24 pt
     let v = screenOf(r).visibleFrame
@@ -1083,22 +1080,18 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         }
         tucked = false; awaySince = Date(); settle()
     }
-    func spots() -> [String: NSRect] {  // where each pet belongs now; tabs tucked into one edge close up into a column
-        var out = [String: NSRect]()
+    func spots() -> [String: (NSRect, NSRectEdge?)] {  // where each pet belongs now; tabs on one edge close up into a column
+        var out = [String: (NSRect, NSRectEdge?)]()
         for k in pets.keys {
             let r = homeRect(k), s = screenOf(r)
-            out[k] = tucked ? tuckSpot(r, s.frame, s.visibleFrame, NSScreen.screens.filter { $0 != s }.map(\.frame)) : r
+            out[k] = tucked ? tuckSpot(r, s.frame, s.visibleFrame, NSScreen.screens.filter { $0 != s }.map(\.frame)) : (r, nil)
         }
-        let moved = out.keys.filter { out[$0] != homeRect($0) }
-        for (_, ks) in Dictionary(grouping: moved, by: { out[$0]!.minX != homeRect($0).minX ? "x\(out[$0]!.minX)" : "y\(out[$0]!.minY)" }) {
-            let side = out[ks[0]]!.minX != homeRect(ks[0]).minX  // a side edge: a column, top first; else a row, left first
-            let along = { (k: String) in side ? -out[k]!.midY : out[k]!.midX }
-            let row = ks.sorted { along($0) < along($1) }, len = { (k: String) in self.pets[k]!.view.tabLong }
-            var at = row.map(along).reduce(0, +) / CGFloat(row.count) - (row.map(len).reduce(0, +) + CGFloat(row.count - 1) * 6) / 2
-            for k in row {  // centered on where the pets were, 6 pt apart
-                let mid = at + len(k) / 2
-                if side { out[k]!.origin.y = -mid - petSize / 2 } else { out[k]!.origin.x = mid - petSize / 2 }
-                at += len(k) + 6
+        for (_, ks) in Dictionary(grouping: out.keys.filter { out[$0]!.1 != nil }, by: { out[$0]!.0.minX }) {
+            let row = ks.sorted { out[$0]!.0.midY > out[$1]!.0.midY }, len = { (k: String) in self.pets[k]!.view.tabLong }
+            var top = row.map { out[$0]!.0.midY }.reduce(0, +) / CGFloat(row.count) + (row.map(len).reduce(0, +) + CGFloat(row.count - 1) * 6) / 2
+            for k in row {  // centered on where the pets were, top first, 6 pt apart
+                out[k]!.0.origin.y = top - len(k) / 2 - petSize / 2
+                top -= len(k) + 6
             }
         }
         return out
@@ -1114,12 +1107,12 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
     func settle(animate: Bool = true) {  // move any pet that isn't where spot() says
         let to = spots()
         for (k, p) in pets {  // tucked pets draw as a tab, on the side that's still on screen
-            let t = to[k]!, h = homeRect(k), v = screenOf(h).visibleFrame
-            p.view.tuckedInto = t == h ? nil : t.maxX <= v.minX + sliver + 1 ? .minX : t.minX >= v.maxX - sliver - 1 ? .maxX
-                                : t.maxY <= v.minY + sliver + 1 ? .minY : .maxY
+            let (t, e) = to[k]!, v = screenOf(homeRect(k)).visibleFrame
+            p.view.tabAt = e == .minX ? v.minX - t.minX : v.maxX - sliver - t.minX
+            p.view.tuckedInto = e
         }
         let off = pets.keys.filter { k in
-            let f = to[k]!, p = pets[k]!.panel
+            let f = to[k]!.0, p = pets[k]!.panel
             return hypot(f.minX - p.frame.minX, f.minY - p.frame.minY) > 0.5 || p.alphaValue < 1
         }
         guard !off.isEmpty else { return }
@@ -1127,7 +1120,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         NSAnimationContext.runAnimationGroup { c in
             c.duration = animate ? 0.25 : 0
             for k in off {
-                let f = to[k]!, p = pets[k]!.panel
+                let f = to[k]!.0, p = pets[k]!.panel
                 if animate { p.animator().setFrame(f, display: true); p.animator().alphaValue = 1 }
                 else { p.setFrame(f, display: true); p.alphaValue = 1 }
             }
