@@ -1233,6 +1233,31 @@ def youtube(c):
         return parse_youtube_page(page.decode("utf-8", "replace"))
 
 
+def video_seconds(page):
+    """Length in seconds from a YouTube watch page, or None."""
+    m = re.search(r'"lengthSeconds":"(\d+)"', page)
+    return int(m.group(1)) if m else None
+
+
+def fill_lengths(limit=120):
+    """Look up the length of YouTube items that lack one (the RSS feed doesn't carry it); a few per round, newest first."""
+    with feed_lock:
+        todo = [x["url"] for x in load_feed()["items"] if x["src"] == "YouTube" and "len" not in x][:limit]
+    got = {}
+    for url in todo:
+        try:
+            got[url] = video_seconds(fetch(url, BROWSER).decode("utf-8", "replace")) or 0  # 0: unknown, don't ask again
+        except Exception:
+            break  # offline or blocked: try again next round
+    if got:
+        with feed_lock:
+            f = load_feed()
+            for x in f["items"]:
+                if x["url"] in got:
+                    x["len"] = got[x["url"]]
+            save_feed(f)
+
+
 def parse_github(data):
     return [{"id": "gh:" + r["full_name"], "src": "GitHub", "title": r["full_name"], "url": r["html_url"],
              "by": f"★ {r['stargazers_count']}" + (f" · {r['language']}" if r.get("language") else ""),
@@ -1270,8 +1295,12 @@ def link_item(url):
     if m:
         url = "https://www.youtube.com/watch?v=" + m.group(1)
         o = json.loads(fetch("https://www.youtube.com/oembed?format=json&url=" + urllib.parse.quote(url)))
+        try:
+            n = video_seconds(fetch(url, BROWSER).decode("utf-8", "replace")) or 0
+        except Exception:
+            n = None  # fill_lengths retries on the next check
         return {"id": "yt:" + m.group(1), "src": "YouTube", "title": flat(o["title"]), "url": url,
-                "by": o.get("author_name", ""), "date": today, "text": ""}
+                "by": o.get("author_name", ""), "date": today, "text": "", **({} if n is None else {"len": n})}
     m = re.match(r"https?://(?:www\.)?github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?(?:[/?#].*)?$", url)
     if m:
         return parse_github(json.dumps({"items": [json.loads(fetch(f"https://api.github.com/repos/{m.group(1)}/{m.group(2)}"))]}))[0]
@@ -1427,6 +1456,7 @@ def run_scout():
             liked = [x["title"] for x in f["items"] if x["vote"] > 0 or x["saved"]][:15]
             disliked = [x["title"] for x in f["items"] if x["vote"] < 0][:15]
             save_feed(f)
+        fill_lengths()
         picks = 0
         for i in range(0, len(todo), 25):
             batch = todo[i:i + 25]
@@ -2944,6 +2974,7 @@ const IC={
   lib:SV('<path d="M5 19V5a2 2 0 0 1 2-2h12v16H7a2 2 0 0 0 0 4h12v-4" fill="#6b4528" stroke="#3e2a18" stroke-width="1.1" stroke-linejoin="round"/><path d="M7 19.6h11.5v1.6H7a.8.8 0 0 1 0-1.6z" fill="#f3e6c8"/><circle cx="12" cy="8" r="1.8" fill="none" stroke="#e0b44a" stroke-width="1.3"/><path d="M12 9.8v5M12 13.2h1.8M12 14.8h1.3" stroke="#e0b44a" stroke-width="1.3" stroke-linecap="round"/>'),
   hide:SV('<path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z" fill="#fff" stroke="#3b3f45" stroke-width="1.3"/><circle cx="12" cy="12" r="3.2" fill="#3f8a5a"/><circle cx="12" cy="12" r="1.3" fill="#1b1b1b"/><path d="M5 19 19.5 4.5" stroke="#9aa4ad" stroke-width="2.4" stroke-linecap="round"/><path d="M3 21l2.3-2.3" stroke="#3b3f45" stroke-width="3.2" stroke-linecap="round"/>'),
   task:SV('<path d="M5 4.5A1.5 1.5 0 0 1 6.5 3H17a2 2 0 0 1 2 2v9M15 21H7a2 2 0 0 1-2-2V4.5" fill="#efe0bb" stroke="#8a6a3a" stroke-width="1.1"/><path d="M8 8h8M8 11h8M8 14h4" stroke="#8a6a3a" stroke-width="1"/><circle cx="17.3" cy="17.3" r="4.4" fill="#2f7a46"/><path d="M17.3 15v4.6M15 17.3h4.6" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/>')};
+function dur(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60),r=s%60;return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(r).padStart(2,'0')}
 function card(x){
   const d=document.createElement('div');d.className='c'+(x.read?' read':'');
   d.innerHTML=`<div class=score></div><div class=body><a class=title target=_blank></a>
@@ -2955,7 +2986,7 @@ function card(x){
   sc.title=x.score==null?'Not ranked yet (Argo unreachable?)':'Score '+x.score;
   sc.style.setProperty('--h',x.score==null?220:Math.round(x.score*12));
   const a=$('.title');a.href=x.url;a.textContent=x.title;a.onclick=()=>{if(!x.read)post({id:x.id,read:true})};
-  $('.src').textContent=x.src;$('.by').textContent=[x.by,x.date,x.manual&&'added by you'].filter(Boolean).join(' · ');
+  $('.src').textContent=x.src;$('.by').textContent=[x.by,x.len&&dur(x.len),x.date,x.manual&&'added by you'].filter(Boolean).join(' · ');
   $('.why').textContent=x.why;
   const ls=x.labels||[];
   for(const l of ls){const c=document.createElement('span');c.className='chip';c.textContent=l;c.style.setProperty('--h',hue(l));

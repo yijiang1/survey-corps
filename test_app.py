@@ -453,3 +453,5 @@ assert seen[0]["grow"] and seen[0]["image"] == Path("s.png") and seen[0]["model"
 app.argo = lambda *a, **kw: None
 assert app.read_schedule(Path("s.png")) is None
 print("ok")
+assert app.video_seconds('x"lengthSeconds":"3725"y') == 3725 and app.video_seconds("nothing") is None
+print("ok")
