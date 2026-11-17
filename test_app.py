@@ -276,6 +276,9 @@ assert (info["cwd"], info["title"]) == ("/h/TomoX", "Radiation damage"), info  #
 app.remote = {"me@a.x": [{"id": "rt", "mtime": _t.time(), **info}], "me@b.x": [{"id": "rt", "mtime": _t.time(), **info}]}
 assert [(a["tool"], a["where"], a["state"], a["open"]) for a in app.agents() if "@" in a["tool"]] == [
     ("Claude Code @a", "Radiation damage", "working", "vscode://vscode-remote/ssh-remote+me@a.x/h/TomoX")]
+app.remote["me@b.x"] = [{"id": "rt", "mtime": _t.time(), **info, "here": True}]  # b runs it: b wins over the first host
+assert [a["tool"] for a in app.agents() if "@" in a["tool"]] == ["Claude Code @b"]
+app.remote["me@b.x"] = [{"id": "rt", "mtime": _t.time(), **info}]
 said.clear(); app.agent_event({"session_id": "rt", "cwd": "/h/talks", "hook_event_name": "Stop"}, "cc", 1, "me@a.x"); _t.sleep(0.2)
 assert said == [("Claude Code @a", "Finished in Radiation damage (talks)")], said  # the bubble names the session too
 assert [(a["where"], a["host"], a["dir"], a["open"]) for a in app.agents() if "@" in a["tool"]] == [

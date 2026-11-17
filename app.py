@@ -796,11 +796,19 @@ REMOTE_SCAN = inspect.getsource(transcript_info) + f"""
 import json, re, time
 from datetime import datetime
 from pathlib import Path
+here = set()  # sessions with a live process on this host (sessions/<pid>.json is shared with hosts on the same home)
+for f in (Path.home() / ".claude" / "sessions").glob("*.json"):
+    try:
+        s = json.loads(f.read_text())
+        if open(f"/proc/{{s['pid']}}/stat").read().rsplit(")", 1)[1].split()[19] == str(s["procStart"]):
+            here.add(s["sessionId"])
+    except Exception:
+        pass
 out = []
 for p in (Path.home() / ".claude" / "projects").glob("*/*.jsonl"):
     m = p.stat().st_mtime
     if time.time() - m < {WINDOW}:
-        out.append(dict(id=p.stem, mtime=m, **transcript_info(p)))
+        out.append(dict(id=p.stem, mtime=m, here=p.stem in here, **transcript_info(p)))
 print(json.dumps(out))
 """
 
@@ -918,9 +926,10 @@ def agents(now=None):
         if transcripts.get(p, (0,))[0] != mtime:
             transcripts[p] = (mtime, transcript_info(p))
         logs[p.stem] = (transcripts[p][1], mtime, "")
-    for target, found in remote.items():  # ponytail: hosts sharing a home (NFS) list the same logs; the first host's name wins
+    for target, found in remote.items():  # hosts sharing a home (NFS) list the same logs: the one running it wins, else the first
         for t in found:
-            logs.setdefault(t["id"], (t, t["mtime"], target))
+            if t["id"] not in logs or t.get("here") and not logs[t["id"]][0].get("here"):
+                logs[t["id"]] = (t, t["mtime"], target)
     out = []
     for sid, a in cc.items():
         t, host = logs.get(sid, ({}, 0, ""))[0], a.get("host", "")
