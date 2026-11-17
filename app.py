@@ -2374,7 +2374,8 @@ h2 span{font-weight:400;margin-left:4px}h2.late{color:var(--red)}
 .lb{border:1px solid transparent;border-radius:10px;padding:1px 9px;font-size:12px;cursor:pointer;font-weight:500;
   background:hsl(var(--h,210) 70% 50% / .14);color:hsl(var(--h,210) 65% var(--chipL))}
 .lb b{font-weight:400;opacity:.6;margin-left:5px}.lb:hover{border-color:hsl(var(--h,210) 65% 50% / .5)}
-.lb.on{background:hsl(var(--h,210) 70% 50%);color:#fff}.lb.on b{opacity:.85}
+.lb.on{background:hsl(var(--h,210) 70% 50%);color:#fff;box-shadow:0 0 0 2px var(--bg),0 0 0 4px hsl(var(--h,210) 70% 50%)}
+#lbar.sel .lb:not(.on){opacity:.4}#lbar.sel .lb:not(.on):hover{opacity:1}.lb.on b{opacity:.85}
 .lb:first-child{background:none;border-color:var(--line);color:var(--muted)}.lb:first-child.on{background:var(--text);color:var(--bg);border-color:var(--text)}
 .chips{display:contents}.chip{border-radius:10px;padding:1px 8px;cursor:pointer;background:hsl(var(--h) 70% 50% / .18);color:hsl(var(--h) 65% var(--chipL));font-weight:500}
 .chip b{display:inline-block;vertical-align:bottom;max-width:0;overflow:hidden;font-weight:400;opacity:0}.chip:hover b{max-width:1em;margin-left:3px;opacity:.7}.chip b:hover{opacity:1}
@@ -2580,7 +2581,7 @@ function item(t){
   const labels=t.labels||[];
   for(const l of labels){
     const c=document.createElement('span');c.className='chip';c.style.setProperty('--h',hue(l));
-    c.textContent=l;c.title='Show only this label';c.onclick=()=>{lf=l;render()};
+    c.textContent=l;c.title='Show only this label';c.onclick=()=>{lf=new Set([l]);render()};
     const x=document.createElement('b');x.textContent='×';x.title='Remove label';
     x.onclick=e=>{e.stopPropagation();up({labels:labels.filter(y=>y!==l)})};
     c.append(x);$('.chips').append(c);
@@ -2738,18 +2739,19 @@ sadd.onclick=async e=>{
   sdlg.close();cm=new Date(first+'T00:00');cm.setDate(1);view='cal';localStorage.view=view;render();
   toast(`Added ${add.length} to the calendar`);
 };
-let lf='';  // label filter ('' = all), set by the label row under the search bar or by clicking a label
+let lf=new Set();  // selected label filters (empty = all; a task matches if it has any)
+// label filter ('' = all), set by the label row under the search bar or by clicking a label
 function render(){
   const names=[...new Set(all.flatMap(t=>t.labels||[]))].sort();
   labels.replaceChildren(...[...new Set([...names,...LB.all])].sort().map(n=>new Option(n)));
-  if(!names.includes(lf))lf='';
-  const lchip=(name,text,n)=>{const c=document.createElement('button');c.className='lb'+(lf===name?' on':'');
-    if(name)c.style.setProperty('--h',hue(name));c.textContent=text;if(n){const b=document.createElement('b');b.textContent=n;c.append(b)}
-    c.onclick=()=>{lf=lf===name?'':name;render()};return c};
+  lf=new Set([...lf].filter(n=>names.includes(n)));
+  const lchip=(name,text,n)=>{const c=document.createElement('button');c.className='lb'+((name?lf.has(name):!lf.size)?' on':'');
+    if(name)c.style.setProperty('--h',hue(name));c.textContent=(name&&lf.has(name)?'✓ ':'')+text;if(n){const b=document.createElement('b');b.textContent=n;c.append(b)}
+    c.onclick=()=>{if(!name)lf.clear();else lf.delete(name)||lf.add(name);render()};return c};
   const undone=all.filter(t=>!t.done);
-  lbar.replaceChildren(lchip('','All labels'),...names.map(n=>lchip(n,n,undone.filter(t=>(t.labels||[]).includes(n)).length||'')));
+  lbar.classList.toggle('sel',lf.size);lbar.replaceChildren(lchip('','All labels'),...names.map(n=>lchip(n,n,undone.filter(t=>(t.labels||[]).includes(n)).length||'')));
   const words=q.value.trim().endsWith('?')?[]:q.value.toLowerCase().split(/\s+/).filter(Boolean);
-  const shown=all.filter(t=>(!lf||(t.labels||[]).includes(lf))&&words.every(w=>
+  const shown=all.filter(t=>(!lf.size||(t.labels||[]).some(l=>lf.has(l)))&&words.every(w=>
     [t.title,t.sender,t.body,t.note,...(t.labels||[])].join(' ').toLowerCase().includes(w)));
   const open=shown.filter(t=>!t.done).sort((a,b)=>(a.due||'z').localeCompare(b.due||'z'));
   const done=shown.filter(t=>t.done);
@@ -2767,7 +2769,7 @@ function render(){
   }
   list.replaceChildren(...out); donelist.replaceChildren(...done.map(item));
   const isCal=view==='cal'; cal.hidden=!isCal; list.hidden=isCal; vl.className=isCal?'':'on'; vc.className=isCal?'on':'';
-  if(isCal)renderCal(shown,lf?[]:EV.filter(e=>words.every(w=>e.title.toLowerCase().includes(w))));
+  if(isCal)renderCal(shown,lf.size?[]:EV.filter(e=>words.every(w=>e.title.toLowerCase().includes(w))));
   donebox.hidden=isCal||!done.length; donehdr.textContent=`Done · ${done.length}`;
   const openAll=all.filter(t=>!t.done), late=openAll.filter(t=>t.due&&t.due<=nowStr()).length;
   stats.textContent=`${openAll.length} open`+(late?` · ${late} overdue`:'');
