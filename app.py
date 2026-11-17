@@ -905,8 +905,8 @@ def agents(now=None):
     now = now or time.time()
     for sid in [s for s, a in cc.items() if a["pid"] and not alive(a["pid"])]:
         cc.pop(sid, None)  # closed without SessionEnd (killed terminal, crash)
-    for sid in [s for s, a in cc.items() if not a["pid"] and a["state"] != "working" and now - a["since"] > WINDOW]:
-        cc.pop(sid, None)  # remote: no pid to check, so one quiet for WINDOW is taken as gone
+    for sid in [s for s, a in cc.items() if not a["pid"] and now - a["since"] > WINDOW]:
+        cc.pop(sid, None)  # remote: no pid to check, so one quiet for WINDOW is taken as gone, even mid-turn (closed window)
     logs = {}  # session id -> (transcript_info, mtime, "user@host" or "")
     for p in CLAUDE.glob("*/*.jsonl"):  # every Claude Code session, desktop app included
         try:

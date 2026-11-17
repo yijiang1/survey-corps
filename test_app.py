@@ -263,6 +263,8 @@ r = next(a for a in app.agents() if a["tool"] == "Claude Code @refiner")
 assert (r["where"], r["state"], r["open"]) == ("My Proj", "idle", "vscode://vscode-remote/ssh-remote+me@refiner.lab.gov/home/me/My%20Proj"), r
 assert said == [("Claude Code @refiner", "Finished in My Proj")] and "cache" not in r, said
 assert not any(a["tool"].startswith("Claude Code @") for a in app.agents(now=_t.time() + 13 * 3600))  # quiet too long: gone
+app.agent_event({"session_id": "r2", "cwd": "/h/TomoX", "hook_event_name": "UserPromptSubmit"}, "cc", 1, "me@refiner.lab.gov")
+assert not any(a["tool"].startswith("Claude Code @") for a in app.agents(now=_t.time() + 13 * 3600))  # window closed mid-turn: gone too
 app.cc.clear()
 # ...and from remote_scan(): transcripts read over SSH; hosts sharing a home list each session once
 rt = Path(tempfile.mkdtemp()) / "rt.jsonl"
