@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Survey Corps: local todo list fed by emails dragged from Outlook. Run: python3 app.py"""
 from collections import Counter
-import base64, html, inspect, json, os, re, signal, socket, sqlite3, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+import base64, html, inspect, io, json, os, re, signal, socket, sqlite3, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid, zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email import message_from_bytes, policy
@@ -92,7 +92,7 @@ SETTINGS = {  # editable in the app's Settings dialog -> (default, max for ints 
     "argo_user": ("", None), "argo_model": (MODEL, None), "retry_minutes": (10, 1440),
     "briefing_hour": (8, 24), "library_editor": ("Visual Studio Code", None), "github_token": ("", None),
     "routines": ("", None), "dictation": (0, 1), "dictate_vocab": ("", None),
-    "dictate_model": (DICTATE_MODEL, None), "dictate_mute": (1, 1), "dictate_fixes": ("", None)}
+    "dictate_model": (DICTATE_MODEL, None), "dictate_mute": (1, 1), "dictate_fixes": ("", None), "aps_author": ("", None)}
 
 
 def get_settings():
@@ -540,6 +540,90 @@ def ask_lib(x, q):
     ctx = "\n".join(f"{k}: {v}" for k, v in [("Name", x["name"]), ("Type", x["group"]), ("Where", x["path"]),
                                              ("Labels", ", ".join(x["labels"])), ("Summary", x["summary"]), ("My notes", x["note"])] if v)
     return ask_one("item from my library", q, ctx + "\n\nContents:\n" + text, x["id"])
+
+
+APS_FORM = DATA / "APS_PublicationClearanceForm.docx"  # the blank form; filled copies go next to the item
+APS_TYPES = ["Journal Article", "Conference Paper", "Conference Poster and/or Presentation", "Abstract"]
+APS_FIELDS = {"author": "PSC Author Submitting This Form:", "journal": "Journal Title:", "title": "*Document Title:",
+              "first_author": "*First Author:", "conference": "*Conference Name:", "proceedings": "*Proceedings Title:",
+              "dates": "*Conference Date(s):", "location": "*Conference Location:",
+              "beamlines": "APS Beamline Endstation(s)", "instruments": "Beamline Instrument(s):"}
+
+
+def fill_aps(form, d):
+    """The clearance form (.docx bytes) with d's answers after each label, an X by d["type"], and d["invited"]."""
+    with zipfile.ZipFile(io.BytesIO(form)) as z:
+        files = {i: z.read(i) for i in z.infolist()}
+    text = lambda s: html.unescape("".join(re.findall(r"<w:t(?: [^>]*)?>([^<]*)", s))).strip()
+    run = lambda s: f'<w:r><w:t xml:space="preserve">{html.escape(s, quote=False)}</w:t></w:r></w:p>'
+
+    def para(m):
+        p, t = m[0], text(m[0])
+        k = next((k for k, label in APS_FIELDS.items() if t.startswith(label) and d.get(k)), None)
+        gap = " " * (not "".join(re.findall(r"<w:t(?: [^>]*)?>([^<]*)", p)).endswith(" "))  # most labels end in one
+        return p[:-6] + run(gap + d[k]) if k else p
+
+    def row(m):  # innermost table rows: the manuscript-type boxes, and "Was this Invited"
+        r, t = m[0], text(m[0])
+        if d.get("type") and t.replace(" ", "") == d["type"].replace(" ", ""):
+            return r.replace("</w:p>", run("X"), 1)  # first cell is the box
+        if t.startswith("Was this Invited") and d.get("invited") is True:
+            ps = r.replace("<w:t>x</w:t>", "<w:t></w:t>", 1).split("</w:p>")
+            ps[1] += run("X YES")[:-6]  # the empty middle cell
+            return "</w:p>".join(ps)
+        return r
+
+    files_xml = next(i for i in files if i.filename == "word/document.xml")
+    xml = files[files_xml].decode()
+    xml = re.sub(r"<w:p[ >](?:(?!</?w:p[ >]).)*</w:p>", para, xml, flags=re.S)
+    xml = re.sub(r"<w:tr[ >](?:(?!</?w:tr[ >]).)*</w:tr>", row, xml, flags=re.S)
+    files[files_xml] = xml.replace('w:hRule="exact"', 'w:hRule="atLeast"').encode()  # rows grow to fit a long title
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, b in files.items():
+            z.writestr(i, b)
+    return out.getvalue()
+
+
+def aps_form(x):
+    """Argo reads a Library paper/talk (and emails linked to it) into the APS clearance form, saved next to it.
+    Returns (path, fields left blank); raises ValueError for the user to see."""
+    if not APS_FORM.exists():
+        raise ValueError(f"Put the blank form at {APS_FORM}")
+    text = "\n".join(filter(None, [x["peek"], link_text(x["path"], x["src"])])) if x.get("src") else peek(x["path"], 20000) or x["peek"]
+    with lock:
+        todos = {t["id"]: t for t in load()}
+    mails = [todos[r["ref"][5:]] for r in x.get("related", []) if r["ref"][5:] in todos][:3]
+    mails = "".join(f"\n\nLinked email: {t['title']}\nFrom: {t['sender']}\nDate: {t['date']}\n{t['body']}" for t in mails)
+    reply = argo("Below is a paper, abstract, poster or talk of mine (and maybe emails about it). Fill in my lab's publication "
+                 'clearance form from it. Reply with ONLY a JSON object {"type": "...", "title": "...", "first_author": "...", '
+                 '"journal": "...", "conference": "...", "proceedings": "...", "dates": "...", "location": "...", '
+                 '"invited": true/false/null, "beamlines": "...", "instruments": "..."}.\n'
+                 f"- type: one of {json.dumps(APS_TYPES)}. Slides or a poster for a meeting = the poster/presentation one.\n"
+                 "- title, first_author, journal, conference (full name), proceedings, dates, location: copied exactly as written.\n"
+                 "- beamlines: Advanced Photon Source (APS) beamlines where the x-rays came from (e.g. 2-ID-D); instruments: the "
+                 "APS beamline instruments used there. Both \"\" if the work used no APS beamline (e.g. electron microscopy).\n"
+                 "- invited: true only if it says it's an invited talk/paper.\n"
+                 'Use "" (or null) for anything it doesn\'t say. Never guess.\n\n'
+                 f"Name: {x['name']}\n\n{text}{mails}", 1000, timeout=120, tag="lib:" + x["id"])
+    if reply is None:
+        raise ValueError("Argo is unavailable right now (down, or not on VPN). Try again later.")
+    got = first_json(reply)
+    got = got if isinstance(got, dict) else {}
+    d = {k: " ".join(v.split()) for k, v in got.items() if isinstance(v, str)}
+    d["invited"] = got.get("invited")
+    d["author"] = config().get("aps_author", "")
+    if d.get("type") not in APS_TYPES:
+        d["type"] = ""
+    src = Path(x["path"])
+    where = Path.home() / "Downloads" if x.get("src") else src if x["folder"] else src.parent
+    stem = re.sub(r'[/:\\]', "-", x["name"] if x.get("src") or x["folder"] else src.stem)[:80]
+    out, n = where / f"{stem}_APS_clearance.docx", 1
+    while out.exists():  # never overwrite one you already edited
+        n += 1
+        out = where / f"{stem}_APS_clearance {n}.docx"
+    out.write_bytes(fill_aps(APS_FORM.read_bytes(), d))
+    return out, [label.strip("*:") for k, label in APS_FIELDS.items() if not d.get(k)] + ["Manuscript type"] * (not d["type"])
 
 
 def briefing():
@@ -1588,6 +1672,11 @@ def peek(p, n=3000):
         if ext in ("docx", "doc", "rtf", "rtfd", "odt", "webarchive"):
             out = subprocess.run(["textutil", "-convert", "txt", "-stdout", p], capture_output=True, timeout=30).stdout
             return out.decode("utf-8", "replace")[:n]
+        if ext == "pptx":  # each slide's text, in order
+            with zipfile.ZipFile(p) as z:
+                slides = sorted((i for i in z.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", i)),
+                                key=lambda i: int(re.sub(r"\D", "", i)))
+                return "\n".join(html.unescape(" ".join(re.findall(r"<a:t>([^<]*)", z.read(i).decode()))) for i in slides)[:n]
         if ext == "pdf":  # PDFKit through JavaScript for Automation: no compiler or extra package needed
             out = subprocess.run(["osascript", "-l", "JavaScript", "-e", 'function run(a){ObjC.import("Quartz");'
                                   'const d=$.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(a[0]));'
@@ -2189,6 +2278,17 @@ class H(BaseHTTPRequestHandler):
                         f = load_feed()
                         relabel(f["items"], d["name"].strip(), new)
                         save_feed(f)
+            if act == "aps":  # fill the APS clearance form (Argo, ~20 s), outside the lock, then open it in Word
+                with lib_lock:
+                    x = next((x for x in load_lib()["items"] if x["id"] == u.path.split("/")[-2]), None)
+                if not x:
+                    return self.reply(404)
+                try:
+                    out, blank = aps_form(x)
+                except ValueError as e:
+                    return self.reply(400, json.dumps({"error": str(e)}).encode())
+                subprocess.run(["open", out])
+                return self.reply(200, json.dumps({"path": str(out), "blank": blank}).encode())
             with lib_lock:
                 lib = load_lib()
                 if u.path == "/api/library/meta":
@@ -3184,6 +3284,7 @@ nav button.on{background:var(--card);box-shadow:0 1px 2px #0003;font-weight:500}
 <h2>Library &amp; Scout</h2>
 <div class=group>
   <div class=r><label for=library_editor>Editor app<small>Opens Library files and folders</small></label><input id=library_editor spellcheck=false placeholder="Visual Studio Code"></div>
+  <div class=r><label for=aps_author>Your name<small>"PSC Author" on the APS clearance form</small></label><input id=aps_author spellcheck=false></div>
   <div class=r><label for=github_token>GitHub token<small id=ghs>Optional, raises Scout's GitHub rate limit</small></label><input id=github_token type=password autocomplete=off></div>
 </div>
 <div class=foot><span>Scout's interests are set in the Scout window.</span></div>
@@ -3530,6 +3631,7 @@ const I={folder:SVG('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0
   edit:SVG('<path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/>'),
   term:SVG('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M12.5 15H17"/>'),
   copy:SVG('<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>'),
+  form:SVG('<rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V3h6v1M9 11h6M9 15h4"/>'),
   x:SVG('<path d="M6 6l12 12M18 6 6 18"/>')};
 const SORTS={recent:'Recent',name:'Name',added:'Added'};
 let lib={groups:[],labels:{},items:[]}, st={busy:[]}, rev=0, trev=0, dragId=null, tasks=[], others=[];  // tasks & emails; others: the labeled ones
@@ -3641,7 +3743,7 @@ function card(x){
       <input class=askm placeholder="✨ Ask Argo about this, e.g. What's the main result? (press Enter)"><div class=askans hidden></div><pre></pre></details></div>
     <div class=side><button class=icon data-a=open title="Open">${I.open}</button><button class=icon data-a=reveal title="Show in Finder">${I.reveal}</button>
       <button class=icon data-a=edit title="Open in ${lib.editor}">${I.edit}</button><button class=icon data-a=terminal title="Open in Terminal">${I.term}</button>
-      <button class=icon data-a=copy title="Copy path">${I.copy}</button><button class="icon x" title="Remove from Library (the file stays on disk)">${I.x}</button></div>`;
+      <button class=icon data-a=copy title="Copy path">${I.copy}</button><button class="icon aps" title="Fill the APS publication clearance form with Argo">${I.form}</button><button class="icon x" title="Remove from Library (the file stays on disk)">${I.x}</button></div>`;
   const $=s=>d.querySelector(s),up=p=>api(`/api/library/item/${x.id}/update`,p);
   const ext=extOf(x),k=kindOf(x);
   const ico=$('.ico');ico.innerHTML=x.folder?WALL:k?KICON[k]:'';if(!x.folder&&!k)ico.textContent=ext||'DOC';
@@ -3679,6 +3781,11 @@ function card(x){
   if(k){for(const a of ['reveal','edit','terminal'])$(`[data-a=${a}]`).hidden=true;$('[data-a=open]').title='Open in browser';
     $('[data-a=copy]').title='Copy link';pi.title='Link'}
   else if(!x.folder&&!/^(txt|md|py|ipynb|json|tex|bib|ya?ml|toml|js|ts|swift|sh|csv|c|h|cpp|m|r|jl|html|css|xml)$/i.test(ext))$('[data-a=edit]').hidden=true;
+  const aps=$('.aps');aps.hidden=!st.configured||!/^(Papers|Docs|Slides)$/.test(x.group)&&!['arXiv','Link'].includes(x.src);
+  aps.onclick=async()=>{toast('Argo is filling the APS clearance form…');aps.disabled=true;
+    const r=await fetch(`/api/library/item/${x.id}/aps`,{method:'POST'}).catch(()=>({}));aps.disabled=false;
+    const j=await r.json?.().catch(()=>({}))||{};
+    toast(r.ok?`Saved ${j.path.split('/').pop()}`+(j.blank.length?`. Fill in yourself: ${j.blank.join(', ')}`:''):j.error||'Something went wrong')};
   $('.x').onclick=()=>confirm(`Remove "${x.name}" from the Library? The ${x.folder?'folder':'file'} itself stays on disk.`)&&api(`/api/library/item/${x.id}/delete`);
   d.draggable=true;d.ondragstart=e=>{if(/INPUT|TEXTAREA|SELECT/.test(e.target.tagName))return e.preventDefault();dragId=x.id;e.dataTransfer.setData('application/x-lib',x.id)};
   d.ondragend=()=>dragId=null;

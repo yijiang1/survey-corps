@@ -460,3 +460,25 @@ assert app.read_schedule(Path("s.png")) is None
 print("ok")
 assert app.video_seconds('x"lengthSeconds":"3725"y') == 3725 and app.video_seconds("nothing") is None
 print("ok")
+
+# APS clearance form: answers go after their labels, X in the matching type's box, "invited" flips the NO
+import io, re, zipfile
+p = lambda s: f'<w:p><w:pPr/><w:r><w:t xml:space="preserve">{s}</w:t></w:r></w:p>'
+cell = lambda s: f"<w:tc>{p(s)}</w:tc>"
+doc = (f'<w:body><w:tbl><w:tr><w:tc><w:tbl><w:tr>{cell("")}{cell("Journal Article")}</w:tr><w:tr>{cell("    ")}{cell("Conference Paper")}</w:tr></w:tbl></w:tc></w:tr>'
+       f'<w:tr w:hRule="exact">{cell("*Document Title: ")}</w:tr><w:tr>{cell("*First Author:")}</w:tr><w:tr>{cell("Journal Title: ")}</w:tr>'
+       f'<w:tr>{cell("Was this Invited:   ")}{cell("")}<w:tc><w:p><w:r><w:t>x</w:t></w:r><w:r><w:t> NO</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body>')
+blank = io.BytesIO()
+with zipfile.ZipFile(blank, "w") as z:
+    z.writestr("word/document.xml", doc)
+    z.writestr("[Content_Types].xml", "<Types/>")
+out = app.fill_aps(blank.getvalue(), {"type": "Conference Paper", "title": "A & B", "first_author": "Ann", "invited": True})
+with zipfile.ZipFile(io.BytesIO(out)) as z:
+    x = z.read("word/document.xml").decode()
+    assert z.read("[Content_Types].xml") == b"<Types/>"
+txt = re.findall(r"<w:t(?: [^>]*)?>([^<]*)", x)
+assert "".join(txt).count("X") == 2 and txt.index("X") == txt.index("    ") + 1, txt  # X in Conference Paper's box only
+assert "*Document Title: A &amp; B" in "".join(txt) and "*First Author: Ann" in "".join(txt), txt  # escaped, one space
+assert txt[txt.index("Journal Title: ") + 1] == "Was this Invited:   ", txt  # no answer: left blank
+assert "X YES" in txt and "x" not in txt and 'hRule="exact"' not in x, txt
+print("ok")
