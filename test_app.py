@@ -256,14 +256,14 @@ print("ok")
 iso = lambda secs_ago: datetime.utcfromtimestamp(_t.time() - secs_ago).isoformat() + "Z"
 # remote Claude Code (hooks on an SSH host, through the tunnel): no pid check, opens VS Code on that host
 said.clear()
-app.agent_event({"session_id": "r", "cwd": "/home/me/My Proj", "hook_event_name": "UserPromptSubmit"}, "cc", 4242, "me@refiner.lab.gov")
-app.agent_event({"session_id": "r", "cwd": "/home/me/My Proj", "hook_event_name": "Stop", "transcript_path": "/home/me/x.jsonl"}, "cc", 4242, "me@refiner.lab.gov")
+app.agent_event({"session_id": "r", "cwd": "/home/me/My Proj", "hook_event_name": "UserPromptSubmit"}, "cc", 4242, "me@gpu1.lab.gov")
+app.agent_event({"session_id": "r", "cwd": "/home/me/My Proj", "hook_event_name": "Stop", "transcript_path": "/home/me/x.jsonl"}, "cc", 4242, "me@gpu1.lab.gov")
 _t.sleep(0.2)
-r = next(a for a in app.agents() if a["tool"] == "Claude Code @refiner")
-assert (r["where"], r["state"], r["open"]) == ("My Proj", "idle", "vscode://vscode-remote/ssh-remote+me@refiner.lab.gov/home/me/My%20Proj"), r
-assert said == [("Claude Code @refiner", "Finished in My Proj")] and "cache" not in r, said
+r = next(a for a in app.agents() if a["tool"] == "Claude Code @gpu1")
+assert (r["where"], r["state"], r["open"]) == ("My Proj", "idle", "vscode://vscode-remote/ssh-remote+me@gpu1.lab.gov/home/me/My%20Proj"), r
+assert said == [("Claude Code @gpu1", "Finished in My Proj")] and "cache" not in r, said
 assert not any(a["tool"].startswith("Claude Code @") for a in app.agents(now=_t.time() + 13 * 3600))  # quiet too long: gone
-app.agent_event({"session_id": "r2", "cwd": "/h/TomoX", "hook_event_name": "UserPromptSubmit"}, "cc", 1, "me@refiner.lab.gov")
+app.agent_event({"session_id": "r2", "cwd": "/h/TomoX", "hook_event_name": "UserPromptSubmit"}, "cc", 1, "me@gpu1.lab.gov")
 assert not any(a["tool"].startswith("Claude Code @") for a in app.agents(now=_t.time() + 13 * 3600))  # window closed mid-turn: gone too
 app.cc.clear()
 # ...and from remote_scan(): transcripts read over SSH; hosts sharing a home list each session once
@@ -481,4 +481,27 @@ assert "".join(txt).count("X") == 2 and txt.index("X") == txt.index("    ") + 1,
 assert "*Document Title: A &amp; B" in "".join(txt) and "*First Author: Ann" in "".join(txt), txt  # escaped, one space
 assert txt[txt.index("Journal Title: ") + 1] == "Was this Invited:   ", txt  # no answer: left blank
 assert "X YES" in txt and "x" not in txt and 'hRule="exact"' not in x, txt
+# SSH gateway pill: on / connecting / off from `ssh -O check` + pgrep (cached), login through Terminal, stop = pkill + `ssh -O exit`
+calls, scripts, codes, real_run, real_osa, real_config = [], [], {}, app.subprocess.run, app.osa, app.config
+app.subprocess.run = lambda cmd, **kw: calls.append(cmd) or type("R", (), {"returncode": codes.get(cmd[0], 1)})()
+app.osa = scripts.append
+app.config = lambda: {}
+app.gateway_switch(True)
+assert app.gateway_state() == "off" and not calls and not scripts  # no gateway set: nothing runs
+for bad in ("-oProxyCommand=x", "gw; touch x", "a b", "gw'"):
+    app.config = lambda: {"ssh_gateway": bad}
+    assert app.gateway() == "", bad  # it goes into a shell command
+app.config = lambda: {"ssh_gateway": "gw"}
+app.gateway_seen = (0.0, "off")
+assert app.gateway_state() == "off"
+codes["pgrep"] = 0; app.gateway_seen = (0.0, "off")
+assert app.gateway_state() == "connecting" and app.gateway_state() == "connecting" and len(calls) == 4, calls  # cached
+codes["ssh"] = 0; app.gateway_seen = (0.0, "off")
+assert app.gateway_state() == "on"
+app.gateway_switch(True)
+assert app.gateway_login("gw") + " && exit ||" in scripts[0] and app.gateway_seen[0] == 0, scripts  # pill updates next poll
+app.gateway_switch(False)
+assert calls[-2:] == [["pkill", "-f", app.gateway_login("gw")], ["ssh", "-O", "exit", "gw"]], calls
+app.config = real_config
+app.subprocess.run, app.osa = real_run, real_osa
 print("ok")

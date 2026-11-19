@@ -92,7 +92,8 @@ SETTINGS = {  # editable in the app's Settings dialog -> (default, max for ints 
     "argo_user": ("", None), "argo_model": (MODEL, None), "retry_minutes": (10, 1440),
     "briefing_hour": (8, 24), "library_editor": ("Visual Studio Code", None), "github_token": ("", None),
     "routines": ("", None), "dictation": (0, 1), "dictate_vocab": ("", None),
-    "dictate_model": (DICTATE_MODEL, None), "dictate_mute": (1, 1), "dictate_fixes": ("", None), "aps_author": ("", None)}
+    "dictate_model": (DICTATE_MODEL, None), "dictate_mute": (1, 1), "dictate_fixes": ("", None), "aps_author": ("", None),
+    "ssh_gateway": ("", None)}
 
 
 def get_settings():
@@ -1085,6 +1086,47 @@ def tunnel(target):
         time.sleep(60)
 
 
+gateway_seen = (0.0, "off")  # (when, "on" | "connecting" | "off")
+
+
+def gateway():
+    """Settings' SSH gateway: a Host in ~/.ssh/config with ControlMaster on, so lab hosts that ProxyJump through it
+    reuse one login (README). "" = none, and the header pill hides. Only plain host names: it goes into a shell."""
+    g = config().get("ssh_gateway", "")
+    return g if re.fullmatch(r"[\w.@-]+", g) and not g.startswith("-") else ""
+
+
+def gateway_login(g):
+    return f"ssh -o ConnectTimeout=10 -fN {g}"  # also how pgrep/pkill find a login still waiting for password/2FA
+
+
+def gateway_state():
+    """on: logged in; connecting: a login is still waiting (or stuck); off. Cached 5 s: every window polls /api/status."""
+    global gateway_seen
+    g = gateway()
+    if g and time.time() - gateway_seen[0] > 5:
+        up = subprocess.run(["ssh", "-O", "check", g], capture_output=True, timeout=10).returncode == 0
+        waiting = subprocess.run(["pgrep", "-f", gateway_login(g)], capture_output=True).returncode == 0
+        gateway_seen = (time.time(), "on" if up else "connecting" if waiting else "off")
+    return gateway_seen[1] if g else "off"
+
+
+def gateway_switch(on):
+    """Log in (password + 2FA need a terminal; -f backgrounds the connection, so the window can close), or stop:
+    cancels a login that's still waiting and logs out."""
+    global gateway_seen
+    g = gateway()
+    if not g:
+        return
+    if on:
+        msg = f"Could not log in to {g}. On VPN or on site you do not need it."
+        osa(f"""tell application "Terminal"\nactivate\ndo script "{gateway_login(g)} && exit || echo '{msg}'"\nend tell""")
+    else:
+        subprocess.run(["pkill", "-f", gateway_login(g)], capture_output=True)
+        subprocess.run(["ssh", "-O", "exit", g], capture_output=True, timeout=10)  # e.g. one started by hand
+    gateway_seen = (0.0, "off")
+
+
 def notify(title, msg):
     subprocess.run(["osascript", "-e", "on run argv",
                     "-e", 'display notification (item 2 of argv) with title (item 1 of argv) sound name "default"',
@@ -2075,7 +2117,7 @@ class H(BaseHTTPRequestHandler):
                 working = sorted(k for k, n in busy.items() if n > 0)
             self.reply(200, json.dumps({"configured": argo_on(), "argo": argo_ok, "checked": argo_at, "busy": working,
                                         "retry_minutes": config().get("retry_minutes", 10),
-                                        "lib_waiting": lib_waiting() if argo_on() else 0,
+                                        "lib_waiting": lib_waiting() if argo_on() else 0, "gateway": gateway(), "gateway_state": gateway_state(),
                                         "rev": max((f.stat().st_mtime for f in (DB, EVENTS) if f.exists()), default=0),
                                         "lib_rev": LIB.stat().st_mtime if LIB.exists() else 0}).encode())
         elif self.path.startswith("/api/pets"):  # /api/pets?after=<last bubble id seen>
@@ -2177,6 +2219,9 @@ class H(BaseHTTPRequestHandler):
             check_argo()
             if argo_ok:
                 threading.Thread(target=retry_argo, daemon=True).start()  # clicking the pill also clears the waiting queue
+            return self.reply(200)
+        if u.path == "/api/gateway":  # {"on": bool}: the header's SSH gateway pill
+            gateway_switch(bool(json.loads(raw or b"{}").get("on")))
             return self.reply(200)
         if u.path == "/api/argo/retry":  # manual retry: ping first so a dead Argo fails fast, then redo the waiting work
             check_argo()
@@ -2578,7 +2623,7 @@ details .askm{border-color:color-mix(in srgb,var(--accent) 35%,transparent)}
 <div id=drop>Drop email to add a task</div><div id=toast></div>
 <header>
   <div class=top><h1>Task Manager</h1><span id=stats></span><button id=argo class=pill></button>
-    <button id=rt class=pill hidden title="Retry the work Argo missed, now">Retry now</button></div>
+    <button id=rt class=pill hidden title="Retry the work Argo missed, now">Retry now</button><button id=xg class=pill hidden></button></div>
   <div class=bar>
     <input id=new placeholder="Add a task (&quot;review Bob's draft by Fri 3pm&quot;), or drag in an email or image">
     <button id=shot class=icon hidden title="Screenshot to task: drag over an area (Space picks a window, Esc cancels). Already have one copied? Paste it here with ⌘V."><svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.5"/></svg></button>
@@ -2878,7 +2923,17 @@ function render(){
 let st={busy:[]}, rev=0;
 async function load(){
   [all,st,LB,EV]=await Promise.all(['/api/todos','/api/status','/api/labels','/api/events'].map(u=>fetch(u).then(r=>r.json())));rev=st.rev;render();pill()}
+function xgPill(){  // SSH gateway (Settings): green while logged in, spinning while a login waits; click to start or stop
+  const g=st.gateway,dot=document.createElement('span'),on=st.gateway_state==='on',wait=st.gateway_state==='connecting';
+  xg.hidden=!g;if(!g)return;dot.className='dot';
+  xg.className='pill'+(on?' ok':wait?' busy':'');xg.replaceChildren(dot,wait?g+' logging in… ✕':on?g+' ✕':g);
+  xg.title=on?`Logged in to ${g}: SSH to lab machines works off VPN. Click to stop (log out).`
+    :wait?'Waiting for your password and 2FA in Terminal. Click to stop.'
+    :`Not logged in to ${g}. Click to log in (Terminal asks for your password and 2FA), so SSH to lab machines works off VPN.`;
+}
+xg.onclick=()=>fetch('/api/gateway',{method:'POST',body:JSON.stringify({on:st.gateway_state==='off'})}).then(tick);
 function pill(){  // Argo status in the header: off / reachable / unavailable / working
+  xgPill();
   const work=st.busy.filter(x=>x!=='check'), checking=st.busy.includes('check'), tw=all.filter(t=>t.retry&&!t.done).length, waiting=tw+st.lib_waiting;
   const ago=st.checked?Math.round(Date.now()/6e4-st.checked/60):null;
   argo.className='pill'+(!st.configured?'':work.length||checking?' busy':st.argo?' ok':st.argo===false?' down':'');
@@ -3266,6 +3321,10 @@ nav button.on{background:var(--card);box-shadow:0 1px 2px #0003;font-weight:500}
   <div class=r><label for=argo_model>Model</label><input id=argo_model spellcheck=false placeholder=claudesonnet55></div>
   <div class=r><label for=retry_minutes>Retry missed work<small>When Argo was down or off VPN</small></label><select id=retry_minutes></select></div>
   <div class=r><label>Connection<small id=res>&nbsp;</small></label><button id=test>Test Connection</button></div>
+</div>
+<h2>Off VPN</h2>
+<div class=group>
+  <div class=r><label for=ssh_gateway>SSH gateway<small>A Host in ~/.ssh/config. Adds a log-in pill to the Task Manager header; blank hides it</small></label><input id=ssh_gateway spellcheck=false autocomplete=off></div>
 </div>
 </section>
 <section data-tab=routines>

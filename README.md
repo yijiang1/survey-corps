@@ -54,6 +54,7 @@ A small local task manager for macOS that turns Outlook emails into to-dos.
 - Stored in `data/library.json`. Argo gets the summary inputs above, plus what an ask (`?`) search reads.
 
 **macOS integration**
+- **SSH gateway pill** in the Task Manager header, for a lab that lets you in through one SSH gateway when you're off VPN. Set its `~/.ssh/config` Host name in Settings → Argo → Off VPN (blank hides the pill). It's green while you're logged in. Click it to log in (Terminal asks for your password and 2FA; the connection then runs in the background). While a login waits, it spins and says “logging in… ✕”; click it again to stop. Clicking it while green logs out. A login gives up after 10 s (e.g. on VPN, where you don't need it). For other hosts to reuse that login, give the gateway's Host `ControlMaster auto` and `ControlPath ~/.ssh/cm-%C`, and the lab hosts `ProxyJump <gateway>`; then SSH, VS Code Remote-SSH and Levi's remotes work off VPN without another 2FA.
 - macOS notification when a task comes due.
 - Native app with a Dock icon, light and dark mode.
 - A floating pet (an original chibi character holding a letter) sits on every desktop: click it to show/hide the app, drag it to move it.
