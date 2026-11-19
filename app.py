@@ -1126,7 +1126,7 @@ def gateway_switch(on):
     if not g:
         return
     if on:
-        msg = f"Could not log in to {g}. On VPN or on site you do not need it."
+        msg = f"Could not log in to {g} (the reason is above). If it timed out: on VPN or on site you do not need it."
         osa(f"""tell application "Terminal"\nactivate\ndo script "{gateway_login(g)} && exit || echo '{msg}'"\nend tell""")
     else:
         subprocess.run(["pkill", "-f", gateway_login(g)], capture_output=True)
