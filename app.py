@@ -92,7 +92,7 @@ SETTINGS = {  # editable in the app's Settings dialog -> (default, max for ints 
     "briefing_hour": (8, 24), "library_editor": ("Visual Studio Code", None), "github_token": ("", None),
     "routines": ("", None), "dictation": (0, 1), "dictate_vocab": ("", None),
     "dictate_model": (DICTATE_MODEL, None), "dictate_mute": (1, 1), "dictate_fixes": ("", None), "aps_author": ("", None),
-    "ssh_gateway": ("", None), "argo_url": ("", None)}
+    "ssh_gateway": ("", None), "argo_url": ("", None), "label_notes": ("", None)}
 
 
 def get_settings():
@@ -206,10 +206,12 @@ def suggest(t, known):
     """Labels, due date and action items for a dropped email (or a cleaned title for a typed task).
     None if Argo didn't answer; {} if it answered nonsense."""
     now = datetime.now()
-    labels = ("- labels: up to 3 short labels (1-2 words, Title Case). Reuse an existing label whenever one fits; "
-              "invent a new one only if none does.\n")
+    ex, known_txt = label_context(known, t["id"])
+    labels = ("- labels: 1-2 labels, 3 at most. Pick from the existing labels, filing it the way I already have: "
+              "match it to the example tasks under each label, not just the label name. Invent a new label (1-2 words, "
+              "Title Case) only if no existing one fits at all, and never more than one.\n")
     if t["eml"] or t.get("shot"):  # a screenshot reads like an email: its date, sender and asks
-        prompt = (f"Today is {now:%A %Y-%m-%d %H:%M} (local time). Existing labels: {json.dumps(known)}.\n"
+        prompt = (f"Today is {now:%A %Y-%m-%d %H:%M} (local time). {known_txt}\n"
                   "Below is an email I saved as a to-do. Reply with ONLY a JSON object "
                   '{"labels": [...], "due": "...", "actions": [...]}.\n' + labels +
                   '- due: when I must act by, as local YYYY-MM-DDTHH:MM. Resolve relative dates ("by Friday") against the '
@@ -219,14 +221,18 @@ def suggest(t, known):
                   "(max 12 words); otherwise [].\n\n"
                   f"Subject: {t['title']}\nFrom: {t['sender']}\nDate: {t['date']}\n\n{t['body'][:3000]}")
     else:
-        prompt = (f"Today is {now:%A %Y-%m-%d %H:%M} (local time). Existing labels: {json.dumps(known)}.\n"
+        prompt = (f"Today is {now:%A %Y-%m-%d %H:%M} (local time). {known_txt}\n"
                   "Below is a to-do I typed. Reply with ONLY a JSON object "
                   '{"title": "...", "labels": [...], "due": "..."}.\n'
                   "- title: the task restated cleanly, without the date/time words, first letter capitalised.\n" + labels +
                   '- due: the deadline it mentions, as local YYYY-MM-DDTHH:MM resolved against today; if only a date is '
                   'given use 17:00. Use "" if it mentions no time (do not invent one).\n\n' + t["body"][:3000])
     reply = argo(prompt, 800, tag="new:" + t["id"])  # "new:": the page shows a status line, then scrolls to the task
-    return None if reply is None else clean_suggestion(reply, now)
+    if reply is None:
+        return None
+    s = clean_suggestion(reply, now)
+    s["labels"] = fit_labels(s["labels"], ex)
+    return s
 
 
 def new_input(fn):
@@ -1264,6 +1270,51 @@ def clean_settings(d):
     return out
 
 
+def label_context(known, skip):
+    """How I've used each label so far (3 recent tasks or Library items each), merged-away names and my Settings rules,
+    so Argo files things like I do (e.g. timesheets under ANL). Returns (examples by label, text for the prompt)."""
+    with lock:
+        todos = load()
+    with lib_lock:
+        items = load_lib()["items"]
+    ex = {l: [] for l in known}
+    for x in [*reversed(todos), *reversed(items)]:
+        for l in x.get("labels", []):
+            if len(ex.setdefault(l, [])) < 3 and x["id"] != skip:
+                ex[l].append((x.get("title") or x.get("name") or "")[:70])
+    txt = "Existing labels, each with a few things I filed under it:\n" + json.dumps(ex, ensure_ascii=False)
+    gone = {k: v for k, v in config().get("label_aliases", {}).items() if v in ex}
+    if gone:
+        txt += "\nLabels I merged away (use the label on the right instead): " + json.dumps(gone, ensure_ascii=False)
+    return ex, txt + label_notes()
+
+
+def fit_labels(got, ex):
+    """Argo's labels mapped onto mine (merged "Timesheet" -> "ANL", "Anl" -> "ANL"), keeping at most one brand-new label."""
+    canon = {**config().get("label_aliases", {}), **{l.lower(): l for l in ex}}
+    got = list(dict.fromkeys(canon.get(l.lower(), l) for l in got))
+    return [l for l in got if l in ex] + [l for l in got if l not in ex][:1]
+
+
+def label_notes():
+    """The user's own labeling rules from Settings, to add to any prompt that picks labels; they win over the defaults."""
+    n = config().get("label_notes", "").strip()
+    return f"\nMy labeling rules (follow these over anything else about labels):\n{n}" if n else ""
+
+
+def add_alias(old, new):
+    """A renamed/merged label keeps pointing at its new name, so Argo can't bring the old one back."""
+    with config_lock:
+        cfg = config()
+        al = {k: (new if v == old else v) for k, v in cfg.get("label_aliases", {}).items()}
+        al[old.lower()] = new
+        al.pop(new.lower(), None)  # renaming back to an old name revives it
+        cfg["label_aliases"] = al
+        tmp = CONFIG.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cfg, indent=1, ensure_ascii=False))
+        tmp.replace(CONFIG)
+
+
 def save_settings(d):
     """Save the form (or {"reset": true} to go back to the defaults). Returns an error message, or None."""
     if d.get("reset"):
@@ -1836,17 +1887,19 @@ def lib_enrich(item_id):
     with lib_lock:
         lib = load_lib()
         x = next((x for x in lib["items"] if x["id"] == item_id), None)
-    known = all_labels()
     if not x or not argo_on():
         return
+    ex, known_txt = label_context(all_labels(), item_id)
     kind = f"{x['src']} link" if x.get("src") else "local folder" if x["folder"] else "local file"
     more = link_text(x["path"], x["src"]) if x.get("src") in ("YouTube", "GitHub", "Link") else ""  # fetched here, off the lock
     more = f"\n\n{ {'YouTube': 'Video description', 'GitHub': 'README'}.get(x.get('src'), 'Page text')}:\n{more}" if more else ""
     reply = argo(f"Below is a {kind} I keep in my library of projects, files and docs. "
                  'Reply with ONLY a JSON object {"summary": "...", "labels": [...]}.\n'
                  "- summary: one plain line (max 20 words) saying what it is.\n"
-                 f"- labels: up to 3 short labels for the projects or topics it belongs to (1-2 words, Title Case). Existing labels: {json.dumps(known)}. Reuse one "
-                 "whenever it fits; invent a new one only if none does.\n\n"
+                 "- labels: 1-2 labels (3 at most) for the projects or topics it belongs to. Pick from the existing labels, "
+                 "filing it the way I already have: match it to the examples under each label, not just the label name. "
+                 "Invent a new label (1-2 words, Title Case) only if no existing one fits at all, and never more than one.\n"
+                 f"{known_txt}\n\n"
                  f"{'Link' if x.get('src') else 'Path'}: {x['path']}\nName: {x['name']}\n\n{x['peek']}{more}", 600, tag="lib:" + item_id)
     with lib_lock:
         lib = load_lib()
@@ -1861,7 +1914,7 @@ def lib_enrich(item_id):
         if s.get("summary") and not cur["summary"]:
             cur["summary"] = s["summary"]
         if s.get("labels") and not cur["labels"]:
-            cur["labels"] = sorted(set(s["labels"]))
+            cur["labels"] = sorted(set(fit_labels(s["labels"], ex)))
         save_lib(lib)
     lib_relate(item_id)  # with its summary and labels, it's easier to match
 
@@ -2330,6 +2383,8 @@ class H(BaseHTTPRequestHandler):
                         f = load_feed()
                         relabel(f["items"], d["name"].strip(), new)
                         save_feed(f)
+                    if new:
+                        add_alias(d["name"].strip(), new)
             if act == "aps":  # fill the APS clearance form (Argo, ~20 s), outside the lock, then open it in Word
                 with lib_lock:
                     x = next((x for x in load_lib()["items"] if x["id"] == u.path.split("/")[-2]), None)
@@ -3329,6 +3384,8 @@ nav button.on{background:var(--card);box-shadow:0 1px 2px #0003;font-weight:500}
   <div class=r><label for=argo_model>Model</label><input id=argo_model spellcheck=false placeholder=claudesonnet55></div>
   <div class=r><label for=retry_minutes>Retry missed work<small>When Argo was down or off VPN</small></label><select id=retry_minutes></select></div>
   <div class=r><label>Connection<small id=res>&nbsp;</small></label><button id=test>Test Connection</button></div>
+  <div class=r style="display:block"><label for=label_notes>Labeling notes<small>Your rules for how Argo labels tasks and Library items, one per line</small></label>
+  <textarea id=label_notes rows=4 spellcheck=false placeholder="Timesheets, effort reporting, training, benefits → ANL&#10;Never use more than 2 labels"></textarea></div>
 </div>
 <h2>Off VPN</h2>
 <div class=group>

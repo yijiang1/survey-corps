@@ -511,3 +511,12 @@ app.config = lambda: {"argo_user": "x"}
 assert not app.argo_on() and app.argo("hi", 5) is None
 app.config = real_config
 print("ok")
+
+# Argo's labels: mapped onto existing ones (case, merged-away names), at most one brand-new label
+_cfg = app.config
+app.config = lambda: {"label_aliases": {"timesheet": "ANL"}}
+ex = {"ANL": [], "Travel": []}
+assert app.fit_labels(["anl", "Timesheet", "Travel"], ex) == ["ANL", "Travel"]
+assert app.fit_labels(["New One", "Travel", "New Two"], ex) == ["Travel", "New One"]
+app.config = _cfg
+print("ok")
