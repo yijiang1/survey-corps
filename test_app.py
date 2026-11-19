@@ -22,8 +22,7 @@ assert a == [{"id": "arxiv:2610.01234", "src": "arXiv", "title": "A new ptychogr
 import tempfile
 import app
 app.DB = Path(tempfile.mkdtemp()) / "todos.json"
-app.config = lambda: {"argo_user": "x"}
-app.ARGO = "http://127.0.0.1:9/"  # nothing listens here: connection refused
+app.config = lambda: {"argo_user": "x", "argo_url": "http://127.0.0.1:9/"}  # nothing listens here: connection refused
 t = {**app.blank(), "title": "review draft by fri", "body": "review draft by fri", "sender": "", "date": "", "eml": False}
 app.save([t])
 app.enrich(t)
@@ -188,7 +187,7 @@ lib = app.load_lib()
 z = {**lib["items"][0], "id": "zzz", "name": "Ptycho analysis", "path": "/x", "peek": "ptychography code", "labels": []}
 lib["items"].append(z)
 app.save_lib(lib)
-cfg, app.config = app.config, lambda: {"argo_user": "x"}
+cfg, app.config = app.config, lambda: {"argo_user": "x", "argo_url": "http://127.0.0.1:9/"}
 seen = []
 app.argo = lambda prompt, n, **kw: seen.append(prompt) or "None of the candidates fit: []"
 app.lib_relate("zzz")
@@ -352,7 +351,7 @@ def png(w, h):
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(b"".join(b"\0" + b"\xff" * 3 * w for _ in range(h)))) + chunk(b"IEND", b""))
 app.SHOTS = Path(tempfile.mkdtemp())
-cfg, app.config = app.config, lambda: {"argo_user": "x"}
+cfg, app.config = app.config, lambda: {"argo_user": "x", "argo_url": "http://127.0.0.1:9/"}
 (app.SHOTS / "big.png").write_bytes(png(3000, 200))
 u = app.data_url(app.SHOTS / "big.png")
 assert u.startswith("data:image/jpeg;base64,") and not list(app.SHOTS.glob("*.send.jpg")), u[:40]  # shrunk, temp removed
@@ -384,7 +383,7 @@ class Fake(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 srv = http.server.HTTPServer(("127.0.0.1", 0), Fake)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
-app.ARGO, app.config = f"http://127.0.0.1:{srv.server_port}/", lambda: {"argo_user": "x"}
+app.config = lambda: {"argo_user": "x", "argo_url": f"http://127.0.0.1:{srv.server_port}/"}
 assert app.argo("hello", 5) == "hi" and asked == [app.MODEL, app.BACKUP], asked
 srv.shutdown()
 # no deadline in an email -> due 17:00, 3 days after its Date header (or after it was added, if unreadable)
@@ -411,7 +410,7 @@ assert app.dictated("um send the slides") == "um send the slides"
 app.argo = lambda *a, **kw: None
 assert app.dictated("hello") == "hello" and app.dictation["state"] == "ready"
 # corrections from Recent: "heard → meant" lines (-> works too) go to Argo's prompt; junk lines are skipped
-fixes = {"argo_user": "x", "dictate_fixes": "Taichi → PtyChi\nno arrow here\n  empad -> EMPAD \n → x"}
+fixes = {"argo_user": "x", "argo_url": "http://127.0.0.1:9/", "dictate_fixes": "Taichi → PtyChi\nno arrow here\n  empad -> EMPAD \n → x"}
 assert app.dict_fixes(fixes) == [("Taichi", "PtyChi"), ("empad", "EMPAD")], app.dict_fixes(fixes)
 prompts, cfg = [], app.config
 app.config, app.argo = lambda: fixes, lambda p, *a, **kw: prompts.append(p) or "<clean>PtyChi</clean>"
@@ -504,4 +503,11 @@ app.gateway_switch(False)
 assert calls[-2:] == [["pkill", "-f", app.gateway_login("gw")], ["ssh", "-O", "exit", "gw"]], calls
 app.config = real_config
 app.subprocess.run, app.osa = real_run, real_osa
+# Argo's address comes from Settings: no address (or not http/https) = off, whatever the username
+for u, on in (("", False), ("ftp://x/y", False), ("https://", False), ("https://llm.example/v1/chat/completions", True)):
+    app.config = lambda: {"argo_user": "x", "argo_url": u}
+    assert app.argo_on() is on, u
+app.config = lambda: {"argo_user": "x"}
+assert not app.argo_on() and app.argo("hi", 5) is None
+app.config = real_config
 print("ok")

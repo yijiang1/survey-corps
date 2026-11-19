@@ -19,7 +19,6 @@ SHOTS = DATA / "shots"   # screenshots turned into tasks
 IMAGE = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
 DB = DATA / "todos.json"
 CONFIG = DATA / "config.json"  # optional: {"argo_user": "<ANL username>", "argo_model": "claudesonnet55"}
-ARGO = "https://apps.inside.anl.gov/argoapi/v1/chat/completions"
 MODEL, BACKUP = "claudesonnet55", "claudesonnet5"  # default Argo model, and the one tried when it errors
 DICTATE_MODEL = "claudehaiku55"  # tidying dictation: as good as Sonnet in our tests and ~30% faster
 BRIEFED = DATA / "briefed"  # date of the last morning briefing
@@ -93,7 +92,7 @@ SETTINGS = {  # editable in the app's Settings dialog -> (default, max for ints 
     "briefing_hour": (8, 24), "library_editor": ("Visual Studio Code", None), "github_token": ("", None),
     "routines": ("", None), "dictation": (0, 1), "dictate_vocab": ("", None),
     "dictate_model": (DICTATE_MODEL, None), "dictate_mute": (1, 1), "dictate_fixes": ("", None), "aps_author": ("", None),
-    "ssh_gateway": ("", None)}
+    "ssh_gateway": ("", None), "argo_url": ("", None)}
 
 
 def get_settings():
@@ -123,8 +122,15 @@ def set_settings(new):
         tmp.replace(CONFIG)
 
 
+def argo_url(cfg=None):
+    """Settings' Argo address: the gateway's OpenAI-style chat completions URL. "" (unset or not http(s)) = Argo off."""
+    u = (cfg or config()).get("argo_url", "")
+    return u if urlparse(u).scheme in ("http", "https") and urlparse(u).hostname else ""
+
+
 def argo_on():
-    return bool(config().get("argo_user"))
+    cfg = config()
+    return bool(cfg.get("argo_user") and argo_url(cfg))
 
 
 def argo(prompt, max_tokens, timeout=120, tag="", image=None, model=None, grow=False):
@@ -132,9 +138,10 @@ def argo(prompt, max_tokens, timeout=120, tag="", image=None, model=None, grow=F
     in Settings. Returns the reply text, or None if unconfigured, down or unreachable (e.g. no VPN)."""
     global argo_ok, argo_at
     cfg = config()
-    if not cfg.get("argo_user"):
+    url = argo_url(cfg)
+    if not cfg.get("argo_user") or not url:
         return None
-    u = urlparse(ARGO)
+    u = urlparse(url)
     try:  # off VPN the host resolves but connections hang until the timeout: find out in 3 s instead of minutes
         socket.create_connection((u.hostname, u.port or 443), timeout=3).close()
     except OSError:
@@ -147,7 +154,7 @@ def argo(prompt, max_tokens, timeout=120, tag="", image=None, model=None, grow=F
         busy[tag] += 1
     try:
         for i, model in enumerate(models):
-            req = urllib.request.Request(ARGO, json.dumps({
+            req = urllib.request.Request(url, json.dumps({
                 "model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": content}]}).encode(),
                 {"Content-Type": "application/json", "Authorization": "Bearer " + cfg["argo_user"]})
             try:
@@ -2942,7 +2949,7 @@ function pill(){  // Argo status in the header: off / reachable / unavailable / 
     :checking?'Checking Argo…':st.argo===false?'Argo unavailable'+(waiting?` · ${waiting} waiting`:''):'Argo');
   rt.hidden=!st.configured||!waiting;rt.textContent=`Retry now · ${waiting}`;
   rt.title=`Retry the work Argo missed, now: ${tw} task${tw===1?'':'s'}, ${st.lib_waiting} Library item${st.lib_waiting===1?'':'s'} (summaries or links)`;
-  argo.title=!st.configured?'LLM features are off. Set "argo_user" in data/config.json to turn them on.'
+  argo.title=!st.configured?'LLM features are off. Set your Argo username and address in Settings to turn them on.'
     :(st.argo===false?'Argo is down, or you are off VPN. Waiting work retries '+(st.retry_minutes?'every '+st.retry_minutes+' min':'only when you press Retry now')+'.':st.argo?'Argo is reachable.':'Not checked yet.')
     +(ago!=null?` Last contact ${ago<1?'just now':ago<60?ago+' min ago':Math.round(ago/60)+' h ago'}.`:'')+' Click to check now.';
 }
@@ -3318,6 +3325,7 @@ nav button.on{background:var(--card);box-shadow:0 1px 2px #0003;font-weight:500}
 <h2>Argo</h2>
 <div class=group>
   <div class=r><label for=argo_user>ANL username<small>Blank turns all LLM features off</small></label><input id=argo_user autocomplete=off spellcheck=false></div>
+  <div class=r><label for=argo_url>Address<small>Chat completions URL. Blank turns all LLM features off</small></label><input id=argo_url spellcheck=false autocomplete=off placeholder="https://…/v1/chat/completions"></div>
   <div class=r><label for=argo_model>Model</label><input id=argo_model spellcheck=false placeholder=claudesonnet55></div>
   <div class=r><label for=retry_minutes>Retry missed work<small>When Argo was down or off VPN</small></label><select id=retry_minutes></select></div>
   <div class=r><label>Connection<small id=res>&nbsp;</small></label><button id=test>Test Connection</button></div>
@@ -3909,7 +3917,7 @@ function pill(){  // Argo status, as in Task Manager
   rt.title=`Retry the work Argo missed, now: ${waiting} item${waiting===1?'':'s'} still need a summary or links (links go 20 items at a time)`;
   argo.className='pill'+(!st.configured?'':work.length||st.busy.includes('check')?' busy':st.argo?' ok':st.argo===false?' down':'');
   argo.replaceChildren(el('span','dot'),!st.configured?'Argo off':work.length?'Argo working…':st.argo===false?'Argo unavailable'+(waiting?` · ${waiting} waiting`:''):'Argo');
-  argo.title=!st.configured?'LLM features are off. Set "argo_user" in data/config.json to turn them on.'
+  argo.title=!st.configured?'LLM features are off. Set your Argo username and address in Settings to turn them on.'
     :st.argo===false?'Argo is down, or you are off VPN. New items get summarized when it is back.':'Argo is reachable. Click to check now.';
 }
 async function tick(){
