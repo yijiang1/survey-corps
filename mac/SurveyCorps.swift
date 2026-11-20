@@ -10,6 +10,7 @@ let feedURL = base.appendingPathComponent("feed")
 let libURL = base.appendingPathComponent("library")
 let settingsURL = base.appendingPathComponent("settings")
 let leviURL = base.appendingPathComponent("levi")
+let sketchURL = base.appendingPathComponent("sketch")
 let petSize: CGFloat = 112  // pet panel size in points: a 96 pt pet plus room to hop and lean
 let sliver: CGFloat = 40    // how much of a tucked pet stays on screen, drawn as a tab
 
@@ -752,11 +753,11 @@ class CloakView: NSView {  // the pill: Survey Corps cloak green with a gold edg
 }
 
 class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
-    var window: NSWindow!, feedWindow: NSWindow!, libWindow: NSWindow!, settingsWindow: NSWindow!, leviWindow: NSWindow!
+    var window: NSWindow!, feedWindow: NSWindow!, libWindow: NSWindow!, settingsWindow: NSWindow!, leviWindow: NSWindow!, sketchWindow: NSWindow!
     var pets: [String: (panel: NSPanel, view: PetView, window: NSWindow?)] = [:]  // "task", "scout", "library", "levi"
     var bubbles: [String: Bubble] = [:], lastBubble = 0
     var routines: [[String: String]] = [], agents: [[String: Any]] = []
-    var feedWeb: WKWebView!, libWeb: DropWebView!, settingsWeb: WKWebView!, leviWeb: WKWebView!
+    var feedWeb: WKWebView!, libWeb: DropWebView!, settingsWeb: WKWebView!, leviWeb: WKWebView!, sketchWeb: WKWebView!
     let server = Process()
 
     @objc func openSettings() {  // Survey Corps > Settings… (⌘,): its own window, like any Mac app
@@ -774,6 +775,24 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
             settingsWeb.load(URLRequest(url: settingsURL))
         }
         settingsWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func openSketch() {  // the Library's ✏️ Sketch: the pad in its own resizable window
+        if sketchWindow == nil {
+            sketchWeb = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+            sketchWeb.navigationDelegate = self
+            sketchWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 800),
+                                    styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            sketchWindow.title = "Sketch"
+            sketchWindow.contentView = sketchWeb
+            sketchWindow.center()
+            sketchWindow.minSize = NSSize(width: 560, height: 420)
+            sketchWindow.setFrameAutosaveName("sketch")
+            sketchWindow.isReleasedWhenClosed = false
+            sketchWeb.load(URLRequest(url: sketchURL))
+        }
+        sketchWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -822,6 +841,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
         // Library window: starts hidden, shown by the librarian pet
         let libConfig = WKWebViewConfiguration()
         libConfig.userContentController.add(self, name: "choose")  // the page's "Choose in Finder…" button
+        libConfig.userContentController.add(self, name: "sketch")  // its ✏️ Sketch button
         libWeb = DropWebView(frame: .zero, configuration: libConfig)
         libWeb.library = true
         libWeb.navigationDelegate = self
@@ -1178,6 +1198,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
     // Library "Choose in Finder…": the standard Open panel (files and folders, several at once, New Folder for a new project)
     func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
         if m.name == "shot" { return screenshotTask() }
+        if m.name == "sketch" { return openSketch() }
         let p = NSOpenPanel()
         p.canChooseFiles = true; p.canChooseDirectories = true; p.allowsMultipleSelection = true; p.canCreateDirectories = true
         p.prompt = "Choose"; p.message = "Pick projects, files or docs (⌘-click for several). New Folder starts a new project."
@@ -1190,7 +1211,7 @@ class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, 
 
     // server takes a moment to start; keep retrying
     func webView(_ w: WKWebView, didFailProvisionalNavigation n: WKNavigation!, withError e: Error) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.load(URLRequest(url: w === self.feedWeb ? feedURL : w === self.libWeb ? libURL : w === self.settingsWeb ? settingsURL : w === self.leviWeb ? leviURL : base)) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { w.load(URLRequest(url: w === self.feedWeb ? feedURL : w === self.libWeb ? libURL : w === self.settingsWeb ? settingsURL : w === self.leviWeb ? leviURL : w === self.sketchWeb ? sketchURL : base)) }
     }
 
     func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows: Bool) -> Bool {

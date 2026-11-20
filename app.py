@@ -1862,6 +1862,22 @@ def lib_add(paths, split=False, group="", labels=()):
     return new, skipped
 
 
+def lib_sketch(png):
+    """A drawing from the Library's sketch pad: saved as a PNG in data/files, added as an Images item that Argo reads."""
+    if not png.startswith(b"\x89PNG"):
+        raise ValueError("not a PNG")
+    FILES.mkdir(parents=True, exist_ok=True)
+    p = FILES / f"sketch-{datetime.now():%Y%m%d-%H%M%S}.png"
+    p.write_bytes(png)
+    x = {**lib_item(p, "Images"), "name": f"Sketch {datetime.now():%b %-d %H:%M}", "peek": "", "sketch": True}
+    with lib_lock:
+        lib = load_lib()
+        lib["items"].insert(0, x)
+        save_lib(lib)
+    threading.Thread(target=lib_enrich, args=(x["id"],), daemon=True).start()
+    return x
+
+
 def feed_to_lib(x):
     """Put a Scout item in the Library (its labels too). False if that link is already there."""
     with lib_lock:
@@ -1891,16 +1907,25 @@ def lib_enrich(item_id):
         return
     ex, known_txt = label_context(all_labels(), item_id)
     kind = f"{x['src']} link" if x.get("src") else "local folder" if x["folder"] else "local file"
+    sketch = x.get("sketch") and not x["peek"]  # not read yet: Argo sees the drawing itself
+    if sketch:
+        kind = "hand-drawn sketch (the attached image)"
     more = link_text(x["path"], x["src"]) if x.get("src") in ("YouTube", "GitHub", "Link") else ""  # fetched here, off the lock
     more = f"\n\n{ {'YouTube': 'Video description', 'GitHub': 'README'}.get(x.get('src'), 'Page text')}:\n{more}" if more else ""
     reply = argo(f"Below is a {kind} I keep in my library of projects, files and docs. "
-                 'Reply with ONLY a JSON object {"summary": "...", "labels": [...]}.\n'
+                 'Reply with ONLY a JSON object {"summary": "...", "labels": [...]'
+                 + (', "title": "...", "text": "..."' if sketch else "") + "}.\n"
                  "- summary: one plain line (max 20 words) saying what it is.\n"
-                 "- labels: 1-2 labels (3 at most) for the projects or topics it belongs to. Pick from the existing labels, "
+                 + ("- title: a short name for it (max 8 words).\n"
+                    "- text: everything in the drawing as plain text: transcribe all handwriting word for word, write "
+                    "equations in plain math (x^2, sqrt(...)), and describe what is drawn (boxes, arrows and what they "
+                    "connect, plots and their axes, tables row by row, layouts).\n" if sketch else "")
+                 + "- labels: 1-2 labels (3 at most) for the projects or topics it belongs to. Pick from the existing labels, "
                  "filing it the way I already have: match it to the examples under each label, not just the label name. "
                  "Invent a new label (1-2 words, Title Case) only if no existing one fits at all, and never more than one.\n"
                  f"{known_txt}\n\n"
-                 f"{'Link' if x.get('src') else 'Path'}: {x['path']}\nName: {x['name']}\n\n{x['peek']}{more}", 600, tag="lib:" + item_id)
+                 f"{'Link' if x.get('src') else 'Path'}: {x['path']}\nName: {x['name']}\n\n{x['peek']}{more}", 3000 if sketch else 600,
+                 tag="lib:" + item_id, image=x["path"] if sketch else None)
     with lib_lock:
         lib = load_lib()
         cur = next((y for y in lib["items"] if y["id"] == item_id), None)
@@ -1911,6 +1936,11 @@ def lib_enrich(item_id):
             return save_lib(lib)
         cur.pop("retry", None)
         s = clean_lib_suggestion(reply)
+        if sketch:
+            d = first_json(reply) or {}
+            cur["peek"] = str(d.get("text") or "").strip()[:3000] or s["summary"]
+            if cur["name"] == x["name"] and str(d.get("title") or "").strip():  # unless renamed meanwhile
+                cur["name"] = flat(str(d["title"]), 80)
         if s.get("summary") and not cur["summary"]:
             cur["summary"] = s["summary"]
         if s.get("labels") and not cur["labels"]:
@@ -2189,7 +2219,7 @@ class H(BaseHTTPRequestHandler):
             self.reply(200, json.dumps({k: {**SCOUT, **config()}[k] for k in SCOUT}).encode())
         elif self.path == "/settings":
             self.reply(200, SETTINGS_PAGE.encode(), "text/html; charset=utf-8")
-        elif self.path == "/library":
+        elif self.path in ("/library", "/sketch"):  # /sketch: the Library page showing only its sketch pad, in its own window
             self.reply(200, LIB_PAGE.encode(), "text/html; charset=utf-8")
         elif self.path == "/levi":
             self.reply(200, LEVI_PAGE.encode(), "text/html; charset=utf-8")
@@ -2364,6 +2394,11 @@ class H(BaseHTTPRequestHandler):
             labels = [l for l in (str(x).strip()[:24] for x in d.get("labels") or []) if l]
             new, skipped = lib_add(d.get("paths") or [], bool(d.get("split")), str(d.get("group") or "").strip(), labels)
             return self.reply(200, json.dumps({"added": [x["name"] for x in new], "skipped": skipped}).encode())
+        if u.path == "/api/library/sketch":  # raw PNG from the sketch pad
+            try:
+                return self.reply(200, json.dumps({"name": lib_sketch(raw)["name"]}).encode())
+            except ValueError:
+                return self.reply(400)
         if u.path == "/api/library/ask":  # agentic search across everything
             res = lib_ask(json.loads(raw or b"{}").get("q", ""))
             return self.reply(200, json.dumps(res).encode()) if res else self.reply(503)
@@ -3709,11 +3744,22 @@ main h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(-
 .legend .ln{width:16px;height:0;border-radius:0;border-top:2px solid var(--accent);background:none;vertical-align:3px}
 .legend .ll{width:16px;height:0;border-radius:0;border-top:1px solid var(--muted);background:none;vertical-align:3px}
 .seg[hidden]{display:none}
+.ktools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}.ktools .seg button{padding:5px 10px}
+#k_col{display:flex;gap:5px}#k_col button{width:22px;height:22px;border-radius:50%;border:2px solid var(--card);box-shadow:0 0 0 1px var(--line);cursor:pointer;padding:0}
+#k_col button.on{box-shadow:0 0 0 2px var(--accent)}
+#kwrap{position:relative;margin-top:10px;display:flex;justify-content:center}
+#kc{display:block;max-width:100%;max-height:calc(100vh - 300px);background:#fff;border:1px solid var(--line);border-radius:10px;touch-action:none;cursor:crosshair}
+body.solo>header,body.solo>.wrap,body.solo #k_close{display:none}
+body.solo #kdlg{position:static;width:100%;height:100vh;max-width:none;max-height:none;margin:0;border:0;border-radius:0;box-shadow:none}
+body.solo #kform{height:100%;max-height:none}body.solo .pb{flex:1;min-height:0;display:flex;flex-direction:column}
+body.solo #kwrap{flex:1;min-height:0}body.solo #kc{width:100%;height:100%;max-height:none}
+#k_text{position:absolute;min-width:160px;background:#fffd;color:#111;border:1px dashed var(--accent);border-radius:4px;padding:0 4px;outline:none}
 </style>
 <div id=drop>Drop files, folders or links to add them</div><div id=toast></div>
 <header>
   <div class=top><h1>Library</h1><span id=stats></span><button id=argo class=pill></button>
     <button id=rt class=pill hidden>Retry now</button>
+    <button class=btn id=sketchbtn title="Draw an idea, diagram or note; Argo reads it into a Library item">✏️ Sketch</button>
     <button class=btn id=addbtn title="Add folders, files or docs">+ Add</button></div>
   <div class=bar>
     <input id=q type=search placeholder="Search, or ask Argo in plain words and press Enter: “slides from my last beamtime talk”  ( / )">
@@ -3739,6 +3785,13 @@ main h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(-
       <label>Type <select id=a_grp></select></label>
       <label>Labels <input id=a_labels list=labels placeholder="Argo picks if empty · comma-separated"></label></div><div id=a_log></div></div>
   <div class=pf><span class=msg></span><button type=button class=btn id=a_close>Close</button><button class="btn primary" id=a_save>Add</button></div>
+</form></dialog>
+<dialog id=kdlg class=sheet><form id=kform>
+  <div class=ph><h3>Sketch</h3><p>Draw or type an idea, diagram, equation or note. Argo reads it (handwriting, text, arrows, boxes, plots) into a Library item with a title, summary and labels; the drawing is kept in data/files.</p></div>
+  <div class=pb><div class=ktools><span class=seg id=k_tool></span><span id=k_col></span><span class=seg id=k_size></span>
+      <button type=button class=btn id=k_undo title="⌘Z">Undo</button><button type=button class=btn id=k_clear>Clear</button></div>
+    <div id=kwrap><canvas id=kc width=1400 height=900></canvas><input id=k_text hidden placeholder="Type, then Enter"></div></div>
+  <div class=pf><span class=msg></span><button type=button class=btn id=k_close>Close</button><button class="btn primary" id=k_save>Add to Library</button></div>
 </form></dialog>
 <dialog id=mdlg class=sheet><form id=mform>
   <div class=ph><h3>Types &amp; labels</h3><p><b>Type</b> is what an item is: set automatically, change it any time. <b>Labels</b> are what it's about
@@ -4132,6 +4185,65 @@ aform.onsubmit=async e=>{
   const j=await r.json();a_log.replaceChildren(...added(j));a_save.disabled=false;load();
   if(!j.skipped.length){a_paths.value='';setTimeout(()=>adddlg.close(),1200)}
 };
+// ---- sketch pad: white canvas (what Argo reads best). Each stroke {tool, color, w, pts} (text: + text), kept for undo ----
+const kx=kc.getContext('2d');let kstrokes=[],kcur=null;
+const KT={pen:'✒️ Pen',hl:'🖍 Highlighter',line:'╱ Line',arrow:'→ Arrow',box:'▭ Box',text:'T Text',erase:'⌫ Eraser'},
+  KC=['#111111','#d70015','#0a60ff','#1a8f3c','#e07a00','#8e44ad'],KS={S:2,M:4,L:9};
+const k={tool:'pen',color:KC[0],w:KS.M};
+function kseg(box,opts,key,val){box.replaceChildren(...Object.entries(opts).map(([id,label])=>{const b=el('button',0,label);b.type='button';
+  b.onclick=()=>{k[key]=val(id);[...box.children].forEach(c=>c.classList.toggle('on',c==b));kc.style.cursor=k.tool=='text'?'text':'crosshair'};
+  b.classList.toggle('on',k[key]===val(id));return b}))}
+kseg(k_tool,KT,'tool',id=>id);kseg(k_size,{S:'S',M:'M',L:'L'},'w',id=>KS[id]);kseg(k_col,Object.fromEntries(KC.map(c=>[c,''])),'color',id=>id);
+[...k_col.children].forEach((b,i)=>{b.style.background=KC[i];b.title='Colour'});
+const kfont=s=>`${10+s.w*4}px -apple-system,sans-serif`;
+function kdraw(){kx.globalAlpha=1;kx.fillStyle='#fff';kx.fillRect(0,0,kc.width,kc.height);kx.lineCap=kx.lineJoin='round';
+  for(const s of kstrokes){if(s.hidden)continue;const [a,b]=[s.pts[0],s.pts[s.pts.length-1]];
+    kx.globalAlpha=s.tool=='hl'?.35:1;kx.strokeStyle=kx.fillStyle=s.tool=='erase'?'#fff':s.color;
+    kx.lineWidth=s.tool=='erase'?s.w*8:s.tool=='hl'?s.w*5:s.w;kx.beginPath();
+    if(s.tool=='text'){kx.font=kfont(s);kx.textBaseline='top';kx.fillText(s.text,a[0],a[1]);continue}
+    if(s.tool=='box')kx.rect(a[0],a[1],b[0]-a[0],b[1]-a[1]);
+    else if(s.tool=='line'||s.tool=='arrow'){kx.moveTo(...a);kx.lineTo(...b);
+      if(s.tool=='arrow'){const t=Math.atan2(b[1]-a[1],b[0]-a[0]),h=12+s.w*3;
+        for(const d of[-.45,.45]){kx.moveTo(...b);kx.lineTo(b[0]-h*Math.cos(t+d),b[1]-h*Math.sin(t+d))}}}
+    else{s.pts.forEach((p,i)=>i?kx.lineTo(...p):kx.moveTo(...p));if(s.pts.length==1)kx.lineTo(a[0]+.1,a[1])}
+    kx.stroke()}}
+const kpt=e=>{const r=kc.getBoundingClientRect();return[(e.clientX-r.left)*kc.width/r.width,(e.clientY-r.top)*kc.height/r.height]};
+function khit(p){  // the topmost text under a point, for editing
+  for(const s of[...kstrokes].reverse()){if(s.tool!='text')continue;kx.font=kfont(s);const[x,y]=s.pts[0];
+    if(p[0]>x-6&&p[0]<x+kx.measureText(s.text).width+6&&p[1]>y-6&&p[1]<y+10+s.w*4+6)return s}}
+function ktext(e){  // Text tool: click empty space for a new text box, or a text to edit it. Enter (or clicking away)
+  kcommit();        // puts it on the drawing; emptying it deletes it; Esc leaves things as they were
+  const r=kc.getBoundingClientRect(),w=kwrap.getBoundingClientRect(),sc=r.width/kc.width,hit=khit(kpt(e));
+  const at=hit?{pt:hit.pts[0],color:hit.color,w:hit.w,edit:hit}:{pt:kpt(e),color:k.color,w:k.w};
+  k_text.style.left=at.pt[0]*sc+r.left-w.left-5+'px';k_text.style.top=at.pt[1]*sc+r.top-w.top-1+'px';
+  k_text.style.font=`${Math.max(11,(10+at.w*4)*sc)}px -apple-system,sans-serif`;k_text.style.color=at.color;
+  k_text.at=at;k_text.value=hit?hit.text:'';if(hit){hit.hidden=true;kdraw()}
+  k_text.style.width=Math.max(160,(hit?.text.length||0)*(10+at.w*4)*sc*.6+30)+'px';k_text.hidden=false;k_text.focus();k_text.select()}
+function kcommit(){if(k_text.hidden)return;k_text.hidden=true;const v=k_text.value.trim(),a=k_text.at;
+  if(a.edit){a.edit.hidden=false;if(v)a.edit.text=v;else kstrokes.splice(kstrokes.indexOf(a.edit),1)}
+  else if(v)kstrokes.push({tool:'text',color:a.color,w:a.w,pts:[a.pt],text:v});kdraw()}
+k_text.onkeydown=e=>{if(e.key=='Enter'){e.preventDefault();kcommit()}
+  else if(e.key=='Escape'){e.preventDefault();k_text.value=k_text.at.edit?.text||'';kcommit()}};
+k_text.onblur=kcommit;
+kc.onpointerdown=e=>{if(k.tool=='text')return e.preventDefault(),ktext(e);kcommit();kc.setPointerCapture(e.pointerId);
+  kcur={tool:k.tool,color:k.color,w:k.w,pts:[kpt(e)]};kstrokes.push(kcur);kdraw()};
+kc.onpointermove=e=>{if(!kcur)return;const ps=(e.getCoalescedEvents?.()||[e]).map(kpt);
+  if(['line','arrow','box'].includes(kcur.tool))kcur.pts[1]=ps.pop();else kcur.pts.push(...ps);kdraw()};
+kc.onpointerup=kc.onpointercancel=()=>kcur=null;
+kc.onmousedown=e=>e.preventDefault();  // keeps focus in a new text box
+k_undo.onclick=()=>{kstrokes.pop();kdraw()};k_clear.onclick=()=>{kstrokes=[];kdraw()};
+kdlg.onkeydown=e=>{if(e.metaKey&&e.key=='z'&&e.target!=k_text){e.preventDefault();k_undo.onclick()}};
+k_close.onclick=()=>kdlg.close();
+// its own window: the Mac app opens a resizable one; a browser, a popup. Solo, the canvas fills the window (2 px per point),
+// and resizing keeps what's drawn where it is
+sketchbtn.onclick=()=>window.webkit?.messageHandlers?.sketch?window.webkit.messageHandlers.sketch.postMessage(''):open('/sketch','sketch','width=1100,height=800');
+const solo=location.pathname=='/sketch';
+function kfit(){const r=kwrap.getBoundingClientRect();kc.width=Math.max(1,r.width*2|0);kc.height=Math.max(1,r.height*2|0);kdraw()}
+if(solo){document.body.classList.add('solo');document.title='Sketch';kdlg.show();kfit();addEventListener('resize',kfit)}
+kform.onsubmit=e=>{e.preventDefault();kcommit();if(!kstrokes.some(s=>s.tool!='erase'))return toast('Draw something first');
+  k_save.disabled=true;kc.toBlob(async b=>{const r=await fetch('/api/library/sketch',{method:'POST',body:b});k_save.disabled=false;
+    if(!r.ok)return toast('Couldn’t save the sketch');const j=await r.json();
+    kstrokes=[];kdraw();if(!solo)kdlg.close();load();toast(`Added “${j.name}” · Argo is reading it`)},'image/png')};
 function dropped(j){drop.classList.remove('over');load();  // called by the Mac app after a Finder drop
   toast([j.added.length&&`Added ${j.added.length} to the Library`,j.skipped.length&&j.skipped.join('; ')].filter(Boolean).join(' · ')||'Nothing added')}
 addEventListener('dragover',e=>{e.preventDefault();if(!dragId)drop.classList.add('over')});

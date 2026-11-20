@@ -1,6 +1,6 @@
 from datetime import datetime
 from pathlib import Path
-from app import SCOUT, channel, clean_scores, clean_settings, clean_suggestion, parse_arxiv, parse_youtube_page
+from app import SCOUT, channel, lib_enrich, clean_scores, clean_settings, clean_suggestion, parse_arxiv, parse_youtube_page
 now = datetime(2026, 10, 17, 9, 0)
 assert clean_suggestion('x {"labels": ["A", " B ", "", "C", "D"], "due": "2026-10-20T17:00"} y', now) == {"labels": ["A", "B", "C"], "due": "2026-10-20T17:00", "title": "", "actions": []}
 assert clean_suggestion('{"title": " Review draft ", "actions": ["only one"]}', now) == {"labels": [], "due": "", "title": "Review draft", "actions": []}  # 1 action = no split
@@ -518,5 +518,32 @@ app.config = lambda: {"label_aliases": {"timesheet": "ANL"}}
 ex = {"ANL": [], "Travel": []}
 assert app.fit_labels(["anl", "Timesheet", "Travel"], ex) == ["ANL", "Travel"]
 assert app.fit_labels(["New One", "Travel", "New Two"], ex) == ["Travel", "New One"]
+app.config = _cfg
+print("ok")
+
+# Sketch pad: the PNG becomes an Images item; Argo sees the drawing and fills in its name, transcription, summary, labels
+app.LIB, app.FILES = Path(tempfile.mkdtemp()) / "library.json", Path(tempfile.mkdtemp())
+app.config = lambda: {"argo_user": "x", "argo_url": "http://127.0.0.1:9/"}
+app.lib_relate = app.lib_enrich = lambda i: None  # no background pass: the test calls it
+try:
+    app.lib_sketch(b"GIF89a")
+    assert False, "not a PNG"
+except ValueError:
+    pass
+x = app.lib_sketch(b"\x89PNG fake")
+assert x["group"] == "Images" and x["sketch"] and Path(x["path"]).read_bytes() == b"\x89PNG fake", x
+seen = []
+app.argo = lambda prompt, n, **kw: seen.append(kw.get("image")) or None  # Argo down: retried later, still unread
+lib_enrich(x["id"])
+assert app.load_lib()["items"][0]["retry"] and seen == [x["path"]]
+app.argo = lambda prompt, n, **kw: seen.append(kw.get("image")) or \
+    '{"summary": "Beamline layout idea", "labels": ["Ptycho"], "title": "New beamline layout", "text": "source -> mirror -> sample"}'
+lib_enrich(x["id"])
+y = app.load_lib()["items"][0]
+assert (y["name"], y["peek"], y["summary"], y["labels"]) == ("New beamline layout", "source -> mirror -> sample", "Beamline layout idea", ["Ptycho"]), y
+assert "retry" not in y and seen[-1] == x["path"]
+app.argo = lambda prompt, n, **kw: seen.append(kw.get("image")) or '{"summary": "s"}'
+lib_enrich(x["id"])
+assert seen[-1] is None  # read once: later passes use the transcription, not the image
 app.config = _cfg
 print("ok")
